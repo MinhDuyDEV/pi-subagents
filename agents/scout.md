@@ -2,7 +2,6 @@
 description: >
   PROACTIVE — Delegate without user @mention when the answer requires official docs, API/library behavior, or web evidence not in the repo.
   External research with citations; use memory when prior decisions may apply. NOT for in-repo mapping (explore) or implementation (general).
-model: opencode-go/deepseek-v4-flash
 thinking: high
 readonly: true
 proactive: true

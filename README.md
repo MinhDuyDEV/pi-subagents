@@ -127,7 +127,7 @@ Pi has one session parent agent; all `*.md` agents under `agents/` are **task su
 
 `tools:` is an explicit allowlist. If omitted, pi-task starts from the tools actually registered in the parent Pi session, then removes `disallowed_tools`. `readonly: true` always adds write/edit/apply_patch to the deny list, even when `tools:` is explicit. It does **not** deny `bash`; use explicit `tools:` or `disallowed_tools: bash` when an agent must not run shell. Recursive `task` delegation is always blocked.
 
-Bundled agents in `agents/`: `explore`, `scout`, `general`, `reviewer`. `readonly` blocks mutating tools (write/edit/apply_patch), not `bash`.
+Bundled agents in `agents/`: `explore`, `scout`, `general`, `reviewer`. They defer model selection to the current Pi session; a user or project agent can set `model:` explicitly. `readonly` blocks mutating tools (write/edit/apply_patch), not `bash`.
 
 When the target repo is not the parent session cwd (e.g. verifying the `pi-task` extension while cwd is an app), put an **absolute path** in the task `prompt` so explore/general search the right tree.
 

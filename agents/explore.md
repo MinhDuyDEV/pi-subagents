@@ -3,7 +3,6 @@ description: >
   PROACTIVE — Delegate without user @mention when the repo is unfamiliar, the question spans modules/services, or you need path:line evidence before any edit.
   Read-only codebase cartographer (files, symbols, call paths). Set thoroughness in the task prompt: quick, medium, or very thorough.
   NOT for external docs (scout), multi-step implementation (general), or a single known path (read/grep).
-model: opencode-go/deepseek-v4-flash
 thinking: off
 readonly: true
 proactive: true

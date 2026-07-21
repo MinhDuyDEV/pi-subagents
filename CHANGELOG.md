@@ -6,6 +6,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-07-21
+
+### Fixed
+
+- Bundled agents now inherit Pi's configured/current model rather than requiring `opencode-go/deepseek-v4-flash`; explicit user and project agent models still take precedence.
+- Test and smoke scripts no longer force `PI_XAI_SIDE_TOOLS=0`.
+
 ## [0.3.3] - 2026-07-21
 
 ### Fixed

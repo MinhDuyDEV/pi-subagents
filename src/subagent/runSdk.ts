@@ -18,7 +18,10 @@ export interface RunSdkSubagentOptions {
   onSession?: (session: any) => () => void;
 }
 
-async function resolveModel(ctx: ExtensionContext, requested?: string) {
+export async function resolveSdkModel(
+  ctx: Pick<ExtensionContext, "model" | "modelRegistry">,
+  requested?: string,
+) {
   const registry = ctx.modelRegistry as any;
   if (requested) {
     const [provider, ...rest] = requested.split("/");
@@ -27,6 +30,8 @@ async function resolveModel(ctx: ExtensionContext, requested?: string) {
       ? registry?.find?.(provider, modelId)
       : registry?.find?.(requested);
     if (exact) return exact;
+  } else if (ctx.model) {
+    return ctx.model;
   }
 
   const all = registry?.getAll?.() ?? [];
@@ -47,7 +52,10 @@ export async function runSdkSubagent(options: RunSdkSubagentOptions): Promise<{
   output: string;
   sessionPath?: string;
 }> {
-  const model = await resolveModel(options.ctx, options.model ?? options.agent.model);
+  const model = await resolveSdkModel(
+    options.ctx,
+    options.model ?? options.agent.model,
+  );
   if (!model) {
     throw new Error("No model available for SDK subagent execution");
   }
