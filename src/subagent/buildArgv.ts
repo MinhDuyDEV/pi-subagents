@@ -13,6 +13,7 @@ export interface BuildPiArgvOptions {
   resume?: boolean;
   resumeSessionRef?: string;
   parentToolNames?: string[];
+  taskToolName?: string;
 }
 
 export function buildPiArgv(opts: BuildPiArgvOptions): string[] {
@@ -22,6 +23,7 @@ export function buildPiArgv(opts: BuildPiArgvOptions): string[] {
     tools: agent.tools,
     disallowedTools: agent.disallowedTools,
     parentToolNames: opts.parentToolNames,
+    taskToolName: opts.taskToolName,
   });
 
   const args: string[] = [];

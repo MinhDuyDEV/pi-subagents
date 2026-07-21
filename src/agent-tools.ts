@@ -61,6 +61,8 @@ export interface ResolveAgentToolsInput {
    * (intersection applied when agent also sets `tools:`).
    */
   parentToolNames?: string[];
+  /** Name registered by pi-task in the parent session. */
+  taskToolName?: string;
 }
 
 /**
@@ -73,6 +75,7 @@ export function resolveAgentToolAllowlist(
   const disallowed = new Set(
     parseMergedDisallowedTools(parseToolList(input.disallowedTools).join(",")),
   );
+  const taskToolName = input.taskToolName ?? "task";
 
   let base: string[];
   if (input.tools !== undefined && input.tools !== null && input.tools !== "") {
@@ -91,7 +94,7 @@ export function resolveAgentToolAllowlist(
 
   const allowed = base.filter((t) => !disallowed.has(t));
   // Never delegate nested task from subagent CLI (env also sets PI_TASK_TOOL_DISABLED).
-  const withoutTask = allowed.filter((t) => t !== "task");
+  const withoutTask = allowed.filter((t) => t !== taskToolName);
 
   if (withoutTask.length === 0) {
     throw new Error(
@@ -107,8 +110,9 @@ export function buildAgentToolSelection(input: ResolveAgentToolsInput): {
   tools: string[];
   excludeTools: string[];
 } {
+  const taskToolName = input.taskToolName ?? "task";
   return {
     tools: resolveAgentToolAllowlist(input),
-    excludeTools: ["task"],
+    excludeTools: [taskToolName],
   };
 }

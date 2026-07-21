@@ -5,7 +5,7 @@ import {
   upsertTaskSessionHistory,
   writeRegistry,
 } from "../conversation.js";
-import { parseResultXml } from "../helpers.js";
+import { assessTaskResult, parseResultXml } from "../helpers.js";
 import { createSyncHerdrControl } from "../subagent/herdr.js";
 import { killAgentPane } from "../subagent/tmux.js";
 import { ignoreStaleExtensionCtx } from "../stale-ctx.js";
@@ -29,6 +29,7 @@ export function completeTask(
   resourceCloser: (task: BackgroundTask) => void = closeTaskResource,
 ): void {
   const parsed = parseResultXml(content);
+  const assessment = assessTaskResult(parsed);
   const durationMs = Date.now() - task.startedAt;
   const completedSessionRef = findJsonlSessionByName(
     piDir,
@@ -49,6 +50,8 @@ export function completeTask(
     conversationId: task.conversationId,
     sessionRef: completedSessionRef,
     status: phase,
+    reportedStatus: assessment.reportedStatus,
+    resultValid: assessment.valid,
     completedAt: Date.now(),
     background: true,
   });
@@ -77,7 +80,10 @@ export function completeTask(
           agent_type: task.agentType,
           description: task.description,
           phase,
-          status: phase,
+          execution_phase: phase,
+          status: assessment.reportedStatus,
+          reported_status: assessment.reportedStatus,
+          result_valid: assessment.valid,
           result: content,
           summary: parsed.summary,
           findings: parsed.findings,
@@ -90,13 +96,7 @@ export function completeTask(
           tool_uses: task.toolUses,
           turn_count: task.turns,
           background: true,
-          structured_result: Boolean(
-            parsed.findings ||
-              parsed.evidence ||
-              parsed.files ||
-              parsed.caveats ||
-              parsed.next_steps,
-          ),
+          structured_result: assessment.valid,
           full_output: parsed.raw.trim() || content.trim(),
         },
       },

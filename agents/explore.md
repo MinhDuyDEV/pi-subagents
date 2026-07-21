@@ -7,7 +7,6 @@ thinking: off
 readonly: true
 proactive: true
 tools: read, grep, find, ls, multi_grep, bash
-prompt_mode: append
 ---
 
 # Explore Agent

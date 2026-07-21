@@ -5,7 +5,6 @@ description: >
   NOT for in-repo-only mapping (explore) or docs-only external research (scout).
 thinking: off
 proactive: true
-prompt_mode: append
 ---
 
 # General

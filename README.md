@@ -117,13 +117,12 @@ readonly: true
 # proactive: true   # listed in proactive delegation block on task tool
 tools: read, grep, find, ls
 disallowed_tools: edit, write
-prompt_mode: append
 ---
 
 # Agent instructions
 ```
 
-Pi has one session parent agent; all `*.md` agents under `agents/` are **task subagents** only. Use `hidden` for internal/orchestration-only agents.
+Pi has one session parent agent; all `*.md` agents under `agents/` are **task subagents** only. pi-task always appends the agent Markdown body to the child system prompt; `prompt_mode` is not a supported frontmatter field. Use `hidden` for internal/orchestration-only agents.
 
 `tools:` is an explicit allowlist. If omitted, pi-task starts from the tools actually registered in the parent Pi session, then removes `disallowed_tools`. `readonly: true` always adds write/edit/apply_patch to the deny list, even when `tools:` is explicit. It does **not** deny `bash`; use explicit `tools:` or `disallowed_tools: bash` when an agent must not run shell. Recursive `task` delegation is always blocked.
 
@@ -149,6 +148,7 @@ Keep the parent responsible for orchestration decisions and final verification. 
 | `PI_TASK_CHILD_NO_EXTENSIONS=1` | Child `pi` runs with `--no-extensions` (fewer startup failures in tmux subagents). |
 | `PI_TASK_POLL_MS` | Background poll interval (default 2000). |
 | `PI_TASK_BACKEND` | `auto` (default), `herdr`, `tmux`, or `sdk`. `auto` prefers HerdR only when Pi is already running inside an active HerdR pane, then tmux, then SDK. |
+| `PI_TASK_TOOL_NAME` | Delegation tool name, default `task`. Set `Agent` to align with Claude Code's native subagent tool name. Invalid or colliding names prevent registration. |
 | `PI_TASK_HERDR_SHELL` | POSIX shell executable for HerdR child commands; default `sh`. On Windows, pi-task checks common Git `sh.exe` locations before falling back to `sh` on the HerdR daemon's `PATH`. |
 | `PI_TASK_TMUX_SPLIT` | Tmux pane orientation: `auto` (default), `horizontal` (side-by-side), or `vertical` (top/bottom). Auto uses a horizontal split when pane width is at least twice its height; otherwise it uses a vertical split. |
 

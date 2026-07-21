@@ -6,6 +6,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.5] - 2026-07-21
+
+### Added
+
+- `PI_TASK_TOOL_NAME` opt-in configuration for the delegation tool name; `task` remains the default and `Agent` enables Claude Code-compatible naming.
+
+### Fixed
+
+- SDK background tasks now deliver success and failure results to the parent, and all execution paths preserve child-reported outcome separately from runtime completion state.
+- Subagents exclude the configured delegation tool name, preventing nested task delegation after a tool-name override.
+
 ## [0.3.4] - 2026-07-21
 
 ### Fixed

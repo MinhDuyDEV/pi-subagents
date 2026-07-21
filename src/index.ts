@@ -47,6 +47,7 @@ import {
       discoverAgents,
       subscribeToolEvents,
   resolveTaskAgentPreflight,
+  assessTaskResult,
   buildTaskEnvelope,
   formatBackgroundReceipt,
   parseResultXml,
@@ -107,6 +108,14 @@ const BUNDLED_AGENT_DIR = join(
 export default function (pi: ExtensionAPI) {
   // Prevent recursive loading
   if (process.env.PI_TASK_TOOL_DISABLED === "1") return;
+
+  const taskToolName = process.env.PI_TASK_TOOL_NAME?.trim() || "task";
+  if (!/^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(taskToolName)) {
+    throw new Error(`Invalid PI_TASK_TOOL_NAME: ${taskToolName}`);
+  }
+  if (pi.getAllTools().some((tool) => tool.name === taskToolName)) {
+    throw new Error(`PI_TASK_TOOL_NAME collides with an existing tool: ${taskToolName}`);
+  }
 
   // ── Background task tracker ────────────────────────────────────────────
       const { piDir } = discoverAgents(process.cwd(), BUNDLED_AGENT_DIR);
@@ -187,8 +196,8 @@ export default function (pi: ExtensionAPI) {
   // ── Tool Registration ──────────────────────────────────────────────────
 
   pi.registerTool({
-    name: "task",
-    label: "Task",
+    name: taskToolName,
+    label: taskToolName,
     description: buildTaskToolDescription(discoverAgents(process.cwd(), BUNDLED_AGENT_DIR).agents),
     promptSnippet: "Delegate work to a specialist agent via the task tool",
     promptGuidelines: [
@@ -534,6 +543,7 @@ export default function (pi: ExtensionAPI) {
         promptContent,
         resume,
         parentToolNames,
+        taskToolName,
         resumeSessionRef,
       );
       const envPrefix = `PI_TASK_TOOL_DISABLED=1`;
@@ -573,6 +583,7 @@ export default function (pi: ExtensionAPI) {
             tools: agent.tools,
             disallowedTools: agent.disallowedTools,
             parentToolNames,
+            taskToolName,
           });
           const runSdkFallback = async (
             foregroundTask?: BackgroundTask,
@@ -648,6 +659,73 @@ export default function (pi: ExtensionAPI) {
                 artifactsDir,
                 conversationId,
                 run: async () => runSdkFallback(undefined, bgOnSession),
+                onComplete: (result) => {
+                  const parsed = parseResultXml(result.output);
+                  const assessment = assessTaskResult(parsed);
+                  const summary = parsed.summary || "SDK subagent completed without assistant text.";
+                  ignoreStaleExtensionCtx(() =>
+                    pi.sendMessage(
+                      {
+                        customType: "task-complete",
+                        content: `Background task ${id} (${agent.name}) done.\n\n${summary}`,
+                        display: true,
+                        details: {
+                          task_id: id,
+                          agent_type: agent.name,
+                          description: descText,
+                          phase: "done",
+                          execution_phase: "done",
+                          status: assessment.reportedStatus,
+                          reported_status: assessment.reportedStatus,
+                          result_valid: assessment.valid,
+                          result: result.output,
+                          summary: parsed.summary,
+                          findings: parsed.findings,
+                          evidence: parsed.evidence,
+                          files: parsed.files,
+                          caveats: parsed.caveats,
+                          next_steps: parsed.next_steps,
+                          confidence: parsed.confidence,
+                          duration_ms: Date.now() - backgroundTask.startedAt,
+                          tool_uses: backgroundTask.toolUses,
+                          turn_count: backgroundTask.turns,
+                          background: true,
+                          structured_result: assessment.valid,
+                          full_output: parsed.raw.trim() || result.output.trim(),
+                        },
+                      },
+                      { triggerTurn: true, deliverAs: "followUp" },
+                    ),
+                  );
+                },
+                onFailed: (error) => {
+                  const message = error instanceof Error ? error.message : String(error);
+                  ignoreStaleExtensionCtx(() =>
+                    pi.sendMessage(
+                      {
+                        customType: "task-complete",
+                        content: `Background task ${id} (${agent.name}) failed.\n\n${message}`,
+                        display: true,
+                        details: {
+                          task_id: id,
+                          agent_type: agent.name,
+                          description: descText,
+                          phase: "failed",
+                          execution_phase: "failed",
+                          status: "unknown",
+                          reported_status: "unknown",
+                          result_valid: false,
+                          summary: message,
+                          duration_ms: Date.now() - backgroundTask.startedAt,
+                          tool_uses: backgroundTask.toolUses,
+                          turn_count: backgroundTask.turns,
+                          background: true,
+                        },
+                      },
+                      { triggerTurn: true, deliverAs: "followUp" },
+                    ),
+                  );
+                },
                 onSettled: () => {
                   backgroundTasks.delete(id);
                   ignoreStaleExtensionCtx(() => clearTaskWidgetIfIdle());
@@ -673,6 +751,7 @@ export default function (pi: ExtensionAPI) {
 
           const finalOutput = output || "SDK subagent completed without assistant text.";
               const parsed = parseResultXml(finalOutput);
+              const assessment = assessTaskResult(parsed);
               const envelope = buildTaskEnvelope(parsed, {
                 agent_type: agent.name,
                 description: descText,
@@ -685,6 +764,9 @@ export default function (pi: ExtensionAPI) {
                 details: {
                   ...envelope.details,
                   phase: "done" as const,
+                  execution_phase: "done" as const,
+                  reported_status: assessment.reportedStatus,
+                  result_valid: assessment.valid,
                   backend: "sdk" as const,
                   session_path: sessionPath,
                   conversation_id: conversationId,
@@ -699,6 +781,10 @@ export default function (pi: ExtensionAPI) {
             ],
             details: {
               phase: "failed" as const,
+              execution_phase: "failed" as const,
+              status: "unknown",
+              reported_status: "unknown",
+              result_valid: false,
               backend: "sdk" as const,
               error: message,
             },
@@ -810,6 +896,8 @@ export default function (pi: ExtensionAPI) {
         stopProgress();
         signal?.removeEventListener("abort", onAbort);
         const content = completion.content;
+        const parsed = parseResultXml(content);
+        const assessment = assessTaskResult(parsed);
         const phase =
           completion.status === "completed"
             ? "done"
@@ -834,6 +922,8 @@ export default function (pi: ExtensionAPI) {
           conversationId,
           sessionRef: completedSessionRef,
           status: phase,
+          reportedStatus: assessment.reportedStatus,
+          resultValid: assessment.valid,
           completedAt: Date.now(),
           background: false,
         });
@@ -857,7 +947,6 @@ export default function (pi: ExtensionAPI) {
         }
         foregroundTasks.delete(id);
         clearTaskWidgetIfIdle();
-            const parsed = parseResultXml(content);
         const durationMs = Date.now() - startedAt;
         const { toolUses, turns } = countToolUses(sessionDir, sessionName);
         const envelope = buildTaskEnvelope(parsed, {
@@ -873,7 +962,9 @@ export default function (pi: ExtensionAPI) {
             ...envelope.details,
             task_id: id,
             phase,
-            status: "done",
+            execution_phase: phase,
+            reported_status: assessment.reportedStatus,
+            result_valid: assessment.valid,
             confidence: parsed.confidence || "",
             turn_count: turns,
             conversation_id: conversationId,

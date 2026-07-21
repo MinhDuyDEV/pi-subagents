@@ -1,4 +1,4 @@
-import type { ToolCallRecord } from "./helpers.js";
+import type { TaskReportedStatus, ToolCallRecord } from "./helpers.js";
 import type { TerminalHandle, TerminalBackendKind } from "./subagent/terminalBackend.js";
 export type { TerminalHandle, HerdrTerminalHandle } from "./subagent/terminalBackend.js";
 
@@ -49,6 +49,8 @@ export interface RegistryEntry {
 /** Durable task→session mapping used for resume after task completion. */
 export interface TaskSessionHistoryEntry extends RegistryEntry {
   status: "running" | "done" | "cancelled" | "aborted" | "failed" | "timeout";
+  reportedStatus?: TaskReportedStatus;
+  resultValid?: boolean;
   completedAt?: number;
   background: boolean;
 }

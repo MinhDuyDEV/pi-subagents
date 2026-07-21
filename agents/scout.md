@@ -6,7 +6,6 @@ thinking: high
 readonly: true
 proactive: true
 skills: memory, source-driven-development, brave-search, webclaw, opensrc
-prompt_mode: append
 ---
 
 # Scout Agent

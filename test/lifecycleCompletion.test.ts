@@ -11,6 +11,43 @@ import {
 import { completeTask } from "../src/lifecycle/completion.js";
 import type { BackgroundTask } from "../src/types.js";
 
+test("completion preserves the child-reported outcome separately from execution", () => {
+  const piDir = mkdtempSync(join(tmpdir(), "pi-task-completion-status-"));
+  const task: BackgroundTask = {
+    dir: join(piDir, "artifacts", "tasks", "task-2"),
+    agentType: "general",
+    sessionName: "task-task-2",
+    originalPane: null,
+    description: "reported status",
+    startedAt: Date.now() - 1000,
+    toolUses: 0,
+    turns: 0,
+  };
+  let details: Record<string, unknown> | undefined;
+
+  completeTask(
+    {
+      sendMessage: (message: { details: Record<string, unknown> }) => {
+        details = message.details;
+      },
+    } as never,
+    "task-2",
+    task,
+    "<status>failure</status>\n<summary>Tests failed</summary>",
+    "done",
+    piDir,
+  );
+
+  const history = readTaskSessionHistory(piDir);
+  assert.equal(history[0]?.status, "done");
+  assert.equal(history[0]?.reportedStatus, "failure");
+  assert.equal(history[0]?.resultValid, true);
+  assert.equal(details?.status, "failure");
+  assert.equal(details?.execution_phase, "done");
+  assert.equal(details?.reported_status, "failure");
+  assert.equal(details?.result_valid, true);
+});
+
 test("completion is persisted and removed from the registry before pane cleanup", () => {
   const piDir = mkdtempSync(join(tmpdir(), "pi-task-completion-"));
   const task: BackgroundTask = {

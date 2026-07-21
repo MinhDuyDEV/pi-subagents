@@ -6,7 +6,6 @@ thinking: xhigh
 readonly: true
 proactive: true
 disallowed_tools: edit
-prompt_mode: append
 ---
 
 # Reviewer Agent

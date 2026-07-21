@@ -1,4 +1,5 @@
 import { upsertTaskSessionHistory } from "../conversation.js";
+import { assessTaskResult, parseResultXml } from "../helpers.js";
 
 export interface SdkBackgroundResult {
   output: string;
@@ -15,6 +16,8 @@ export interface SdkBackgroundTaskInput {
   artifactsDir: string;
   conversationId?: string;
   run: () => Promise<SdkBackgroundResult>;
+  onComplete?: (result: SdkBackgroundResult) => void;
+  onFailed?: (error: unknown) => void;
   onSettled?: () => void;
   now?: () => number;
 }
@@ -38,6 +41,7 @@ export function startSdkBackgroundTask(input: SdkBackgroundTaskInput): void {
   void input
     .run()
     .then((result) => {
+      const assessment = assessTaskResult(parseResultXml(result.output));
       upsertTaskSessionHistory(input.piDir, {
         id: input.id,
         agentType: input.agentType,
@@ -49,11 +53,18 @@ export function startSdkBackgroundTask(input: SdkBackgroundTaskInput): void {
         conversationId: input.conversationId,
         sessionRef: result.sessionPath ?? undefined,
         status: "done",
+        reportedStatus: assessment.reportedStatus,
+        resultValid: assessment.valid,
         completedAt: now(),
         background: true,
       });
+      try {
+        input.onComplete?.(result);
+      } catch {
+        // Parent notification failure must not rewrite a completed task as failed.
+      }
     })
-    .catch(() => {
+    .catch((error: unknown) => {
       upsertTaskSessionHistory(input.piDir, {
         id: input.id,
         agentType: input.agentType,
@@ -67,6 +78,11 @@ export function startSdkBackgroundTask(input: SdkBackgroundTaskInput): void {
         completedAt: now(),
         background: true,
       });
+      try {
+        input.onFailed?.(error);
+      } catch {
+        // Notification failure does not change the durable task failure.
+      }
     })
     .finally(() => input.onSettled?.());
 }

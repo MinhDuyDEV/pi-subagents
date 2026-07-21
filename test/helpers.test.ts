@@ -8,6 +8,7 @@ import { strict as assert } from "node:assert";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { resolveAgentToolAllowlist } from "../src/agent-tools.js";
 import {
   parseResultXml,
   extractTag,
@@ -1192,4 +1193,16 @@ console.log("ALL TASK HELPER TESTS PASSED");
       const { normalizeConversationId } = await import("../src/conversation.js");
       assert.equal(normalizeConversationId(" research-ai "), "research-ai");
       assert.equal(normalizeConversationId("research/ai"), "research-ai");
+    }
+
+    {
+      const t = "configured task tool is excluded from subagents";
+      assert.deepEqual(
+        resolveAgentToolAllowlist({
+          parentToolNames: ["read", "Agent"],
+          taskToolName: "Agent",
+        }),
+        ["read"],
+        t,
+      );
     }

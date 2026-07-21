@@ -69,6 +69,38 @@ export interface ParsedResult {
   raw: string;
 }
 
+export type TaskReportedStatus =
+  | "success"
+  | "failure"
+  | "blocked"
+  | "partial"
+  | "unknown";
+
+export interface TaskResultAssessment {
+  reportedStatus: TaskReportedStatus;
+  valid: boolean;
+}
+
+export function assessTaskResult(result: ParsedResult): TaskResultAssessment {
+  const reportedStatus = isTaskReportedStatus(result.status)
+    ? result.status
+    : "unknown";
+  return {
+    reportedStatus,
+    valid: reportedStatus !== "unknown" && result.summary.length > 0,
+  };
+}
+
+function isTaskReportedStatus(status: string): status is TaskReportedStatus {
+  return (
+    status === "success" ||
+    status === "failure" ||
+    status === "blocked" ||
+    status === "partial" ||
+    status === "unknown"
+  );
+}
+
 /** A single tool call extracted from a subagent session JSONL. */
 export interface ToolCallRecord {
   /** Tool name (e.g. "websearch", "read", "bash") */
@@ -260,13 +292,7 @@ export function buildTaskEnvelope(
     background: boolean;
   },
 ): { content: Array<{ type: "text"; text: string }>; details: Record<string, unknown> } {
-  const structured = Boolean(
-    parsed.findings ||
-      parsed.evidence ||
-      parsed.files ||
-      parsed.caveats ||
-      parsed.next_steps,
-  );
+  const assessment = assessTaskResult(parsed);
   return {
     content: [{ type: "text", text: parsed.summary }],
     details: {
@@ -275,14 +301,15 @@ export function buildTaskEnvelope(
       tool_uses: meta.tool_uses,
       duration_ms: meta.duration_ms,
       background: meta.background,
-      status: parsed.status,
+      status: assessment.reportedStatus,
+      result_valid: assessment.valid,
       summary: parsed.summary,
       findings: parsed.findings,
       evidence: parsed.evidence,
       files: parsed.files,
       caveats: parsed.caveats,
       next_steps: parsed.next_steps,
-      structured_result: structured,
+      structured_result: assessment.valid,
     },
   };
 }
@@ -582,6 +609,7 @@ export function formatAgentList(agents: AgentConfig[]): string {
       promptContent: string,
       resume?: boolean,
       parentToolNames?: string[],
+      taskToolName?: string,
       resumeSessionRef?: string,
     ): string[] {
       return buildPiArgv({
@@ -592,6 +620,7 @@ export function formatAgentList(agents: AgentConfig[]): string {
         resume,
         resumeSessionRef,
         parentToolNames,
+        taskToolName,
       });
     }
 
