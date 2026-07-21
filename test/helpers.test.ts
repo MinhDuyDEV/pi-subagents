@@ -1002,6 +1002,7 @@ import {
     [
       "split-window",
       "-v",
+      "-d",
       "-P",
       "-F",
       "#{pane_id}",
@@ -1020,6 +1021,7 @@ import {
     [
       "split-window",
       "-h",
+      "-d",
       "-P",
       "-F",
       "#{pane_id}",

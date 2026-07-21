@@ -6,6 +6,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.6] - 2026-07-21
+
+### Fixed
+
+- Tmux-backed background subagents now launch detached, preserving focus in the parent pane during parallel delegation.
+- Removed an invalid extension-load-time tool inventory call that prevented pi-task v0.3.5 from loading.
+
 ## [0.3.5] - 2026-07-21
 
 ### Added

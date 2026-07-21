@@ -366,6 +366,7 @@ export function buildTmuxSplitWindowArgs(
   const args = [
     "split-window",
     direction,
+    "-d",
     "-P",
     "-F",
     "#{pane_id}",

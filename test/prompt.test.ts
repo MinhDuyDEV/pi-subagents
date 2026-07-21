@@ -34,6 +34,7 @@ import { TASK_PROMPT_INSTRUCTIONS } from "../src/helpers.js";
     "utf8",
   );
   assert.ok(indexSrc.includes("absolute repo path"), t);
+  assert.ok(!indexSrc.includes("pi.getAllTools()"), "extension load avoids runtime-only tool enumeration");
 }
 
 console.log("prompt.test.ts: all passed");

@@ -113,10 +113,6 @@ export default function (pi: ExtensionAPI) {
   if (!/^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(taskToolName)) {
     throw new Error(`Invalid PI_TASK_TOOL_NAME: ${taskToolName}`);
   }
-  if (pi.getAllTools().some((tool) => tool.name === taskToolName)) {
-    throw new Error(`PI_TASK_TOOL_NAME collides with an existing tool: ${taskToolName}`);
-  }
-
   // ── Background task tracker ────────────────────────────────────────────
       const { piDir } = discoverAgents(process.cwd(), BUNDLED_AGENT_DIR);
       const backgroundTasks = new Map<string, BackgroundTask>();
