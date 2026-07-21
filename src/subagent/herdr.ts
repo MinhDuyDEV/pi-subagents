@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import type { HerdrTerminalHandle } from "../types.js";
 import {
@@ -21,6 +22,22 @@ interface HerdrWorkspace {
 
 interface HerdrResponse<T> {
   result?: T;
+}
+
+const WINDOWS_GIT_SHELLS = [
+  "C:\\Program Files\\Git\\usr\\bin\\sh.exe",
+  "C:\\Program Files\\Git\\bin\\sh.exe",
+] as const;
+
+export function resolveHerdrShell(
+  env: NodeJS.ProcessEnv,
+  platform: NodeJS.Platform = process.platform,
+  fileExists: (path: string) => boolean = existsSync,
+): string {
+  const configured = env.PI_TASK_HERDR_SHELL?.trim();
+  if (configured) return configured;
+  if (platform === "win32") return WINDOWS_GIT_SHELLS.find(fileExists) ?? "sh";
+  return "sh";
 }
 
 let launchQueue: Promise<void> = Promise.resolve();
@@ -228,7 +245,7 @@ export function createHerdrTerminalBackend(
             input.cwd,
             "--no-focus",
             "--",
-            "sh",
+            resolveHerdrShell(env),
             "-lc",
             input.command,
           ]);

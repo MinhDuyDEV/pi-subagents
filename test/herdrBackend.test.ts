@@ -4,7 +4,31 @@ import test from "node:test";
 import {
   createHerdrTerminalBackend,
   createSyncHerdrControl,
+  resolveHerdrShell,
 } from "../src/subagent/herdr.js";
+
+test("HerdR resolves an explicit shell before Windows Git shell discovery", () => {
+  assert.equal(
+    resolveHerdrShell(
+      { PI_TASK_HERDR_SHELL: "C:\\Tools\\sh.exe" },
+      "win32",
+      () => false,
+    ),
+    "C:\\Tools\\sh.exe",
+  );
+});
+
+test("HerdR resolves the first available Windows Git shell before PATH fallback", () => {
+  assert.equal(
+    resolveHerdrShell(
+      {},
+      "win32",
+      (shellPath) => shellPath === "C:\\Program Files\\Git\\bin\\sh.exe",
+    ),
+    "C:\\Program Files\\Git\\bin\\sh.exe",
+  );
+  assert.equal(resolveHerdrShell({}, "win32", () => false), "sh");
+});
 
 test("grouped HerdR launch creates an isolated shared workspace and returns its agent pane", async () => {
   const calls: Array<{ args: string[]; env?: NodeJS.ProcessEnv }> = [];
@@ -85,6 +109,7 @@ test("ungrouped HerdR launch starts in the caller tab", async () => {
       HERDR_ENV: "1",
       HERDR_PANE_ID: "w1:p1",
       HERDR_SOCKET_PATH: "/tmp/herdr.sock",
+      PI_TASK_HERDR_SHELL: "C:\\Tools\\sh.exe",
     },
     run: async (_command, args) => {
       calls.push([...args]);
@@ -110,7 +135,7 @@ test("ungrouped HerdR launch starts in the caller tab", async () => {
       "/repo",
       "--no-focus",
       "--",
-      "sh",
+      "C:\\Tools\\sh.exe",
       "-lc",
       "pi --session task",
     ],

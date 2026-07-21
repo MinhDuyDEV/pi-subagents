@@ -6,6 +6,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-07-21
+
+### Fixed
+
+- HerdR-backed tasks on Windows can use `PI_TASK_HERDR_SHELL` or automatic Git `sh.exe` detection instead of requiring `sh` on the HerdR daemon's `PATH`.
+
 ## [0.3.2] - 2026-07-19
 
 ### Added
