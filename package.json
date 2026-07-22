@@ -1,6 +1,6 @@
 {
   "name": "@heyhuynhgiabuu/pi-task",
-  "version": "0.3.6",
+  "version": "0.3.8",
   "description": "Delegating task/subagent extension for Pi: foreground/background subagents, widgets, tmux observability, SDK fallback.",
   "type": "module",
   "main": "dist/index.js",
@@ -44,13 +44,16 @@
   ],
   "license": "MIT",
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.80.0",
-    "@earendil-works/pi-tui": "^0.80.0",
-    "@sinclair/typebox": "*"
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
   },
   "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.81.0",
+    "@earendil-works/pi-tui": "^0.81.0",
     "@types/node": "^20.0.0",
     "tsx": "^4.20.6",
+    "typebox": "1.1.38",
     "typescript": "^5.0.0"
   },
   "publishConfig": {

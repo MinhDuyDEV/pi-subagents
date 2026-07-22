@@ -23,7 +23,9 @@ export type HerdrTerminalHandle = Extract<TerminalHandle, { backend: "herdr" }>;
 
 export interface TerminalLaunchInput {
   cwd: string;
-  command: string;
+  command?: string;
+  agentArgs?: readonly string[];
+  initialPrompt?: string;
   label?: string;
   direction?: "right" | "down";
   env?: Record<string, string>;
@@ -161,6 +163,9 @@ export function createTmuxTerminalBackend(
     },
 
     async launch(input) {
+      if (!input.command) {
+        throw new Error("tmux backend requires a launch command");
+      }
       const configuredMode =
         input.direction === "right"
           ? "horizontal"

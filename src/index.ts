@@ -17,7 +17,7 @@
 
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -63,7 +63,6 @@ import {
 import { formatSdkBackgroundReceipt, startSdkBackgroundTask } from "./subagent/sdkBackground.js";
 import { runSdkSubagent } from "./subagent/runSdk.js";
 import { createDefaultHerdrTerminalBackend, createSyncHerdrControl } from "./subagent/herdr.js";
-import { ensureExitSentinelDirectory, getExitSentinelPath, wrapWithHerdrExitSentinel } from "./subagent/exitSentinel.js";
 import { selectTerminalBackend } from "./subagent/terminalBackend.js";
 import { steerRunningBackgroundTask } from "./subagent/steer.js";
 import {
@@ -315,7 +314,6 @@ export default function (pi: ExtensionAPI) {
             paneId: entry.handle?.resourceId ?? entry.paneId,
             handle: entry.handle,
             backend: entry.handle?.backend ?? "tmux",
-            exitSentinelPath: entry.handle?.backend === "herdr" ? getExitSentinelPath(piDir, entry.id) : undefined,
             originalPane: null,
             description: params.description || entry.description,
             startedAt: entry.startedAt,
@@ -426,7 +424,6 @@ export default function (pi: ExtensionAPI) {
             paneId: entry.handle?.resourceId ?? entry.paneId,
             handle: entry.handle,
             backend: entry.handle?.backend ?? "tmux",
-            exitSentinelPath: entry.handle?.backend === "herdr" ? getExitSentinelPath(piDir, entry.id) : undefined,
             originalPane: null,
             description: params.description || entry.description,
             startedAt: entry.startedAt,
@@ -532,17 +529,6 @@ export default function (pi: ExtensionAPI) {
           await mkdir(sessionDir, { recursive: true });
 
       // ─── Build and run the sub-agent pi process ──────────────────────────
-      const piArgs = buildPiArgs(
-        agent,
-        sessionName,
-        sessionDir,
-        promptContent,
-        resume,
-        parentToolNames,
-        taskToolName,
-        resumeSessionRef,
-      );
-      const envPrefix = `PI_TASK_TOOL_DISABLED=1`;
       const legacyRequestedBackend = process.env.PI_TASK_USE_TMUX_BACKEND === "1"
         ? "tmux"
         : process.env.PI_TASK_USE_SDK_BACKEND === "1"
@@ -573,6 +559,27 @@ export default function (pi: ExtensionAPI) {
           details: { phase: "failed" as const, error },
         };
       }
+      let promptLaunch:
+        | { systemPromptPath: string; deferTaskPrompt: boolean }
+        | undefined;
+      if (selectedBackend === "herdr") {
+        promptLaunch = {
+          systemPromptPath: join(sessionDir, "agent-system-prompt.md"),
+          deferTaskPrompt: true,
+        };
+        await writeFile(promptLaunch.systemPromptPath, agent.body, "utf8");
+      }
+      const piArgs = buildPiArgs(
+        agent,
+        sessionName,
+        sessionDir,
+        promptContent,
+        resume,
+        parentToolNames,
+        taskToolName,
+        resumeSessionRef,
+        promptLaunch,
+      );
       const useSdkBackend = selectedBackend === "sdk";
 
           const toolSelection = buildAgentToolSelection({
@@ -792,30 +799,26 @@ export default function (pi: ExtensionAPI) {
         }
       }
 
-      const shellCommand = `${envPrefix} pi ${piArgs.map((a) => shellQuote(a)).join(" ")}`;
-      const sessionFile = join(sessionDir, sessionName + ".jsonl");
-      const exitSentinelPath = getExitSentinelPath(piDir, id);
-      if (selectedBackend === "herdr") ensureExitSentinelDirectory(exitSentinelPath);
-      const childCommand = `cd ${shellQuote(ctx.cwd)} && ${shellCommand}`;
-      const terminalCommand = selectedBackend === "herdr"
-        ? wrapWithHerdrExitSentinel(childCommand, exitSentinelPath, id)
-        : wrapWithPaneExitWatcher(sessionFile, childCommand);
-
       let paneId: string;
       let originalPane: string | null;
       let handle: TerminalHandle;
       try {
         if (selectedBackend === "herdr") {
           handle = await herdrBackend.launch({
-            command: terminalCommand,
+            agentArgs: piArgs,
+            initialPrompt: promptContent,
             cwd: ctx.cwd,
-                label: `${agent.name}-${id.slice(0, 8)}`,
-                workspaceGroup: params.workspace_group,
-
+            env: { PI_TASK_TOOL_DISABLED: "1" },
+            label: `${agent.name}-${id.slice(0, 8)}`,
+            workspaceGroup: params.workspace_group,
           });
           paneId = handle.resourceId;
           originalPane = process.env.HERDR_PANE_ID ?? null;
         } else {
+          const shellCommand = `PI_TASK_TOOL_DISABLED=1 pi ${piArgs.map((a) => shellQuote(a)).join(" ")}`;
+          const sessionFile = join(sessionDir, sessionName + ".jsonl");
+          const childCommand = `cd ${shellQuote(ctx.cwd)} && ${shellCommand}`;
+          const terminalCommand = wrapWithPaneExitWatcher(sessionFile, childCommand);
           const splitResult = splitWindowPane(ctx.cwd, terminalCommand);
           paneId = splitResult.paneId;
           originalPane = splitResult.originalPane;
@@ -884,7 +887,6 @@ export default function (pi: ExtensionAPI) {
               timeoutMs: TASK_TIMEOUT_MS,
               pollMs: 1000,
               sinceMs: startedAt,
-              exitSentinelPath: selectedBackend === "herdr" ? exitSentinelPath : undefined,
               resourceExists: selectedBackend === "herdr"
                 ? () => herdrBackend.isAlive(handle as Extract<TerminalHandle, { backend: "herdr" }>)
                 : undefined,
@@ -977,7 +979,6 @@ export default function (pi: ExtensionAPI) {
         sessionName,
         paneId,
         handle,
-        exitSentinelPath: selectedBackend === "herdr" ? exitSentinelPath : undefined,
         originalPane,
         description: descText,
         startedAt: Date.now(),

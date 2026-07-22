@@ -5,6 +5,11 @@
 import type { AgentConfig } from "../helpers.js";
 import { resolveAgentToolAllowlist } from "../agent-tools.js";
 
+export interface PiPromptLaunchOptions {
+  systemPromptPath: string;
+  deferTaskPrompt: boolean;
+}
+
 export interface BuildPiArgvOptions {
   agent: AgentConfig;
   sessionName: string;
@@ -14,6 +19,7 @@ export interface BuildPiArgvOptions {
   resumeSessionRef?: string;
   parentToolNames?: string[];
   taskToolName?: string;
+  promptLaunch?: PiPromptLaunchOptions;
 }
 
 export function buildPiArgv(opts: BuildPiArgvOptions): string[] {
@@ -36,7 +42,10 @@ export function buildPiArgv(opts: BuildPiArgvOptions): string[] {
   args.push("--name", sessionName);
   args.push("--session-dir", sessionDir);
   if (resume) args.push("--session", opts.resumeSessionRef ?? sessionName);
-  args.push("--append-system-prompt", agent.body);
-  args.push(promptContent);
+  args.push(
+    "--append-system-prompt",
+    opts.promptLaunch?.systemPromptPath ?? agent.body,
+  );
+  if (!opts.promptLaunch?.deferTaskPrompt) args.push(promptContent);
   return args;
 }

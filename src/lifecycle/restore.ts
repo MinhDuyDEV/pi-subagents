@@ -5,7 +5,6 @@ import {
   writeRegistry,
 } from "../conversation.js";
 import { hasAgentFinished } from "../session-text.js";
-import { getExitSentinelPath } from "../subagent/exitSentinel.js";
 import { killAgentPane, paneExists } from "../subagent/tmux.js";
 import type { BackgroundTask, RegistryEntry } from "../types.js";
 
@@ -106,7 +105,6 @@ export function restoreActiveBackgroundTasks(
       sessionName: entry.sessionName,
         paneId,
         handle: entry.handle,
-        exitSentinelPath: entry.handle?.backend === "herdr" ? getExitSentinelPath(piDir, entry.id) : undefined,
         backend: entry.handle?.backend ?? "tmux",
         originalPane: null,
       description: entry.description,

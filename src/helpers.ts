@@ -10,7 +10,10 @@ import { join, dirname, basename, resolve } from "node:path";
 import { parseToolList } from "./agent-tools.js";
 import { parseMergedDisallowedTools } from "./policy.js";
 import type { Theme } from "@earendil-works/pi-coding-agent";
-import { buildPiArgv } from "./subagent/buildArgv.js";
+import {
+  buildPiArgv,
+  type PiPromptLaunchOptions,
+} from "./subagent/buildArgv.js";
 
 
 function parseMarkdownFrontmatter(content: string): {
@@ -612,6 +615,7 @@ export function formatAgentList(agents: AgentConfig[]): string {
       parentToolNames?: string[],
       taskToolName?: string,
       resumeSessionRef?: string,
+      promptLaunch?: PiPromptLaunchOptions,
     ): string[] {
       return buildPiArgv({
         agent,
@@ -622,6 +626,7 @@ export function formatAgentList(agents: AgentConfig[]): string {
         resumeSessionRef,
         parentToolNames,
         taskToolName,
+        promptLaunch,
       });
     }
 

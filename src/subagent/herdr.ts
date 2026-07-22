@@ -1,5 +1,4 @@
 import { execFileSync } from "node:child_process";
-import { existsSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import type { HerdrTerminalHandle } from "../types.js";
 import {
@@ -24,26 +23,10 @@ interface HerdrResponse<T> {
   result?: T;
 }
 
-const WINDOWS_GIT_SHELLS = [
-  "C:\\Program Files\\Git\\usr\\bin\\sh.exe",
-  "C:\\Program Files\\Git\\bin\\sh.exe",
-] as const;
-
-export function resolveHerdrShell(
-  env: NodeJS.ProcessEnv,
-  platform: NodeJS.Platform = process.platform,
-  fileExists: (path: string) => boolean = existsSync,
-): string {
-  const configured = env.PI_TASK_HERDR_SHELL?.trim();
-  if (configured) return configured;
-  if (platform === "win32") return WINDOWS_GIT_SHELLS.find(fileExists) ?? "sh";
-  return "sh";
-}
-
 let launchQueue: Promise<void> = Promise.resolve();
 const groupedWorkspaces = new Map<
   string,
-  { workspaceId: string; references: number }
+  { workspaceId: string; paneIds: Set<string> }
 >();
 
 function workspaceGroupKey(socketPath: string, group: string): string {
@@ -93,11 +76,9 @@ function paneFrom(value: unknown): HerdrPane {
   return pane as HerdrPane;
 }
 
-function parentTabFrom(value: unknown): string {
-  const tabId = paneFrom(value).tab_id;
-  if (typeof tabId !== "string")
-    throw new Error("HerdR pane get did not include tab_id");
-  return tabId;
+function paneHostsPi(value: unknown): boolean {
+  const candidate = value as { pane?: { agent?: unknown } };
+  return candidate.pane?.agent === "pi";
 }
 
 function workspaceFrom(value: unknown): HerdrWorkspace {
@@ -121,6 +102,22 @@ function workspaceFrom(value: unknown): HerdrWorkspace {
 
 function isMissingWorkspace(error: unknown): boolean {
   return /workspace_not_found|workspace not found/i.test(String(error));
+}
+
+function errorText(error: unknown): string {
+  if (!(error instanceof Error)) return String(error);
+  const output = error as Error & { stdout?: unknown; stderr?: unknown };
+  return [error.message, output.stdout, output.stderr]
+    .filter((value): value is string => typeof value === "string")
+    .join("\n");
+}
+
+function isAgentPaneBusy(error: unknown): boolean {
+  return /agent_pane_busy|not an available shell/i.test(errorText(error));
+}
+
+function sleep(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 function sleepSync(milliseconds: number): void {
@@ -198,13 +195,15 @@ export function createHerdrTerminalBackend(
             "HerdR backend requires Pi to run inside an active HerdR pane",
           );
         }
-        const label = input.label ?? "pi-task";
         const groupKey = input.workspaceGroup
           ? workspaceGroupKey(socketPath, input.workspaceGroup)
           : undefined;
         const existingGroup = groupKey
           ? groupedWorkspaces.get(groupKey)
           : undefined;
+        const terminalEnvArgs = Object.entries(input.env ?? {}).flatMap(
+          ([name, value]) => ["--env", `${name}=${value}`],
+        );
         const workspaceResponse =
           groupKey && !existingGroup
             ? await run([
@@ -212,67 +211,98 @@ export function createHerdrTerminalBackend(
                 "create",
                 "--cwd",
                 input.cwd,
+                ...terminalEnvArgs,
                 "--label",
                 input.workspaceGroup!,
                 "--no-focus",
               ])
             : undefined;
-        const workspace = existingGroup
-          ? { workspace_id: existingGroup.workspaceId, root_pane_id: undefined }
-          : workspaceResponse
-            ? workspaceFrom(
-                decode(workspaceResponse.stdout, "workspace create"),
-              )
-            : undefined;
+        const workspace = workspaceResponse
+          ? workspaceFrom(decode(workspaceResponse.stdout, "workspace create"))
+          : undefined;
+        let created: HerdrPane | undefined;
         try {
-          const placement = workspace
-            ? ["--workspace", workspace.workspace_id]
-            : [
-                "--tab",
-                parentTabFrom(
-                  decode(
-                    (await run(["pane", "get", env.HERDR_PANE_ID])).stdout,
-                    "pane get",
-                  ),
-                ),
-              ];
-          const response = await run([
+          if (workspace) {
+            const response = await run(["pane", "get", workspace.root_pane_id]);
+            created = paneFrom(decode(response.stdout, "pane get"));
+          } else {
+            const targetPane = existingGroup
+              ? existingGroup.paneIds.values().next().value
+              : undefined;
+            if (existingGroup && !targetPane) {
+              throw new Error("HerdR workspace has no live task pane to split");
+            }
+            const response = await run([
+              "pane",
+              "split",
+              ...(targetPane ? [targetPane] : ["--current"]),
+              "--direction",
+              input.direction ?? "right",
+              "--cwd",
+              input.cwd,
+              ...terminalEnvArgs,
+              "--no-focus",
+            ]);
+            created = paneFrom(decode(response.stdout, "pane split"));
+          }
+          const startArgs = [
             "agent",
             "start",
-            label,
-            ...placement,
-            "--cwd",
-            input.cwd,
-            "--no-focus",
+            input.label ?? "pi-task",
+            "--kind",
+            "pi",
+            "--pane",
+            created.pane_id,
             "--",
-            resolveHerdrShell(env),
-            "-lc",
-            input.command,
-          ]);
-          const created = paneFrom(decode(response.stdout, "agent start"));
-          if (workspace?.root_pane_id)
-            await run(["pane", "close", workspace.root_pane_id]);
-          if (groupKey && workspace) {
-            groupedWorkspaces.set(groupKey, {
-              workspaceId: workspace.workspace_id,
-              references: (existingGroup?.references ?? 0) + 1,
-            });
+            ...(input.agentArgs ?? []),
+          ];
+          const deadline = Date.now() + 3_000;
+          while (true) {
+            try {
+              const response = await run(startArgs);
+              created = paneFrom(decode(response.stdout, "agent start"));
+              break;
+            } catch (error) {
+              if (!isAgentPaneBusy(error) || Date.now() >= deadline) throw error;
+              await sleep(50);
+            }
+          }
+          if (input.initialPrompt !== undefined) {
+            await run([
+              "agent",
+              "prompt",
+              created.pane_id,
+              input.initialPrompt,
+            ]);
+          }
+          if (groupKey) {
+            const group = existingGroup ?? {
+              workspaceId: workspace!.workspace_id,
+              paneIds: new Set<string>(),
+            };
+            group.paneIds.add(created.pane_id);
+            groupedWorkspaces.set(groupKey, group);
           }
           return {
             backend: "herdr" as const,
             resourceId: created.pane_id,
             socketPath,
             terminalId: created.terminal_id,
-            ...(workspace ? { workspaceId: workspace.workspace_id } : {}),
+            ...(workspace || existingGroup
+              ? { workspaceId: workspace?.workspace_id ?? existingGroup!.workspaceId }
+              : {}),
             ...(input.workspaceGroup
               ? { workspaceGroup: input.workspaceGroup }
               : {}),
           };
         } catch (error) {
-          if (workspaceResponse && workspace)
+          if (workspace) {
             await run(["workspace", "close", workspace.workspace_id]).catch(
               () => undefined,
             );
+          } else if (created) {
+            await run(["pane", "close", created.pane_id]).catch(() => undefined);
+          }
           throw error;
         }
       });
@@ -280,8 +310,12 @@ export function createHerdrTerminalBackend(
 
     async isAlive(handle) {
       try {
-        await verifyOwnership(handle);
-        return true;
+        const owned = requireHerdrHandle(handle);
+        if (!socketPath || owned.socketPath !== socketPath) return false;
+        const response = await run(["pane", "get", owned.resourceId]);
+        const payload = decode(response.stdout, "pane get");
+        if (paneFrom(payload).terminal_id !== owned.terminalId) return false;
+        return paneHostsPi(payload);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         if (/ownership mismatch|not[_ -]?found/i.test(message)) return false;
@@ -321,6 +355,7 @@ export function createHerdrTerminalBackend(
     },
 
     async close(handle) {
+      return serializeLaunch(async () => {
       if (
         handle.backend === "herdr" &&
         handle.workspaceId &&
@@ -332,8 +367,8 @@ export function createHerdrTerminalBackend(
           await run(["pane", "close", handle.resourceId]);
           return;
         }
-        if (group.references > 1) {
-          group.references -= 1;
+        if (!group.paneIds.delete(handle.resourceId)) return;
+        if (group.paneIds.size > 0) {
           await run(["pane", "close", handle.resourceId]);
           return;
         }
@@ -348,6 +383,7 @@ export function createHerdrTerminalBackend(
 
       const owned = await verifyOwnership(handle);
       await run(["pane", "close", owned.resourceId]);
+      });
     },
   };
 }
@@ -409,8 +445,8 @@ export function createSyncHerdrControl(
           run(["pane", "close", handle.resourceId], handle.socketPath);
           return;
         }
-        if (group.references > 1) {
-          group.references -= 1;
+        if (!group.paneIds.delete(handle.resourceId)) return;
+        if (group.paneIds.size > 0) {
           run(["pane", "close", handle.resourceId], handle.socketPath);
           return;
         }

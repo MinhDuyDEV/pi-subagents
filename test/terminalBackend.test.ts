@@ -35,6 +35,19 @@ test("tmux terminal backend preserves the launch handle contract", async () => {
   ]]);
 });
 
+test("tmux terminal backend requires a launch command", async () => {
+  const backend = createTmuxTerminalBackend({
+    run: async () => {
+      throw new Error("tmux should not run without a command");
+    },
+  });
+
+  await assert.rejects(
+    backend.launch({ cwd: "/repo" }),
+    /tmux backend requires a launch command/,
+  );
+});
+
 test("tmux terminal backend auto-detects from current pane geometry", async () => {
   const calls: string[][] = [];
   const backend = createTmuxTerminalBackend({

@@ -6,6 +6,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.8] - 2026-07-22
+
+### Changed
+
+- Migrated the HerdR backend to HerdR 0.7.5's topology-first native agent launch API, preserving caller-tab affinity for ungrouped tasks and shared workspaces for grouped tasks.
+- Updated the development and test baseline to Pi 0.81.0 and Pi's supported `typebox` package while keeping runtime peer dependencies host-provided.
+- HerdR task completion now uses Pi session JSONL plus live agent detection instead of an exit sentinel.
+
+### Fixed
+
+- HerdR-backed tasks now pass the multiline system prompt through a file and submit the raw task prompt after agent startup, avoiding control-character rejection without wrapping user instructions as a file attachment.
+- Hardened parallel HerdR launch and cleanup ownership by tracking task pane identities and serializing lifecycle mutations.
+
+### Removed
+
+- Removed `PI_TASK_HERDR_SHELL`; native `herdr agent start` no longer launches tasks through a configurable shell wrapper.
+
 ## [0.3.6] - 2026-07-21
 
 ### Fixed
