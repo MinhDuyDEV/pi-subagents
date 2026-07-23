@@ -1,13 +1,13 @@
 {
   "name": "@minhduydev/pi-subagents",
   "version": "0.1.0",
-  "description": "Delegation runtime for Pi: a robust task/subagent tool (foreground/background, HerdR/tmux/SDK) plus machine-checkable orchestration (resource claims/leases, context packs, evidence-only review, doctor, telemetry) and pane-creation retry. Runtime-only — ships no agent profiles; agents resolve from the consumer's .pi/agents/.",
+  "description": "Delegation runtime for Pi: a robust task/subagent tool (foreground/background, HerdR/tmux/SDK) plus machine-checkable orchestration (resource claims/leases, context packs, evidence-only review, doctor, telemetry) and pane-creation retry. Runtime-only \u2014 ships no agent profiles; agents resolve from the consumer's .pi/agents/.",
   "type": "module",
-  "main": "dist/index.js",
+  "main": "dist/task-runtime.js",
   "exports": {
     ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
+      "types": "./dist/task-runtime.d.ts",
+      "import": "./dist/task-runtime.js"
     }
   },
   "files": [
@@ -21,7 +21,9 @@
     "test": "tsx --test test/helpers.test.ts test/prompt.test.ts test/frontmatter.test.ts test/renderHint.test.ts test/polling.test.ts test/taskWidget.test.ts test/sdkWidgetEvents.test.ts test/sdkBackground.test.ts test/sdkPolling.test.ts test/widgetLifecycle.test.ts test/handles.test.ts test/terminalBackend.test.ts test/herdrBackend.test.ts test/exitSentinel.test.ts test/waitCompletion.test.ts test/restore.test.ts test/lifecycleCompletion.test.ts test/failure-diagnostics.test.ts test/taskTitle.test.ts test/modelSelection.test.ts",
     "smoke": "tsx test/smoke.ts",
     "prepack": "npm run build",
-    "postversion": "git push --follow-tags"
+    "postversion": "git push --follow-tags",
+    "test:orchestration": "vitest run test/orchestration-*.test.ts",
+    "test:base": "tsx --test test/helpers.test.ts test/prompt.test.ts test/frontmatter.test.ts test/renderHint.test.ts test/polling.test.ts test/taskWidget.test.ts test/sdkWidgetEvents.test.ts test/sdkBackground.test.ts test/sdkPolling.test.ts test/widgetLifecycle.test.ts test/handles.test.ts test/terminalBackend.test.ts test/herdrBackend.test.ts test/exitSentinel.test.ts test/waitCompletion.test.ts test/restore.test.ts test/lifecycleCompletion.test.ts test/failure-diagnostics.test.ts test/taskTitle.test.ts test/modelSelection.test.ts"
   },
   "keywords": [
     "pi",
@@ -44,20 +46,25 @@
     "@earendil-works/pi-tui": ">=0.81.1",
     "typebox": "*"
   },
+  "dependencies": {
+    "@sinclair/typebox": "^0.34.48"
+  },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.81.0",
     "@earendil-works/pi-tui": "^0.81.0",
+    "@sinclair/typebox": "^0.34.48",
     "@types/node": "^20.0.0",
     "tsx": "^4.20.6",
     "typebox": "1.1.38",
-    "typescript": "^5.0.0"
+    "typescript": "^5.0.0",
+    "vitest": "^2.1.9"
   },
   "publishConfig": {
     "access": "public"
   },
   "pi": {
     "extensions": [
-      "./dist/index.js"
+      "./dist/task-runtime.js"
     ]
   },
   "repository": {
