@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
@@ -8,11 +8,20 @@ import { resolveSdkModel } from "../src/subagent/runSdk.js";
 
 const bundledAgentDir = fileURLToPath(new URL("../agents/", import.meta.url));
 
-test("bundled agents defer model selection to Pi", () => {
-  for (const name of ["explore", "general", "reviewer", "scout"]) {
-    const content = readFileSync(`${bundledAgentDir}/${name}.md`, "utf8");
-    assert.doesNotMatch(content, /^model:/m, `${name} pins a model`);
+test("runtime-only: ships no bundled agent profiles", () => {
+  // pi-subagents is runtime-only: agents resolve from the consumer's
+  // .pi/agents/ and ~/.pi/agent/agents/. The bundled dir must be empty/absent.
+  let entries: string[] = [];
+  try {
+    entries = readdirSync(bundledAgentDir).filter((f) => f.endsWith(".md"));
+  } catch {
+    // missing dir is the expected runtime-only state in consumers
   }
+  assert.equal(
+    entries.length,
+    0,
+    `pi-subagents must ship no bundled agents; found: ${entries.join(", ")}`,
+  );
 });
 
 test("terminal subagents defer to Pi unless an agent explicitly selects a model", () => {

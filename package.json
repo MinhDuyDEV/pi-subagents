@@ -1,7 +1,7 @@
 {
-  "name": "@heyhuynhgiabuu/pi-task",
-  "version": "0.3.7",
-  "description": "Delegating task/subagent extension for Pi: foreground/background subagents, widgets, tmux observability, SDK fallback.",
+  "name": "@minhduydev/pi-subagents",
+  "version": "0.1.0",
+  "description": "Delegation runtime for Pi: a robust task/subagent tool (foreground/background, HerdR/tmux/SDK) plus machine-checkable orchestration (resource claims/leases, context packs, evidence-only review, doctor, telemetry) and pane-creation retry. Runtime-only — ships no agent profiles; agents resolve from the consumer's .pi/agents/.",
   "type": "module",
   "main": "dist/index.js",
   "exports": {
@@ -10,17 +10,10 @@
       "import": "./dist/index.js"
     }
   },
-  "bin": {
-    "pi-task": "dist/index.js"
-  },
   "files": [
     "dist",
-    "agents",
     "README.md",
-    "LICENSE",
-    "CHANGELOG.md",
-    "media",
-    "!media/demo-background-task.mp4"
+    "LICENSE"
   ],
   "scripts": {
     "build": "tsc",
@@ -37,6 +30,9 @@
     "agent",
     "subagent",
     "task",
+    "delegation",
+    "orchestration",
+    "herdr",
     "tmux",
     "background-tasks",
     "parallel-execution",
@@ -44,8 +40,8 @@
   ],
   "license": "MIT",
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*",
+    "@earendil-works/pi-coding-agent": ">=0.81.1",
+    "@earendil-works/pi-tui": ">=0.81.1",
     "typebox": "*"
   },
   "devDependencies": {
@@ -62,16 +58,14 @@
   "pi": {
     "extensions": [
       "./dist/index.js"
-    ],
-    "video": "https://github.com/heyhuynhgiabuu/pi-task/releases/download/v0.2.0/demo-background-task.mp4",
-    "image": "https://raw.githubusercontent.com/heyhuynhgiabuu/pi-task/main/media/demo.png"
+    ]
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/heyhuynhgiabuu/pi-task.git"
+    "url": "git+https://github.com/MinhDuyDEV/pi-subagents.git"
   },
   "bugs": {
-    "url": "https://github.com/heyhuynhgiabuu/pi-task/issues"
+    "url": "https://github.com/MinhDuyDEV/pi-subagents/issues"
   },
-  "homepage": "https://github.com/heyhuynhgiabuu/pi-task#readme"
+  "homepage": "https://github.com/MinhDuyDEV/pi-subagents#readme"
 }
