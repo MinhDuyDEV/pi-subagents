@@ -71,6 +71,14 @@ export async function appendOrchestrationEvent(input: {
   eventPath: string;
   event: NewOrchestrationEvent;
 }): Promise<OrchestrationEvent> {
+  if (process.env.PI_SUBAGENTS_NO_TELEMETRY === "1") {
+    return {
+      ...input.event,
+      version: ORCHESTRATION_EVENT_VERSION,
+      id: randomUUID(),
+      timestamp: input.event.timestamp ?? new Date().toISOString(),
+    } as OrchestrationEvent;
+  }
   const event: OrchestrationEvent = {
     ...input.event,
     version: ORCHESTRATION_EVENT_VERSION,

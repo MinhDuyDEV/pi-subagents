@@ -138,7 +138,7 @@ function createOrchestratedTaskTool(
       const startedAt = new Date().toISOString();
 
       try {
-        if (orchestration?.claims && orchestration.claims.length > 0) {
+        if (orchestration?.claims && orchestration.claims.length > 0 && process.env.PI_SUBAGENTS_NO_CLAIMS !== "1") {
           lease = await acquireResourceLease({
             storePath: paths.leaseStore,
             owner: orchestrationId,
@@ -237,7 +237,10 @@ function createOrchestratedTaskTool(
           });
         }
 
-        const proof = await recordForegroundCompletion(activeRun, paths);
+        const proof =
+          process.env.PI_SUBAGENTS_NO_PROOF === "1"
+            ? undefined
+            : await recordForegroundCompletion(activeRun, paths);
         if (proof && !proof.valid) {
           throw new EvidenceOnlyProofError(taskId, proof.issues);
         }

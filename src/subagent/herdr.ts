@@ -120,6 +120,34 @@ function sleep(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
+export async function runWithRetry<T>(
+  run: (args: readonly string[]) => Promise<T>,
+  args: readonly string[],
+  options: { label: string; backoffMs?: readonly number[] },
+): Promise<T> {
+  // Retry a HerdR command on transient failure (e.g. `Failed to create herdr
+  // execution pane` under concurrent pane splits). Backoff is short and bounded.
+  // `PI_SUBAGENTS_PANE_RETRIES` overrides the retry count (default 3; 0 disables).
+  const maxRetries = Math.max(0, Number(process.env.PI_SUBAGENTS_PANE_RETRIES ?? 3));
+  const backoff = options.backoffMs ?? [200, 500, 1000];
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+    try {
+      return await run(args);
+    } catch (error) {
+      lastError = error;
+      if (attempt >= maxRetries) break;
+      const delay =
+        backoff[Math.min(attempt, backoff.length - 1)] ?? backoff[backoff.length - 1];
+      await sleep(delay);
+    }
+  }
+  const message = lastError instanceof Error ? lastError.message : String(lastError);
+  throw new Error(
+    `HerdR ${options.label} failed after ${maxRetries + 1} attempt(s): ${message}`,
+  );
+}
+
 function sleepSync(milliseconds: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
 }
@@ -206,16 +234,20 @@ export function createHerdrTerminalBackend(
         );
         const workspaceResponse =
           groupKey && !existingGroup
-            ? await run([
-                "workspace",
-                "create",
-                "--cwd",
-                input.cwd,
-                ...terminalEnvArgs,
-                "--label",
-                input.workspaceGroup!,
-                "--no-focus",
-              ])
+            ? await runWithRetry(
+                run,
+                [
+                  "workspace",
+                  "create",
+                  "--cwd",
+                  input.cwd,
+                  ...terminalEnvArgs,
+                  "--label",
+                  input.workspaceGroup!,
+                  "--no-focus",
+                ],
+                { label: "workspace create" },
+              )
             : undefined;
         const workspace = workspaceResponse
           ? workspaceFrom(decode(workspaceResponse.stdout, "workspace create"))
@@ -223,7 +255,11 @@ export function createHerdrTerminalBackend(
         let created: HerdrPane | undefined;
         try {
           if (workspace) {
-            const response = await run(["pane", "get", workspace.root_pane_id]);
+            const response = await runWithRetry(
+              run,
+              ["pane", "get", workspace.root_pane_id],
+              { label: "pane get" },
+            );
             created = paneFrom(decode(response.stdout, "pane get"));
           } else {
             const targetPane = existingGroup
@@ -232,17 +268,21 @@ export function createHerdrTerminalBackend(
             if (existingGroup && !targetPane) {
               throw new Error("HerdR workspace has no live task pane to split");
             }
-            const response = await run([
-              "pane",
-              "split",
-              ...(targetPane ? [targetPane] : ["--current"]),
-              "--direction",
-              input.direction ?? "right",
-              "--cwd",
-              input.cwd,
-              ...terminalEnvArgs,
-              "--no-focus",
-            ]);
+            const response = await runWithRetry(
+              run,
+              [
+                "pane",
+                "split",
+                ...(targetPane ? [targetPane] : ["--current"]),
+                "--direction",
+                input.direction ?? "right",
+                "--cwd",
+                input.cwd,
+                ...terminalEnvArgs,
+                "--no-focus",
+              ],
+              { label: "pane split" },
+            );
             created = paneFrom(decode(response.stdout, "pane split"));
           }
           const startArgs = [
