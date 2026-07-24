@@ -4,6 +4,11 @@ All notable changes to `@minhduydev/pi-subagents` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- _Development cycle for 0.6.0._
+
 ## [0.5.0] - 2026-07-23
 
 ### Added
