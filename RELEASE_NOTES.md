@@ -1,137 +1,52 @@
-# pi-task v0.2.5
+# @minhduydev/pi-subagents v0.5.0
+
+A Herdr-native, durable, isolation-first delegation runtime for [Pi](https://pi.dev). This release introduces a durable orchestration kernel, typed Herdr integration, Git worktree isolation, runtime-bound evidence receipts, independent review gates, grouped completion, scheduling, RPC v3, recovery, and a packaged Agent Skill — all while preserving the runtime-only design (no bundled agent profiles).
 
 ## Highlights
 
-- **One-tool orchestration:** `task` guidance is stricter and clearer — prompt contract now explicitly requires goal, non-goals, write/read policy, stop condition, and verification recipe.
-- **Cleaner task receipts:** foreground textual progress and background launch receipts now both show the exact subagent JSONL path, without noisy tmux/session-name boilerplate.
-- **Cleaner widgets:** foreground and background widgets both use a compact header + tree-detail layout, with collapsed `(+N more)` tool-call summaries and aligned spacing.
-- **Harness cleanup:** removed stale harness references and dead foreground-progress data plumbing so the extension is cleaner around its single-tool design.
-- **Tests:** widget regression coverage is now part of the main `npm test` run.
+- **Durable task kernel:** `runs.json` with separate execution/verification/review phases, idempotent correctness events, terminal-phase immutability, and cross-restart recovery. The telemetry opt-out strips optional metrics only — the correctness journal is always persisted.
+- **Runtime-bound evidence:** `record_evidence` creates typed receipts with producer identity, observation time, artifact SHA-256, claim binding, and exit code. Self-declared handoff evidence is context only and cannot pass a proof gate.
+- **Independent review gates:** A task cannot self-review. Reviews require a completed, verified, distinct reviewer task matching the configured profile, bound to an immutable subject digest (session + worktree diff + evidence). `ship` enforces the gate; `worktree_merge` enforces it again with diff-digest verification.
+- **Git worktree isolation:** Parallel writers run in dedicated worktrees with base SHA, changed-path, and diff-digest provenance. Launch requires a clean source repository. Explicit `worktree_status`/`worktree_merge`/`worktree_remove` actions handle retained changes.
+- **Typed Herdr client:** Structured envelopes/errors, abort/timeouts, capabilities, atomic `agent prompt`, agent waits, metadata reporting, classified transient retries, and symlink/ownership verification before cleanup.
+- **Grouped completion:** `batch_id` + `join: "group"` coalesces nearby completions into one parent notification to prevent turn storms.
+- **Scheduling & RPC v3:** Durable cron/one-shot schedules and cross-extension RPC with opaque recursive ownership scopes and descendant-first cancellation.
+- **Recovery:** Allocating runs are rebound to the durable registry; terminal JSONL is reconciled after parent restart; file locks heartbeat with process-alive detection.
+- **CI:** Node 20/24 matrix, Pi SDK minimum/latest compatibility, audit, pack, and package-install verification.
+
+## Breaking changes
+
+- **`herdr` → `task_control`:** The orchestration tool is renamed to avoid collision with `@ogulcancelik/pi-herdr`.
+- **Review identity:** Arbitrary `orchestration_id` no longer counts as a review. Use real `reviewer_task_id` from a completed, verified, distinct reviewer task.
+- **Evidence authority:** Handoff evidence strings no longer satisfy proof gates. Use `record_evidence` for gate-authoritative evidence.
+- **Write claims:** `kind: "write"` requires `mode: "exclusive"` and a project-relative path.
+- **Worktree launch:** Requires a clean source repository (no uncommitted changes).
+- **Telemetry opt-out:** `PI_SUBAGENTS_NO_TELEMETRY=1` no longer suppresses the event journal.
 
 ## Upgrade
 
 ```bash
-pi install @heyhuynhgiabuu/pi-task@0.2.5
-# or link local: pi extensions link ~/dev/projects/pi-task
+pi remove npm:@heyhuynhgiabuu/pi-task  # if upgrading from the upstream fork
+pi install npm:@minhduydev/pi-subagents@0.5.0
 ```
 
-Requires peer `@earendil-works/pi-coding-agent` ^0.80.0.
+Requires Pi `0.81.1+`, Node.js `20+`. Optional: Herdr `0.7.5+` or tmux. Git required for worktree isolation.
 
----
+See [`docs/migration-0.5.md`](docs/migration-0.5.md) for the full migration guide.
 
-# Release notes
+## Test results
 
-Human-readable release log for `@heyhuynhgiabuu/pi-task`.
+- 163 tests pass (61 base + 102 orchestration)
+- `tsc --noEmit` clean
+- `npm audit` 0 vulnerabilities
+- Package install test passes
+- No `as any` in source
 
-## 0.2.3 — 2026-07-02
+## Links
 
-### Highlights
-
-- **Task roster:** bundled agents `explore`, `scout`, `general`, `reviewer` (removed worker / planner / vision). YAML `hidden`, `proactive`, `readonly`; dynamic task catalog + preflight.
-- **Workspace scope** in delegated prompts; parent hint to pass absolute repo paths when cwd ≠ target.
-- **Foreground:** sticky header (`toolTitle` agent, `text` tool count while running, `success` duration); description until live stats; `readProgress(sessionDir)`; overlap caps.
-- **Background + results:** shared result body — `muted` toolcalls • `success` duration on **completed** results; one collapsed `⎿` line; task-complete title aligned with sticky; dim `)` on expand hint.
-- **Tests:** prompt, frontmatter, renderHint; smoke peer `pi` version check.
-
-### Upgrade
-
-```bash
-pi install @heyhuynhgiabuu/pi-task@0.2.3
-# or link local: pi extensions link ~/dev/projects/pi-task
-```
-
-Requires peer `@earendil-works/pi-coding-agent` ^0.80.0.
-
-## 0.1.6
-
-### What changed
-
-- Per-task data lives in flat files at the top of `.pi/artifacts/`.
-  No per-task subdirs, no `<task-id>` paths.
-- The subagent's session is auto-saved by pi at
-  `~/.pi/agent/sessions/<cwd>/<session-id>.jsonl`. pi-task does not
-  maintain its own session storage.
-- Task widget rendering is now split into a dedicated module for easier
-  maintenance.
-- Foreground and background widgets now use consistent colors for
-  duration/tool-call stats.
-- Background completion results now use a padded themed main-pane block
-  and no longer duplicate completed-widget notifications.
-- Final foreground tool-call counts now match the live widget count.
-
-### Layout
-
-```
-.pi/artifacts/
-├── TODO.md              pikit canonical (untouched)
-├── PLAN.md              pikit canonical (untouched)
-├── PROGRESS.md          pikit canonical (untouched)
-├── DECISIONS.md         pikit canonical (untouched)
-├── TASKS.md             pi-task: all task data, ### blocks per task
-└── task-sessions.json   pi-task: conversation_id → { task_id, session_file }
-```
-
-No `.pi/task-runs/`. No `.pi/artifacts/task-<id>/` subdirs. No
-CONTEXT.md (the prompt is in the CLI arg). No SESSION.md. No
-RESULT.md (the subagent's final assistant message IS the result;
-pi-task reads it from the auto-saved session file).
-
-### How it works
-
-1. Parent launches `pi --name <task_id> "<prompt>"` in a tmux pane
-   (interactive TUI) — or `pi --mode json` if tmux is unavailable
-2. Subagent works, user watches (in tmux mode)
-3. Subagent's final assistant message IS the result. The prompt
-   tells the subagent to end with a clear summary.
-4. Parent reads the last assistant message from the auto-saved
-   session file (tmux mode) or from the JSON event stream (SDK mode)
-5. Parent embeds the result in `TASKS.md` as a `#### Result` block
-6. Parent updates `task-sessions.json` with the session file path
-7. For resume, parent uses `pi --session <session_file>` to continue
-
-## 0.1.2 — 2025
-
-### Fixed
-
-- **Missing `pi.extensions` field in `package.json`.** Without it, the
-  package was installed into `.pi/npm/node_modules/` by `pi install`
-  but pi's package loader didn't recognize it as an extension, so the
-  `task` tool was never registered. The previous fix (moving deps to
-  `dependencies`) made the package loadable, but the package also
-  needed to declare itself as a pi extension.
-
-  Added:
-
-  ```json
-  "pi": {
-    "extensions": [
-      "./dist/index.js"
-    ]
-  }
-  ```
-
-### What you need to do
-
-After this version is installed, the `task` tool becomes available to
-the LLM in pi. Verify by:
-
-1. Start pi
-2. The status bar / extension list shows `@heyhuynhgiabuu/pi-task`
-3. The LLM can call the `task` tool
-
-## 0.1.1 — 2025
-
-### Fixed
-
-- **`Cannot find package '@earendil-works/pi-tui'`** on `pi install`.
-  `@earendil-works/pi-coding-agent` and `@earendil-works/pi-tui` were
-  declared as `peerDependencies` and `devDependencies`, but the dist
-  has a runtime `import { Text, truncateToWidth } from
-"@earendil-works/pi-tui"`. With `npm install --omit=dev` (the
-  default used by `pi install`), peer deps are recorded but not
-  installed into the package's own `node_modules`. They are now
-  declared in `dependencies` and pinned to `^0.79.0`.
-
-## 0.1.0
-
-Initial release.
+- [CHANGELOG](CHANGELOG.md)
+- [Architecture](docs/architecture.md)
+- [API reference](docs/api.md)
+- [Herdr integration](docs/herdr-integration.md)
+- [Migration guide](docs/migration-0.5.md)
+- [Agent Skill](skills/pi-subagents/SKILL.md)

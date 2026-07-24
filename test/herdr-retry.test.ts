@@ -53,9 +53,9 @@ describe("runWithRetry (pane-creation retry)", () => {
         label: "workspace create",
         backoffMs: [1, 1, 1],
       }),
-      /workspace create failed after 4 attempt\(s\): boom/,
+      /workspace create failed after 1 attempt\(s\): boom/,
     );
-    assert.equal(calls, 4);
+    assert.equal(calls, 1);
   });
 
   test("succeeds on the first attempt when no error occurs", async () => {

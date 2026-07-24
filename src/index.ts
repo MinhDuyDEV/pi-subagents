@@ -20,7 +20,10 @@ import { existsSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type {
+  AgentSession,
+  ExtensionAPI,
+} from "@earendil-works/pi-coding-agent";
 
 import { buildAgentToolSelection } from "./agent-tools.js";
 import {
@@ -62,7 +65,11 @@ import {
 } from "./lifecycle/index.js";
 import { formatSdkBackgroundReceipt, startSdkBackgroundTask } from "./subagent/sdkBackground.js";
 import { runSdkSubagent } from "./subagent/runSdk.js";
-import { createDefaultHerdrTerminalBackend, createSyncHerdrControl } from "./subagent/herdr.js";
+import {
+  createDefaultHerdrTerminalBackend,
+  createSyncHerdrControl,
+  restoreHerdrWorkspaceGroups,
+} from "./subagent/herdr.js";
 import { selectTerminalBackend } from "./subagent/terminalBackend.js";
 import { steerRunningBackgroundTask } from "./subagent/steer.js";
 import {
@@ -92,6 +99,13 @@ import type {
   TerminalHandle,
 } from "./types.js";
 import { ignoreStaleExtensionCtx } from "./stale-ctx.js";
+import {
+  createTaskWorktree,
+  finalizeTaskWorktree,
+  removeTaskWorktree,
+  type WorktreeHandle,
+  type WorktreeResult,
+} from "./worktree.js";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -109,6 +123,7 @@ export default function (pi: ExtensionAPI) {
   if (process.env.PI_TASK_TOOL_DISABLED === "1") return;
 
   const taskToolName = process.env.PI_TASK_TOOL_NAME?.trim() || "task";
+  const herdrWaitController = new AbortController();
   if (!/^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(taskToolName)) {
     throw new Error(`Invalid PI_TASK_TOOL_NAME: ${taskToolName}`);
   }
@@ -116,6 +131,16 @@ export default function (pi: ExtensionAPI) {
       const { piDir } = discoverAgents(process.cwd(), BUNDLED_AGENT_DIR);
       const backgroundTasks = new Map<string, BackgroundTask>();
       const foregroundTasks = new Map<string, BackgroundTask>();
+  const unsubscribeTaskStopped = pi.events.on(
+    "pi-subagents:task-stopped",
+    (payload: unknown) => {
+      if (!payload || typeof payload !== "object") return;
+      const taskId = (payload as { taskId?: unknown }).taskId;
+      if (typeof taskId !== "string") return;
+      backgroundTasks.delete(taskId);
+      foregroundTasks.delete(taskId);
+    },
+  );
   const taskWidget = createTaskWidgetController(foregroundTasks, backgroundTasks);
   const { ensureTaskWidget, clearTaskWidgetIfIdle } = taskWidget;
 
@@ -133,6 +158,19 @@ export default function (pi: ExtensionAPI) {
       throw error;
     }
   };
+  restoreHerdrWorkspaceGroups(
+    readRegistry(piDir)
+      .filter(
+        (entry) =>
+          entry.handle?.backend === "herdr" &&
+          registryEntryStatus(entry) !== "missing",
+      )
+      .map((entry) => entry.handle)
+      .filter(
+        (handle): handle is Extract<TerminalHandle, { backend: "herdr" }> =>
+          handle?.backend === "herdr",
+      ),
+  );
   restoreActiveBackgroundTasks(
     piDir,
     backgroundTasks,
@@ -180,6 +218,8 @@ export default function (pi: ExtensionAPI) {
   // ── Cleanup on shutdown ────────────────────────────────────────────────
 
   pi.on("session_shutdown", () => {
+    herdrWaitController.abort();
+    unsubscribeTaskStopped?.();
     stopBackgroundPolling();
     clearInterval(countInterval);
     taskWidget.dispose();
@@ -265,6 +305,7 @@ export default function (pi: ExtensionAPI) {
           let sessionName: string;
           let resume = false;
           let resumeSessionRef: string | undefined;
+          let resumeWorktree: WorktreeHandle | undefined;
     
           const artifactsDir = join(piDir, "artifacts", "tasks");
     
@@ -290,6 +331,7 @@ export default function (pi: ExtensionAPI) {
               };
             }
             resume = true;
+            resumeWorktree = previous?.worktree;
 
         const entry = readRegistry(piDir).find(
           (candidate) => candidate.id === id,
@@ -320,6 +362,7 @@ export default function (pi: ExtensionAPI) {
             toolUses: 0,
             turns: 0,
             conversationId,
+            worktree: entry.worktree,
             recentCalls: [],
           };
                     backgroundTasks.set(id, bgtask);
@@ -403,6 +446,7 @@ export default function (pi: ExtensionAPI) {
          sessionName = entry.sessionName;
          resume = true;
          resumeSessionRef = entry.sessionRef;
+         resumeWorktree = entry.worktree;
 
         // If background and the terminal resource is still alive, reattach to the tracker.
         const entryStatus = registryEntryStatus(entry);
@@ -430,6 +474,7 @@ export default function (pi: ExtensionAPI) {
             toolUses: 0,
             turns: 0,
             conversationId: entry.conversationId,
+            worktree: entry.worktree,
             recentCalls: [],
           };
           backgroundTasks.set(id, bgtask);
@@ -516,13 +561,35 @@ export default function (pi: ExtensionAPI) {
       const isBackground = params.background ?? TASK_BACKGROUND_DEFAULT;
       // default true
 
+      let worktree = resumeWorktree;
+      if (worktree && !existsSync(worktree.path)) {
+        return {
+          content: [{ type: "text" as const, text: `The isolated worktree for task ${id} no longer exists: ${worktree.path}` }],
+          details: { phase: "failed" as const, error: "Task worktree missing", task_id: id },
+          isError: true,
+        };
+      }
+      if (!worktree && params.isolation === "worktree") {
+        try {
+          worktree = createTaskWorktree({ cwd: ctx.cwd, taskIdHint: id });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          return {
+            content: [{ type: "text" as const, text: message }],
+            details: { phase: "failed" as const, error: message, task_id: id },
+            isError: true,
+          };
+        }
+      }
+      const executionCwd = worktree?.path ?? ctx.cwd;
+
           // ── Build the prompt (instructions are inlined; no CONTEXT.md file) ─
           const promptContent = buildTaskPrompt({
             description: descText,
             agentName: agent.name,
             agentSource: agent.source,
             prompt: params.prompt,
-            cwd: ctx.cwd,
+            cwd: executionCwd,
           });
 
           const sessionDir = join(artifactsDir, "sessions", id);
@@ -590,7 +657,7 @@ export default function (pi: ExtensionAPI) {
           });
           const runSdkFallback = async (
             foregroundTask?: BackgroundTask,
-            onSession?: (session: any) => () => void,
+            onSession?: (session: AgentSession) => () => void,
           ) =>
             runSdkSubagent({
               onSession: foregroundTask
@@ -598,7 +665,7 @@ export default function (pi: ExtensionAPI) {
                 : onSession,
               prompt: promptContent,
               agent,
-              cwd: ctx.cwd,
+              cwd: executionCwd,
               ctx,
               model: agent.model,
               thinkingLevel: agent.thinking,
@@ -620,6 +687,7 @@ export default function (pi: ExtensionAPI) {
             toolUses: 0,
             turns: 0,
             conversationId,
+            worktree,
             recentCalls: [],
           };
 
@@ -645,11 +713,12 @@ export default function (pi: ExtensionAPI) {
                 toolUses: 0,
                 turns: 0,
                 conversationId,
+                worktree,
                 recentCalls: [],
               };
               backgroundTasks.set(id, backgroundTask);
               ignoreStaleExtensionCtx(() => ensureTaskWidget(ctx));
-              const bgOnSession = (session: any) =>
+              const bgOnSession = (session: AgentSession) =>
                 subscribeToolEvents(session, backgroundTask, 10, taskWidget.requestRender);
 
               startSdkBackgroundTask({
@@ -661,8 +730,9 @@ export default function (pi: ExtensionAPI) {
                 piDir,
                 artifactsDir,
                 conversationId,
+                worktree,
                 run: async () => runSdkFallback(undefined, bgOnSession),
-                onComplete: (result) => {
+                onComplete: (result, worktreeResult) => {
                   const parsed = parseResultXml(result.output);
                   const assessment = assessTaskResult(parsed);
                   const summary = parsed.summary || "SDK subagent completed without assistant text.";
@@ -695,13 +765,14 @@ export default function (pi: ExtensionAPI) {
                           background: true,
                           structured_result: assessment.valid,
                           full_output: parsed.raw.trim() || result.output.trim(),
+                          worktree: worktreeResult,
                         },
                       },
                       { triggerTurn: true, deliverAs: "followUp" },
                     ),
                   );
                 },
-                onFailed: (error) => {
+                onFailed: (error, worktreeResult) => {
                   const message = error instanceof Error ? error.message : String(error);
                   ignoreStaleExtensionCtx(() =>
                     pi.sendMessage(
@@ -723,6 +794,7 @@ export default function (pi: ExtensionAPI) {
                           tool_uses: backgroundTask.toolUses,
                           turn_count: backgroundTask.turns,
                           background: true,
+                          worktree: worktreeResult,
                         },
                       },
                       { triggerTurn: true, deliverAs: "followUp" },
@@ -751,6 +823,9 @@ export default function (pi: ExtensionAPI) {
 
             try {
               const { output, sessionPath } = await runSdkFallback(foregroundTask);
+              const worktreeResult = worktree
+                ? finalizeTaskWorktree(worktree)
+                : undefined;
 
           const finalOutput = output || "SDK subagent completed without assistant text.";
               const parsed = parseResultXml(finalOutput);
@@ -774,10 +849,17 @@ export default function (pi: ExtensionAPI) {
                   session_path: sessionPath,
                   conversation_id: conversationId,
                   full_output: parsed.raw.trim() || finalOutput,
+                  worktree: worktreeResult,
                 },
               };
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
+          let failedWorktreeResult: WorktreeResult | undefined;
+          try {
+            failedWorktreeResult = worktree ? finalizeTaskWorktree(worktree) : undefined;
+          } catch {
+            failedWorktreeResult = undefined;
+          }
           return {
             content: [
               { type: "text" as const, text: `SDK task failed: ${message}` },
@@ -790,6 +872,7 @@ export default function (pi: ExtensionAPI) {
               result_valid: false,
               backend: "sdk" as const,
               error: message,
+              worktree: failedWorktreeResult,
             },
             isError: true,
           };
@@ -807,19 +890,20 @@ export default function (pi: ExtensionAPI) {
           handle = await herdrBackend.launch({
             agentArgs: piArgs,
             initialPrompt: promptContent,
-            cwd: ctx.cwd,
+            cwd: executionCwd,
             env: { PI_TASK_TOOL_DISABLED: "1" },
             label: `${agent.name}-${id.slice(0, 8)}`,
             workspaceGroup: params.workspace_group,
+            signal,
           });
           paneId = handle.resourceId;
           originalPane = process.env.HERDR_PANE_ID ?? null;
         } else {
           const shellCommand = `PI_TASK_TOOL_DISABLED=1 pi ${piArgs.map((a) => shellQuote(a)).join(" ")}`;
           const sessionFile = join(sessionDir, sessionName + ".jsonl");
-          const childCommand = `cd ${shellQuote(ctx.cwd)} && ${shellCommand}`;
+          const childCommand = `cd ${shellQuote(executionCwd)} && ${shellCommand}`;
           const terminalCommand = wrapWithPaneExitWatcher(sessionFile, childCommand);
-          const splitResult = splitWindowPane(ctx.cwd, terminalCommand);
+          const splitResult = splitWindowPane(executionCwd, terminalCommand);
           paneId = splitResult.paneId;
           originalPane = splitResult.originalPane;
           handle = { backend: "tmux", resourceId: paneId };
@@ -836,6 +920,13 @@ export default function (pi: ExtensionAPI) {
       } catch {
         foregroundTasks.delete(id);
         clearTaskWidgetIfIdle();
+        if (worktree && !resumeWorktree) {
+          try {
+            removeTaskWorktree(worktree, true);
+          } catch {
+            // Preserve the original launch failure; doctor can report leaked worktrees.
+          }
+        }
         return {
           content: [
             {
@@ -846,6 +937,21 @@ export default function (pi: ExtensionAPI) {
           details: { phase: "failed" as const, error: `${selectedBackend} launch failed` },
           isError: true,
         };
+      }
+
+      if (params.__pi_subagents_invocation_id) {
+        pi.events.emit("pi-subagents:task-launched", {
+          protocolVersion: 1,
+          invocationId: params.__pi_subagents_invocation_id,
+          taskId: id,
+          resumed: Boolean(params.task_id),
+          agentType: agent.name,
+          description: descText,
+          backend: selectedBackend,
+          executionDirectory: executionCwd,
+          worktree,
+          timestamp: new Date().toISOString(),
+        });
       }
 
       // ── FOREGROUND MODE: block until result, return directly ────────────
@@ -862,6 +968,7 @@ export default function (pi: ExtensionAPI) {
           piDir,
           dir: artifactsDir,
           conversationId,
+          worktree,
           status: "running",
           background: false,
         });
@@ -907,6 +1014,14 @@ export default function (pi: ExtensionAPI) {
           sessionName,
           agent.name,
         )?.sessionRef;
+        let worktreeResult: WorktreeResult | undefined;
+        if (worktree) {
+          try {
+            worktreeResult = finalizeTaskWorktree(worktree);
+          } catch {
+            // Keep the worktree handle in history for manual recovery.
+          }
+        }
         upsertTaskSessionHistory(piDir, {
           id,
           agentType: agent.name,
@@ -919,6 +1034,8 @@ export default function (pi: ExtensionAPI) {
           dir: artifactsDir,
           conversationId,
           sessionRef: completedSessionRef,
+          worktree,
+          worktreeResult,
           status: phase,
           reportedStatus: assessment.reportedStatus,
           resultValid: assessment.valid,
@@ -967,6 +1084,7 @@ export default function (pi: ExtensionAPI) {
             turn_count: turns,
             conversation_id: conversationId,
             full_output: parsed.raw.trim() || content.trim(),
+            worktree: worktreeResult,
           },
         };
           }
@@ -985,6 +1103,7 @@ export default function (pi: ExtensionAPI) {
         toolUses: 0,
         turns: 0,
         conversationId,
+        worktree,
         recentCalls: [],
         backend: selectedBackend,
       };
@@ -1003,6 +1122,7 @@ export default function (pi: ExtensionAPI) {
         piDir,
         dir: artifactsDir,
         conversationId,
+        worktree,
       };
 
       // Write to JSON registry for on-load restore
@@ -1026,6 +1146,27 @@ export default function (pi: ExtensionAPI) {
 
       // ── Sticky widget ──────────────────────────────────────────────────
       ignoreStaleExtensionCtx(() => ensureTaskWidget(ctx));
+
+      if (handle.backend === "herdr" && herdrBackend.waitForAttention) {
+        void herdrBackend
+          .waitForAttention(handle, {
+            signal: herdrWaitController.signal,
+            timeoutMs: TASK_TIMEOUT_MS,
+          })
+          .then(async ({ status }) => {
+            const active = backgroundTasks.get(id);
+            if (!active) return;
+            active.phase = status;
+            taskWidget.requestRender();
+            // Herdr is the wake-up signal; Pi JSONL remains completion truth.
+            await stopBackgroundPolling.tick();
+          })
+          .catch((error: unknown) => {
+            if (herdrWaitController.signal.aborted) return;
+            if (error instanceof Error && /timeout/iu.test(error.message)) return;
+            // Reconciliation polling remains active if the wait stream is interrupted.
+          });
+      }
 
       return {
         content: [

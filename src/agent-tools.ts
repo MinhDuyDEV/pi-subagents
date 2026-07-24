@@ -93,8 +93,9 @@ export function resolveAgentToolAllowlist(
   }
 
   const allowed = base.filter((t) => !disallowed.has(t));
-  // Never delegate nested task from subagent CLI (env also sets PI_TASK_TOOL_DISABLED).
-  const withoutTask = allowed.filter((t) => t !== taskToolName);
+  // Never delegate the parent task/control plane to child Pi processes.
+  const parentControlTools = new Set([taskToolName, "task_control", "herdr"]);
+  const withoutTask = allowed.filter((tool) => !parentControlTools.has(tool));
 
   if (withoutTask.length === 0) {
     throw new Error(
@@ -113,6 +114,6 @@ export function buildAgentToolSelection(input: ResolveAgentToolsInput): {
   const taskToolName = input.taskToolName ?? "task";
   return {
     tools: resolveAgentToolAllowlist(input),
-    excludeTools: [taskToolName],
+    excludeTools: [taskToolName, "task_control", "herdr"],
   };
 }

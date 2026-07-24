@@ -43,6 +43,7 @@ describe("evidence-only review", () => {
           description: "Old test output",
           reference: "artifacts/missing.txt",
           recordedAt: "2026-07-18T23:00:00.000Z",
+          source: "runtime-session",
         },
       ],
       now: new Date("2026-07-19T00:10:00.000Z"),
@@ -67,6 +68,7 @@ describe("evidence-only review", () => {
           description: "npm test passed",
           reference: "command:npm test",
           recordedAt: "2026-07-19T00:09:00.000Z",
+          source: "runtime-session",
         },
       ],
       now: new Date("2026-07-19T00:10:00.000Z"),
@@ -76,6 +78,29 @@ describe("evidence-only review", () => {
     expect(result.valid).toBe(false);
     expect(result.issues).toContain(
       "Command evidence has no captured output reference: command:npm test.",
+    );
+  });
+
+  it("rejects self-declared evidence without a runtime receipt or session binding", async () => {
+    const projectDirectory = await createTemporaryProject();
+    const artifact = join(projectDirectory, "declared.txt");
+    await writeFile(artifact, "claimed pass", "utf8");
+    const result = await validateEvidenceOnlyProof({
+      projectDirectory,
+      evidence: [
+        {
+          description: "Self-authored claim",
+          reference: "declared.txt",
+          recordedAt: "2026-07-19T00:09:00.000Z",
+          source: "declared",
+        },
+      ],
+      now: new Date("2026-07-19T00:10:00.000Z"),
+      maxEvidenceAgeMs: 5 * 60_000,
+    });
+    expect(result.valid).toBe(false);
+    expect(result.issues).toContain(
+      "Evidence lacks a runtime-generated receipt or session binding: declared.txt.",
     );
   });
 
@@ -92,6 +117,7 @@ describe("evidence-only review", () => {
           description: "Focused test passed",
           reference: "artifacts/focused-test.txt",
           recordedAt: "2026-07-19T00:09:00.000Z",
+          source: "runtime-session",
         },
       ],
       now: new Date("2026-07-19T00:10:00.000Z"),

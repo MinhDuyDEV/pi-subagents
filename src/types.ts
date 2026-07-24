@@ -1,5 +1,6 @@
 import type { TaskReportedStatus, ToolCallRecord } from "./helpers.js";
 import type { TerminalHandle, TerminalBackendKind } from "./subagent/terminalBackend.js";
+import type { WorktreeHandle, WorktreeResult } from "./worktree.js";
 export type { TerminalHandle, HerdrTerminalHandle } from "./subagent/terminalBackend.js";
 
 export type ExecutionBackend = "sdk" | TerminalBackendKind;
@@ -19,6 +20,8 @@ export interface BackgroundTask {
   toolUses: number;
   turns: number;
   conversationId?: string;
+  worktree?: WorktreeHandle;
+  worktreeResult?: WorktreeResult;
   /** Most recent tool calls (capped), updated every COUNT_POLL_MS. */
   recentCalls: ToolCallRecord[];
   /** Consecutive completion-poll failures; reset to 0 on a successful poll. */
@@ -44,6 +47,8 @@ export interface RegistryEntry {
   dir: string;
   conversationId?: string;
   sessionRef?: string;
+  worktree?: WorktreeHandle;
+  worktreeResult?: WorktreeResult;
 }
 
 /** Durable task→session mapping used for resume after task completion. */

@@ -1,21 +1,66 @@
-# Implementation Notes
+# Implementation notes
 
-## HerdR backend — 2026-07-13
+## Runtime baseline
 
-### Deviations
+The package is a runtime-only fork of `heyhuynhgiabuu/pi-task` `0.3.7`. Consumer repositories own `.pi/agents/`; no profile or parent-system policy is bundled. `src/task-runtime.ts` wraps the in-repo task extension, so orchestration hooks can remain additive while the base task implementation continues to own Pi session/process behavior.
 
-- The first implementation agents timed out after establishing the terminal-backend RED tests. The implementation was completed and verified directly from that partial state.
-- HerdR uses CLI wrappers rather than a raw socket client. This follows HerdR's recommendation for orchestration and keeps the initial integration small.
-- Initial live smoke was blocked outside HerdR. After restarting Pi inside HerdR 0.7.3, end-to-end launch, durable resume/steering, completion, and orphan-pane cleanup were verified. The smoke exposed runtime timing and CLI-output issues that unit tests did not reproduce.
-- Temporary HerdR transport failures remain recoverable instead of being classified as dead panes. Durable records are preserved until the same socket and terminal identity can be validated again.
+## 0.5 architecture decisions — 2026-07-23
 
-### Discoveries
+### Durable state is not telemetry
 
-- HerdR pane IDs are session-local. Safe control requires the persisted absolute socket path and terminal identity before reading, steering, or closing a pane.
-- HerdR's shell can outlive the delegated Pi process. An atomic task-owned exit sentinel distinguishes child exit from shell liveness; a valid Pi JSONL terminal result always takes precedence.
-- HerdR `done` and `idle` depend on attention/focus. They are not used as task-result authority.
-- Durable resume must deliver the new prompt after reattaching to an already-running task; reattachment alone is not a completed resume operation. HerdR needed a 300 ms gap between `pane run` and a confirming Enter so Pi queues the prompt during an active turn.
-- Long wrapper commands must start through `herdr agent start -- sh -lc ...`; sending them into a fresh shell with `pane run` allowed immediate steering to corrupt the still-buffered command.
-- HerdR mutation commands can succeed with empty stdout. Only JSON-producing inspection commands should be decoded.
-- An autonomous child-side JSONL watcher was removed after live testing showed it could close the HerdR pane before the parent task runner consumed completion, leaving an orphaned in-memory widget entry. Normal cleanup is parent-owned: the wrapper records child exit, while pi-task polling records completion and then closes the pane. Restart restoration handles parent termination.
-- The existing code treats all five terminal stop reasons (`stop`, `endTurn`, `length`, `error`, `aborted`) as completed. This integration preserves that behavior.
+`runs.json`, leases, contexts and `events.jsonl` are local correctness state. The telemetry opt-out removes optional aggregate fields only. Runtime caches (`activeRuns`, Herdr group maps, Cron objects) can always be reconstructed or safely abandoned from durable records.
+
+### Three independent outcomes
+
+Execution, verification and review are not collapsed into one status. In particular:
+
+- a failed child is never recorded as completed because proof was absent;
+- a verification failure is not rewritten as an execution failure;
+- awaiting review is not failure;
+- final success is not sent before background verification completes.
+
+### Identity and ownership
+
+Caller correlation IDs are labels. Runtime-generated invocation IDs, canonical task IDs, RPC ownership handles and persisted Herdr terminal IDs establish authority. Reviews require a real distinct completed reviewer task and current subject-session digest.
+
+### Write isolation
+
+A global dirty-tree scan cannot attribute concurrent work. Completion claim checks therefore consume worktree changed-path receipts. Shared cwd remains available for reads/single low-risk writers, but worktree isolation is the supported parallel-write boundary. It is still not an OS sandbox.
+
+### Pi tool interception
+
+Built-in `edit` and `write` tools are guarded through Pi's global `tool_call` event. Wrapping `registerTool` on the upstream extension cannot observe built-ins registered by Pi itself.
+
+## Herdr backend
+
+- CLI wrappers remain the primary transport because they inherit named-session/socket behavior and stable JSON envelopes.
+- `HerdrClient` centralizes typed result/error parsing, aborts, timeouts, capability probes, agent waits, metadata and worktree helpers.
+- Pane IDs are session-local. Safe control binds absolute socket, parent pane, pane ID, terminal ID, agent name and workspace/tab identity.
+- Prompt/steer uses atomic `herdr agent prompt`; the old raw `send-text`, delay, and Enter sequence was removed.
+- Herdr status wakes reconciliation only. The child Pi JSONL stop reason and final assistant message remain authoritative.
+- Missing Herdr context may fall back. A live-context control outage is surfaced rather than silently duplicating work on tmux/SDK.
+- Allocation retries are serialized, bounded and limited to classified transient failures.
+- Background waits are interruption-tolerant; periodic JSONL reconciliation remains the safety net.
+- Metadata is display-only and never takes lifecycle authority from Herdr's Pi integration.
+- Cleanup is parent-owned and verifies terminal identity before closing resources.
+
+## Scheduling and RPC
+
+Schedules persist before Cron installation, use protected non-overlapping callbacks, and remove their own schedule field before invocation to prevent recursion. RPC protocol v3 creates opaque recursive scopes, freezes scopes before cancellation, stops descendants first, and reports unsettled/failure details instead of returning optimistic success.
+
+## Child process boundary
+
+`PI_TASK_TOOL_DISABLED=1` disables the base task tool. The wrapper also skips `task_control`, commands, schedules, RPC, timers and parent guards. The child allowlist removes both task and control tool names. This avoids recursive manager/timer leaks and prevents children from releasing or reviewing parent-owned work.
+
+## Verification
+
+The repository test matrix covers SDK/tmux/Herdr base behavior plus durable run state, worktree provenance, merge/removal, lease renewal, child isolation, Pi `tool_call` guarding, symlink escape, typed Herdr errors, grouped completion, scheduling, RPC ownership, proof/review state, evidence authority, event idempotency, terminal-phase immutability, file-lock heartbeat, allocating-run recovery, terminal-JSONL reconciliation, restore and failure paths. Live Herdr smoke remains necessary for terminal lifecycle behavior that mocks cannot reproduce.
+
+## Durability and recovery
+
+- Correctness events carry idempotency keys so duplicate completion/release/ship/review records cannot accumulate across restarts.
+- Terminal execution phases are immutable: `canTransitionExecution` rejects resurrection of a completed/failed/cancelled/timeout run.
+- Allocating runs (launch crashed before task ID was assigned) are conservatively rebound to a unique matching durable registry entry at `session_start`.
+- Terminal Pi JSONL discovered after a parent restart is reconciled: the stop reason (not just the history status) determines the terminal outcome, and completed tasks are forwarded once before the parent resumes polling.
+- File locks heartbeat their mtime and record a process PID so a live long-running operation cannot have its lock stolen by stale-mtime detection.
+- Doctor checks are individually wrapped so one corrupt store produces a scoped error issue instead of crashing the entire doctor run.

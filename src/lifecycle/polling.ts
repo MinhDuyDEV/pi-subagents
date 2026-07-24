@@ -27,10 +27,15 @@ export interface BackgroundPollingDeps {
   pi: ExtensionAPI;
 }
 
+export interface BackgroundPollingController {
+  (): void;
+  tick(): Promise<void>;
+}
+
 export function startBackgroundPolling(
   deps: BackgroundPollingDeps,
   pollMs: number,
-): () => void {
+): BackgroundPollingController {
   let stopped = false;
   let inFlight = false;
   const pollErrors = new Map<string, number>();
@@ -119,8 +124,10 @@ export function startBackgroundPolling(
     void tick();
   }, pollMs);
 
-  return () => {
+  const stop = (() => {
     stopped = true;
     clearInterval(interval);
-  };
+  }) as BackgroundPollingController;
+  stop.tick = tick;
+  return stop;
 }

@@ -794,22 +794,22 @@ export function summarizeArgs(toolName: string, args: unknown): string {
         const line = rawLine.trim();
         if (!line) continue;
 
-        let entry: any;
+        let entry: unknown;
         try {
-          entry = JSON.parse(line);
+          entry = JSON.parse(line) as unknown;
         } catch {
           continue;
         }
 
-        const msg = entry?.message;
-        if (!msg || typeof msg !== "object") continue;
+        if (!isUnknownRecord(entry) || !isUnknownRecord(entry.message)) continue;
+        const msg = entry.message;
 
         // Collect tool results first so we can match them to tool calls
         if (msg.role === "toolResult") {
           const ts =
             typeof msg.timestamp === "number"
               ? msg.timestamp
-              : Date.parse(entry?.timestamp ?? "") || 0;
+              : Date.parse(typeof entry.timestamp === "string" ? entry.timestamp : "") || 0;
           if (typeof msg.toolCallId === "string") {
             resultsById.set(msg.toolCallId, {
               isError: Boolean(msg.isError),
@@ -823,7 +823,7 @@ export function summarizeArgs(toolName: string, args: unknown): string {
 
         turns++;
         for (const block of msg.content) {
-          if (!block || block.type !== "toolCall") continue;
+          if (!isUnknownRecord(block) || block.type !== "toolCall") continue;
           toolUses++;
           const id = typeof block.id === "string" ? block.id : "";
           if (!id) continue; // can't match results without an id
@@ -837,7 +837,7 @@ export function summarizeArgs(toolName: string, args: unknown): string {
             ts:
               typeof msg.timestamp === "number"
                 ? msg.timestamp
-                : Date.parse(entry?.timestamp ?? "") || 0,
+                : Date.parse(typeof entry.timestamp === "string" ? entry.timestamp : "") || 0,
           });
         }
       }
@@ -867,6 +867,10 @@ export function summarizeArgs(toolName: string, args: unknown): string {
 
   const recent = all.slice(Math.max(0, all.length - limit));
   return { toolUses, turns, recent };
+}
+
+function isUnknownRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
 }
 
 export function formatElapsed(ms: number): string {

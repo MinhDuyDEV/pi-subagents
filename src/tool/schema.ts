@@ -15,6 +15,9 @@ export function taskParametersSchema() {
         workspace_group: Type.Optional(Type.String({
           description: "Shared HerdR workspace group. Concurrent tasks with the same value use panes in one workspace.",
         })),
+        isolation: Type.Optional(Type.Literal("worktree", {
+          description: "Run writes in an isolated Git worktree. Changed worktrees are retained and returned; unchanged worktrees are removed.",
+        })),
 
     task_id: Type.Optional(
       Type.String({
@@ -28,6 +31,7 @@ export function taskParametersSchema() {
           "Durable specialist conversation id. Reuses .pi/artifacts/task-<id>/sessions when called again.",
       }),
     ),
+    __pi_subagents_invocation_id: Type.Optional(Type.String()),
     background: Type.Optional(
       Type.Boolean({
         description:

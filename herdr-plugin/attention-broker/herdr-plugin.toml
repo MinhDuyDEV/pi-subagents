@@ -1,0 +1,24 @@
+id = "minhduydev.pi-subagents-attention"
+name = "Pi Subagents Attention Broker"
+version = "1.0.0"
+min_herdr_version = "0.7.5"
+description = "Durably coalesces delegated-agent attention events and wakes the owning Pi supervisor without polling."
+platforms = ["linux", "macos", "windows"]
+
+[[actions]]
+id = "status"
+title = "Show queued task attention"
+contexts = ["global"]
+command = ["node", "attention-broker.js", "status"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["node", "attention-broker.js", "event"]
+
+[[events]]
+on = "pane.exited"
+command = ["node", "attention-broker.js", "event"]
+
+[[events]]
+on = "pane.closed"
+command = ["node", "attention-broker.js", "event"]

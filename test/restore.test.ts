@@ -67,6 +67,33 @@ describe("restoreActiveBackgroundTasks", () => {
     assert.equal(history[0]?.status, "done");
   });
 
+  it("preserves terminal JSONL failure truth during recovery", () => {
+    const piDir = makePiDir();
+    const taskDir = join(piDir, "artifacts", "sessions", "task-error");
+    writeSession(taskDir, "task-task-error", "error");
+    writeJson(join(piDir, "task-registry.json"), [
+      {
+        id: "task-error",
+        dir: taskDir,
+        sessionName: "task-task-error",
+        startedAt: Date.now() - 1000,
+        paneId: "%missing",
+        agentType: "scout",
+        description: "failed task",
+        background: true,
+      },
+    ]);
+    writeJson(join(piDir, "task-session-history.json"), [
+      { id: "task-error", status: "running", startedAt: Date.now() - 1000 },
+    ]);
+
+    restoreActiveBackgroundTasks(piDir, new Map());
+    const history = readJson<Array<{ id: string; status: string }>>(
+      join(piDir, "task-session-history.json"),
+    );
+    assert.equal(history[0]?.status, "failed");
+  });
+
   it("preserves durable records during a temporary backend outage", () => {
     const piDir = makePiDir();
     const taskDir = join(piDir, "artifacts", "sessions", "task-herdr");

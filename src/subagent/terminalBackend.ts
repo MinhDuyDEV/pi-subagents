@@ -15,6 +15,9 @@ export type TerminalHandle =
       resourceId: string;
       socketPath: string;
       terminalId: string;
+      parentPaneId?: string;
+      agentName?: string;
+      tabId?: string;
       workspaceId?: string;
       workspaceGroup?: string;
     };
@@ -31,12 +34,16 @@ export interface TerminalLaunchInput {
   env?: Record<string, string>;
   remainOnExit?: boolean;
   workspaceGroup?: string;
+  signal?: AbortSignal;
+  timeoutMs?: number;
 }
 
 export interface CommandRunOptions {
   cwd?: string;
   env?: NodeJS.ProcessEnv;
   input?: string;
+  signal?: AbortSignal;
+  timeoutMs?: number;
 }
 
 export interface CommandResult {
@@ -60,6 +67,10 @@ export interface TerminalBackend {
   isAlive(handle: TerminalHandle): Promise<boolean>;
   send(handle: TerminalHandle, message: string): Promise<void>;
   readTail(handle: TerminalHandle, lines: number): Promise<string>;
+  waitForAttention?(
+    handle: TerminalHandle,
+    options?: { signal?: AbortSignal; timeoutMs?: number },
+  ): Promise<{ status: "idle" | "working" | "blocked" | "done" | "unknown" }>;
   close(handle: TerminalHandle): Promise<void>;
 }
 
@@ -87,12 +98,14 @@ export function createDefaultCommandRunner(): CommandRunner {
             env: options.env,
             encoding: "utf8",
             maxBuffer: 4 * 1024 * 1024,
+            signal: options.signal,
+            timeout: options.timeoutMs,
           },
           (error, stdout, stderr) => {
             if (error) {
               reject(
                 new CommandFailedError(
-                  `${command} exited unsuccessfully`,
+                  `${command} exited unsuccessfully${typeof error.code === "string" ? ` (${error.code})` : ""}`,
                   stdout,
                   stderr,
                   typeof error.code === "number" ? error.code : undefined,
@@ -176,11 +189,11 @@ export function createTmuxTerminalBackend(
       let paneHeight = 0;
       if (configuredMode !== "horizontal" && configuredMode !== "vertical") {
         try {
-          const sizeResult = await runner.run("tmux", [
-            "display-message",
-            "-p",
-            "#{pane_width} #{pane_height}",
-          ]);
+          const sizeResult = await runner.run(
+            "tmux",
+            ["display-message", "-p", "#{pane_width} #{pane_height}"],
+            { signal: input.signal, timeoutMs: input.timeoutMs },
+          );
           const [widthRaw, heightRaw] = sizeResult.stdout.trim().split(/\s+/, 2);
           paneWidth = Number(widthRaw);
           paneHeight = Number(heightRaw);
@@ -193,31 +206,32 @@ export function createTmuxTerminalBackend(
         paneHeight,
         configuredMode,
       );
-      const result = await runner.run("tmux", [
-        "split-window",
-        direction,
-        "-d",
-        "-P",
-        "-F",
-        "#{pane_id}",
-        "-c",
-        input.cwd,
-        input.command,
-      ]);
+      const result = await runner.run(
+        "tmux",
+        [
+          "split-window",
+          direction,
+          "-d",
+          "-P",
+          "-F",
+          "#{pane_id}",
+          "-c",
+          input.cwd,
+          input.command,
+        ],
+        { signal: input.signal, timeoutMs: input.timeoutMs },
+      );
       const resourceId = lastNonEmptyLine(result.stdout);
       if (!resourceId) {
         throw new Error("tmux did not return a pane id");
       }
 
       if (input.remainOnExit) {
-        await runner.run("tmux", [
-          "set-option",
-          "-p",
-          "-t",
-          resourceId,
-          "remain-on-exit",
-          "on",
-        ]);
+        await runner.run(
+          "tmux",
+          ["set-option", "-p", "-t", resourceId, "remain-on-exit", "on"],
+          { signal: input.signal, timeoutMs: input.timeoutMs },
+        );
       }
 
       return { backend: "tmux", resourceId };

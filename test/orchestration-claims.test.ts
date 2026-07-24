@@ -5,7 +5,11 @@ import { tmpdir } from "node:os";
 import {
   ResourceClaimConflictError,
   acquireResourceLease,
+  assertNoConflictingWrite,
+  findClaimCoveringPath,
   listActiveResourceLeases,
+  releaseOrphanedLeases,
+  renewResourceLease,
   releaseResourceLease,
   transferResourceLeaseOwnership,
 } from "../src/orchestration/claims.ts";
@@ -262,5 +266,170 @@ describe("resource claims", () => {
       leases: unknown[];
     };
     expect(persisted).toEqual({ version: 1, leases: [] });
+  });
+
+  it("releaseOrphanedLeases reaps leases whose owner is not alive", async () => {
+    const storePath = await createStorePath();
+    await acquireResourceLease({
+      storePath,
+      owner: "task-alive",
+      claims: [{ kind: "write", resource: "a", mode: "exclusive" }],
+    });
+    await acquireResourceLease({
+      storePath,
+      owner: "task-dead",
+      claims: [{ kind: "write", resource: "b", mode: "exclusive" }],
+    });
+    expect(await listActiveResourceLeases({ storePath })).toHaveLength(2);
+
+    const reaped = await releaseOrphanedLeases({
+      storePath,
+      aliveOwnerIds: new Set(["task-alive"]),
+    });
+    expect(reaped).toHaveLength(1);
+    const remaining = await listActiveResourceLeases({ storePath });
+    expect(remaining.map((lease) => lease.owner).sort()).toEqual(["task-alive"]);
+  });
+
+  it("renews only the matching opaque owner and extends heartbeat", async () => {
+    const storePath = await createStorePath();
+    const acquired = new Date("2026-01-01T00:00:00.000Z");
+    const lease = await acquireResourceLease({
+      storePath,
+      owner: "opaque-owner",
+      claims: [{ kind: "write", resource: "src", mode: "exclusive" }],
+      now: acquired,
+      ttlMs: 1_000,
+    });
+    const renewed = await renewResourceLease({
+      storePath,
+      leaseId: lease.id,
+      owner: "opaque-owner",
+      now: new Date("2026-01-01T00:00:00.500Z"),
+      ttlMs: 2_000,
+    });
+    expect(renewed?.heartbeatAt).toBe("2026-01-01T00:00:00.500Z");
+    expect(renewed?.expiresAt).toBe("2026-01-01T00:00:02.500Z");
+    await expect(
+      renewResourceLease({
+        storePath,
+        leaseId: lease.id,
+        owner: "forged-owner",
+        now: new Date("2026-01-01T00:00:00.600Z"),
+      }),
+    ).rejects.toThrow(/owned by opaque-owner/u);
+  });
+
+  it("rejects shared or out-of-project write ownership", async () => {
+    const storePath = await createStorePath();
+    await expect(
+      acquireResourceLease({
+        storePath,
+        owner: "owner",
+        claims: [{ kind: "write", resource: "src", mode: "shared" }],
+      }),
+    ).rejects.toThrow(/must be exclusive/u);
+    await expect(
+      acquireResourceLease({
+        storePath,
+        owner: "owner",
+        claims: [{ kind: "write", resource: "../outside", mode: "exclusive" }],
+      }),
+    ).rejects.toThrow(/inside the project/u);
+  });
+});
+
+describe("write-claim path coverage", () => {
+  it("findClaimCoveringPath returns a lease whose claim covers the exact path", async () => {
+    const storePath = await createStorePath();
+    await acquireResourceLease({
+      storePath,
+      owner: "task-owner",
+      claims: [{ kind: "write", resource: "dir/a.ts", mode: "exclusive" }],
+    });
+
+    const lease = await findClaimCoveringPath({ storePath, path: "dir/a.ts" });
+    expect(lease?.owner).toBe("task-owner");
+  });
+
+  it("findClaimCoveringPath treats a parent directory claim as covering a child path", async () => {
+    const storePath = await createStorePath();
+    await acquireResourceLease({
+      storePath,
+      owner: "task-owner",
+      claims: [{ kind: "write", resource: "dir", mode: "exclusive" }],
+    });
+
+    const lease = await findClaimCoveringPath({ storePath, path: "dir/a.ts" });
+    expect(lease?.owner).toBe("task-owner");
+  });
+
+  it("findClaimCoveringPath does not cover a sibling path outside the claim", async () => {
+    const storePath = await createStorePath();
+    await acquireResourceLease({
+      storePath,
+      owner: "task-owner",
+      claims: [{ kind: "write", resource: "dir", mode: "exclusive" }],
+    });
+
+    const lease = await findClaimCoveringPath({ storePath, path: "other/a.ts" });
+    expect(lease).toBeUndefined();
+  });
+
+  it("findClaimCoveringPath returns undefined when no leases exist", async () => {
+    const storePath = await createStorePath();
+    const lease = await findClaimCoveringPath({ storePath, path: "dir/a.ts" });
+    expect(lease).toBeUndefined();
+  });
+
+  it("assertNoConflictingWrite throws when a different owner holds a covering write lease", async () => {
+    const storePath = await createStorePath();
+    await acquireResourceLease({
+      storePath,
+      owner: "task-subagent",
+      claims: [{ kind: "write", resource: "dir", mode: "exclusive" }],
+    });
+
+    await expect(
+      assertNoConflictingWrite({
+        storePath,
+        ownerTaskId: "parent",
+        path: "dir/a.ts",
+      }),
+    ).rejects.toThrow(/Write blocked: dir\/a\.ts is locked by task task-subagent/);
+  });
+
+  it("assertNoConflictingWrite allows the owning task to write", async () => {
+    const storePath = await createStorePath();
+    await acquireResourceLease({
+      storePath,
+      owner: "parent",
+      claims: [{ kind: "write", resource: "dir", mode: "exclusive" }],
+    });
+
+    await expect(
+      assertNoConflictingWrite({
+        storePath,
+        ownerTaskId: "parent",
+        path: "dir/a.ts",
+      }),
+    ).resolves.toBeUndefined();
+  });
+
+  it("assertNoConflictingWrite allows writes when no covering lease exists", async () => {
+    const storePath = await createStorePath();
+    await acquireResourceLease({
+      storePath,
+      owner: "task-subagent",
+      claims: [{ kind: "write", resource: "other", mode: "exclusive" }],
+    });
+
+    await expect(
+      assertNoConflictingWrite({
+        storePath,
+        ownerTaskId: "parent",
+        path: "dir/a.ts",
+      }),
+    ).resolves.toBeUndefined();
   });
 });

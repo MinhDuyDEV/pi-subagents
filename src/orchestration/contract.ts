@@ -1,4 +1,4 @@
-import { Type, type Static } from "@sinclair/typebox";
+import { Type, type Static } from "typebox";
 import type { ResourceClaim } from "./claims.js";
 import type { ContextPackInput } from "./context.js";
 
@@ -42,6 +42,7 @@ const ContextEvidenceSchema = Type.Object(
     description: Type.String({ minLength: 1 }),
     reference: Type.String({ minLength: 1 }),
     recorded_at: Type.Optional(Type.String()),
+    claim: Type.Optional(Type.String()),
   },
   { additionalProperties: false },
 );
@@ -66,6 +67,7 @@ const ContextPackInputSchema = Type.Object(
       ),
     ),
     evidence: Type.Optional(Type.Array(ContextEvidenceSchema)),
+    claims: Type.Optional(Type.Array(Type.String())),
     next_step: Type.String({ minLength: 1 }),
   },
   { additionalProperties: false },
@@ -82,10 +84,36 @@ const ProofPolicySchema = Type.Object(
 export const OrchestrationRequestSchema = Type.Object(
   {
     id: Type.Optional(Type.String({ minLength: 1 })),
+    batch_id: Type.Optional(Type.String({ minLength: 1 })),
+    join: Type.Optional(
+      Type.Union([Type.Literal("async"), Type.Literal("group")]),
+    ),
+    isolation: Type.Optional(Type.Literal("worktree")),
+    schedule: Type.Optional(
+      Type.Object(
+        {
+          cron: Type.Optional(Type.String({ minLength: 1 })),
+          at: Type.Optional(Type.String({ minLength: 1 })),
+          timezone: Type.Optional(Type.String({ minLength: 1 })),
+          max_runs: Type.Optional(Type.Integer({ minimum: 1 })),
+        },
+        { additionalProperties: false },
+      ),
+    ),
     claims: Type.Optional(Type.Array(ResourceClaimSchema)),
-    lease_ttl_ms: Type.Optional(Type.Number({ minimum: 1 })),
+    lease_ttl_ms: Type.Optional(Type.Number({ minimum: 1_000 })),
     context: Type.Optional(ContextPackInputSchema),
     proof: Type.Optional(ProofPolicySchema),
+    verifier: Type.Optional(
+      Type.Object(
+        {
+          required: Type.Boolean(),
+          reviewer_agent: Type.Optional(Type.String()),
+          min_reviews: Type.Optional(Type.Number({ minimum: 1 })),
+        },
+        { additionalProperties: false },
+      ),
+    ),
   },
   { additionalProperties: false },
 );
@@ -94,12 +122,26 @@ type PublicOrchestrationRequest = Static<typeof OrchestrationRequestSchema>;
 
 export interface OrchestrationRequest {
   id?: string;
+  batchId?: string;
+  join?: "async" | "group";
+  isolation?: "worktree";
+  schedule?: {
+    cron?: string;
+    at?: string;
+    timezone?: string;
+    maxRuns?: number;
+  };
   claims?: ResourceClaim[];
   leaseTtlMs?: number;
   context?: ContextPackInput;
   proof?: {
     mode: "evidence-only";
     maxEvidenceAgeMs?: number;
+  };
+  verifier?: {
+    required: boolean;
+    reviewerAgent?: string;
+    minReviews?: number;
   };
 }
 
@@ -112,6 +154,12 @@ export function parseOrchestrationRequest(
   const publicValue = value as PublicOrchestrationRequest;
   return {
     ...(publicValue.id ? { id: publicValue.id } : {}),
+    ...(publicValue.batch_id ? { batchId: publicValue.batch_id } : {}),
+    ...(publicValue.join ? { join: publicValue.join } : {}),
+    ...(publicValue.isolation ? { isolation: publicValue.isolation } : {}),
+    ...(publicValue.schedule
+      ? { schedule: normalizeSchedule(publicValue.schedule) }
+      : {}),
     ...(publicValue.claims
       ? { claims: publicValue.claims.map((claim) => ({ ...claim })) }
       : {}),
@@ -131,6 +179,36 @@ export function parseOrchestrationRequest(
           },
         }
       : {}),
+    ...(publicValue.verifier
+      ? {
+          verifier: {
+            required: publicValue.verifier.required,
+            ...(publicValue.verifier.reviewer_agent
+              ? { reviewerAgent: publicValue.verifier.reviewer_agent }
+              : {}),
+            ...(publicValue.verifier.min_reviews
+              ? { minReviews: publicValue.verifier.min_reviews }
+              : {}),
+          },
+        }
+      : {}),
+  };
+}
+
+function normalizeSchedule(
+  schedule: NonNullable<PublicOrchestrationRequest["schedule"]>,
+): NonNullable<OrchestrationRequest["schedule"]> {
+  if (Boolean(schedule.cron) === Boolean(schedule.at)) {
+    throw new Error("orchestration.schedule requires exactly one of cron or at");
+  }
+  if (schedule.at && !Number.isFinite(Date.parse(schedule.at))) {
+    throw new Error("orchestration.schedule.at must be an ISO date-time");
+  }
+  return {
+    ...(schedule.cron ? { cron: schedule.cron } : {}),
+    ...(schedule.at ? { at: schedule.at } : {}),
+    ...(schedule.timezone ? { timezone: schedule.timezone } : {}),
+    ...(schedule.max_runs ? { maxRuns: schedule.max_runs } : {}),
   };
 }
 
@@ -158,9 +236,11 @@ function normalizeContext(
             ...(evidence.recorded_at
               ? { recordedAt: evidence.recorded_at }
               : {}),
+            ...(evidence.claim ? { claim: evidence.claim } : {}),
           })),
         }
       : {}),
+    ...(context.claims ? { claims: [...context.claims] } : {}),
     nextStep: context.next_step,
   };
 }

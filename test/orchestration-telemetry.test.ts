@@ -18,6 +18,7 @@ async function createTemporaryDirectory(): Promise<string> {
 }
 
 afterEach(async () => {
+  delete process.env.PI_SUBAGENTS_NO_TELEMETRY;
   await Promise.all(
     temporaryDirectories.splice(0).map((directory) =>
       rm(directory, { recursive: true, force: true }),
@@ -174,5 +175,57 @@ describe("task outcome telemetry", () => {
       tokensPerCompletedTask: 175,
       costPerCompletedTask: 0.04,
     });
+  });
+
+  it("deduplicates correctness events by durable idempotency key", async () => {
+    const directory = await createTemporaryDirectory();
+    const eventPath = join(directory, "events.jsonl");
+    const first = await appendOrchestrationEvent({
+      eventPath,
+      event: {
+        type: "task_completed",
+        taskId: "task-once",
+        orchestrationId: "invocation-once",
+        idempotencyKey: "invocation-once:completed",
+      },
+    });
+    const duplicate = await appendOrchestrationEvent({
+      eventPath,
+      event: {
+        type: "task_completed",
+        taskId: "task-once",
+        orchestrationId: "invocation-once",
+        idempotencyKey: "invocation-once:completed",
+      },
+    });
+    expect(duplicate.id).toBe(first.id);
+    expect(await readOrchestrationEvents(eventPath)).toHaveLength(1);
+  });
+
+  it("keeps correctness events while telemetry fields are opted out", async () => {
+    const directory = await createTemporaryDirectory();
+    const eventPath = join(directory, "events.jsonl");
+    process.env.PI_SUBAGENTS_NO_TELEMETRY = "1";
+    await appendOrchestrationEvent({
+      eventPath,
+      event: {
+        type: "task_execution_completed",
+        taskId: "task-1",
+        orchestrationId: "invocation-1",
+        durationMs: 100,
+        usage: {
+          inputTokens: 1,
+          outputTokens: 1,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          totalTokens: 2,
+          cost: 0.01,
+        },
+      },
+    });
+    const [event] = await readOrchestrationEvents(eventPath);
+    expect(event?.type).toBe("task_execution_completed");
+    expect(event?.durationMs).toBeUndefined();
+    expect(event?.usage).toBeUndefined();
   });
 });

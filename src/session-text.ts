@@ -46,23 +46,21 @@ function matchesSessionName(content: string, sessionName?: string): boolean {
  * - "stop" / "endTurn" / "length" / "error" / "aborted": terminal.
  * - no assistant messages or no stopReason yet: not done.
  */
-export function hasAgentFinished(
+export function getAgentTerminalStopReason(
   sessionDir: string,
   sessionName?: string,
   sinceMs?: number,
-): boolean {
-  if (!existsSync(sessionDir)) return false;
+): string | undefined {
+  if (!existsSync(sessionDir)) return undefined;
 
   const files = readdirSync(sessionDir)
     .filter((f) => f.endsWith(".jsonl"))
     .sort();
 
   let lastStopReason: string | undefined;
-
   for (const file of files) {
     const content = readFileSync(join(sessionDir, file), "utf-8");
     if (!matchesSessionName(content, sessionName)) continue;
-
     for (const rawLine of content.split("\n")) {
       const line = rawLine.trim();
       if (!line) continue;
@@ -78,8 +76,7 @@ export function hasAgentFinished(
           if (Number.isFinite(timestampMs) && timestampMs < sinceMs) continue;
         }
         const msg = entry.message;
-        if (!msg || msg.role !== "assistant") continue;
-        if (typeof msg.stopReason === "string") {
+        if (msg?.role === "assistant" && typeof msg.stopReason === "string") {
           lastStopReason = msg.stopReason;
         }
       } catch {
@@ -87,10 +84,21 @@ export function hasAgentFinished(
       }
     }
   }
+  return lastStopReason && lastStopReason !== "toolUse"
+    ? lastStopReason
+    : undefined;
+}
 
-  if (!lastStopReason) return false;
-  if (lastStopReason === "toolUse") return false;
-  return ["stop", "endTurn", "length", "error", "aborted"].includes(lastStopReason);
+export function hasAgentFinished(
+  sessionDir: string,
+  sessionName?: string,
+  sinceMs?: number,
+): boolean {
+  const stopReason = getAgentTerminalStopReason(sessionDir, sessionName, sinceMs);
+  return (
+    stopReason !== undefined &&
+    ["stop", "endTurn", "length", "error", "aborted"].includes(stopReason)
+  );
 }
 
 /**

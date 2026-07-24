@@ -10,6 +10,7 @@ import { createSyncHerdrControl } from "../subagent/herdr.js";
 import { killAgentPane } from "../subagent/tmux.js";
 import { ignoreStaleExtensionCtx } from "../stale-ctx.js";
 import type { BackgroundTask } from "../types.js";
+import { finalizeTaskWorktree } from "../worktree.js";
 
 function closeTaskResource(task: BackgroundTask): void {
   if (task.handle?.backend === "herdr") {
@@ -36,6 +37,13 @@ export function completeTask(
     task.sessionName,
     task.agentType,
   )?.sessionRef;
+  if (task.worktree) {
+    try {
+      task.worktreeResult = finalizeTaskWorktree(task.worktree);
+    } catch {
+      // Preserve the worktree handle for manual recovery if inspection fails.
+    }
+  }
 
   upsertTaskSessionHistory(piDir, {
     id,
@@ -49,6 +57,8 @@ export function completeTask(
     dir: task.dir,
     conversationId: task.conversationId,
     sessionRef: completedSessionRef,
+    worktree: task.worktree,
+    worktreeResult: task.worktreeResult,
     status: phase,
     reportedStatus: assessment.reportedStatus,
     resultValid: assessment.valid,
@@ -68,6 +78,18 @@ export function completeTask(
   const summaryText = parsed.summary?.trim()
     ? parsed.summary.trim()
     : content.replace(/\s+/g, " ").trim().slice(0, 240);
+
+  if (task.handle?.backend === "herdr") {
+    try {
+      createSyncHerdrControl().notify(
+        `Task ${phase}: ${task.agentType}`,
+        summaryText.slice(0, 240),
+        phase === "done" ? "done" : "request",
+      );
+    } catch {
+      // Herdr toast delivery is optional and must not affect durable completion.
+    }
+  }
 
   ignoreStaleExtensionCtx(() =>
     pi.sendMessage(
@@ -98,6 +120,7 @@ export function completeTask(
           background: true,
           structured_result: assessment.valid,
           full_output: parsed.raw.trim() || content.trim(),
+          worktree: task.worktreeResult,
         },
       },
       {

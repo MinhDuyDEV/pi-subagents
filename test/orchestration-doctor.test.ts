@@ -159,7 +159,7 @@ describe("orchestration doctor", () => {
       delegationPrompt: "Goal: Do something.",
       ceremonySteps: [
         { name: "Ask for approval twice", uniqueValue: "" },
-        { name: "Run focused tests", uniqueValue: "Fresh behavior evidence" },
+        { name: "Run focused tests", uniqueValue: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4" },
       ],
       now: new Date("2026-07-19T01:00:00.000Z"),
       staleAfterMs: 30 * 60 * 1_000,
@@ -181,5 +181,23 @@ describe("orchestration doctor", () => {
     expect(result.issues.filter((issue) => issue.code === "stale-task")).toHaveLength(
       2,
     );
+  });
+
+  it("flags ceremony steps whose uniqueValue is not a verifiable artifact or hash", async () => {
+    const projectDirectory = await createTemporaryProject();
+    const result = await runOrchestrationDoctor({
+      projectDirectory,
+      delegationPrompt: "Goal: Ship the feature.",
+      ceremonySteps: [
+        { name: "Descriptive only", uniqueValue: "Fresh behavior evidence" },
+        { name: "Verifiable hash", uniqueValue: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4" },
+      ],
+      now: new Date("2026-07-19T01:00:00.000Z"),
+      staleAfterMs: 30 * 60 * 1_000,
+    });
+    const ceremony = result.issues.filter((issue) => issue.code === "valueless-ceremony");
+    expect(ceremony).toHaveLength(1);
+    expect(ceremony[0].severity).toBe("error");
+    expect(ceremony[0].message).toContain("Descriptive only");
   });
 });

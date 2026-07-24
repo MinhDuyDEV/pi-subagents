@@ -1,4 +1,8 @@
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type {
+  AgentSession,
+  ExtensionContext,
+  ModelRegistry,
+} from "@earendil-works/pi-coding-agent";
 import type { AgentConfig } from "../helpers.js";
 
 export interface RunSdkSubagentOptions {
@@ -11,37 +15,34 @@ export interface RunSdkSubagentOptions {
   tools?: string[];
   excludeTools?: string[];
   systemPrompt?: string;
-  /**
-   * Called with the AgentSession after creation but before prompt().
-   * Return an unsubscribe function that will be called on cleanup.
-   */
-  onSession?: (session: any) => () => void;
+  /** Called after session creation and before prompt(). */
+  onSession?: (session: AgentSession) => () => void;
 }
 
 export async function resolveSdkModel(
   ctx: Pick<ExtensionContext, "model" | "modelRegistry">,
   requested?: string,
-) {
-  const registry = ctx.modelRegistry as any;
+): Promise<ExtensionContext["model"]> {
+  const registry: ModelRegistry = ctx.modelRegistry;
   if (requested) {
     const [provider, ...rest] = requested.split("/");
     const modelId = rest.join("/");
-    const exact = modelId
-      ? registry?.find?.(provider, modelId)
-      : registry?.find?.(requested);
-    if (exact) return exact;
+    if (modelId) {
+      const exact = registry.find(provider, modelId);
+      if (exact) return exact;
+    }
   } else if (ctx.model) {
     return ctx.model;
   }
 
-  const all = registry?.getAll?.() ?? [];
-  const available = all.length > 0 ? all : ((await registry?.getAvailable?.()) ?? []);
+  const all = registry.getAll();
+  const available = all.length > 0 ? all : registry.getAvailable();
   if (requested) {
     const byId = available.find(
-      (model: any) =>
-        model?.id === requested ||
-        `${model?.provider?.id ?? model?.provider}/${model?.id}` === requested ||
-        model?.name === requested,
+      (model) =>
+        model.id === requested ||
+        `${model.provider}/${model.id}` === requested ||
+        model.name === requested,
     );
     if (byId) return byId;
   }
@@ -62,18 +63,16 @@ export async function runSdkSubagent(options: RunSdkSubagentOptions): Promise<{
 
   const { createAgentSession, DefaultResourceLoader, getAgentDir } =
     await import("@earendil-works/pi-coding-agent");
-  const previousDisabled = process.env.PI_TASK_TOOL_DISABLED;
-  process.env.PI_TASK_TOOL_DISABLED = "1";
-  let session: any;
+  let session: AgentSession | undefined;
   let unsubSession: (() => void) | undefined;
   try {
     const agentDir = getAgentDir();
     const resourceLoader = new DefaultResourceLoader({
       cwd: options.cwd,
       agentDir,
-      systemPromptOverride: () => options.systemPrompt,
+      systemPrompt: options.systemPrompt,
       noExtensions: true,
-    } as any);
+    });
 
     await resourceLoader.reload();
 
@@ -81,13 +80,12 @@ export async function runSdkSubagent(options: RunSdkSubagentOptions): Promise<{
       cwd: options.cwd,
       agentDir,
       model,
-      thinkingLevel: options.thinkingLevel as any,
+      thinkingLevel: normalizeThinkingLevel(options.thinkingLevel),
       tools: options.tools,
       excludeTools: options.excludeTools,
       resourceLoader,
     }));
 
-    // Subscribe to tool execution events before prompt()
     if (options.onSession) {
       unsubSession = options.onSession(session);
     }
@@ -99,26 +97,37 @@ export async function runSdkSubagent(options: RunSdkSubagentOptions): Promise<{
     return { output: output.trim(), sessionPath };
   } finally {
     unsubSession?.();
-    session?.dispose?.();
-    if (previousDisabled === undefined) {
-      delete process.env.PI_TASK_TOOL_DISABLED;
-    } else {
-      process.env.PI_TASK_TOOL_DISABLED = previousDisabled;
-    }
+    session?.dispose();
   }
 }
 
-function getLastAssistantText(messages: readonly any[]): string {
+type ThinkingLevel = Parameters<AgentSession["setThinkingLevel"]>[0];
+
+function normalizeThinkingLevel(value: string | undefined): ThinkingLevel | undefined {
+  if (
+    value === "off" ||
+    value === "minimal" ||
+    value === "low" ||
+    value === "medium" ||
+    value === "high" ||
+    value === "xhigh"
+  ) {
+    return value;
+  }
+  return undefined;
+}
+
+function getLastAssistantText(messages: readonly unknown[]): string {
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index];
-    if (message?.role !== "assistant") continue;
+    if (!isRecord(message) || message.role !== "assistant") continue;
     const content = message.content;
     if (typeof content === "string") return content;
     if (Array.isArray(content)) {
       return content
         .map((part) => {
           if (typeof part === "string") return part;
-          if (typeof part?.text === "string") return part.text;
+          if (isRecord(part) && typeof part.text === "string") return part.text;
           return "";
         })
         .filter(Boolean)
@@ -126,4 +135,8 @@ function getLastAssistantText(messages: readonly any[]): string {
     }
   }
   return "";
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
 }

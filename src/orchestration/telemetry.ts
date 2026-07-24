@@ -1,20 +1,30 @@
 import { randomUUID } from "node:crypto";
 import { appendFile, mkdir, readFile } from "node:fs/promises";
 import { dirname } from "node:path";
+import { withFileLock } from "./file-lock.js";
 
 const ORCHESTRATION_EVENT_VERSION = 1;
 
 export type OrchestrationEventType =
   | "task_started"
   | "task_resumed"
+  | "task_execution_completed"
   | "task_completed"
   | "task_failed"
+  | "task_cancelled"
+  | "task_timed_out"
+  | "task_awaiting_review"
   | "claim_acquired"
   | "claim_released"
   | "handoff_updated"
   | "proof_passed"
   | "proof_failed"
-  | "review_completed";
+  | "review_completed"
+  | "task_reviewed"
+  | "task_shipped"
+  | "task_ship_blocked"
+  | "task_worktree_merged"
+  | "task_worktree_removed";
 
 export interface TaskUsageSummary {
   inputTokens: number;
@@ -42,6 +52,11 @@ export interface NewOrchestrationEvent {
   acceptedFindings?: number;
   usage?: TaskUsageSummary;
   reason?: string;
+  verdict?: string;
+  reviewerTaskId?: string;
+  reviewerInvocationId?: string;
+  subjectDigest?: string;
+  idempotencyKey?: string;
 }
 
 export interface OrchestrationEvent extends NewOrchestrationEvent {
@@ -71,23 +86,36 @@ export async function appendOrchestrationEvent(input: {
   eventPath: string;
   event: NewOrchestrationEvent;
 }): Promise<OrchestrationEvent> {
-  if (process.env.PI_SUBAGENTS_NO_TELEMETRY === "1") {
-    return {
-      ...input.event,
-      version: ORCHESTRATION_EVENT_VERSION,
-      id: randomUUID(),
-      timestamp: input.event.timestamp ?? new Date().toISOString(),
-    } as OrchestrationEvent;
-  }
+  // The lifecycle journal is correctness state and is always persisted. The
+  // telemetry opt-out removes optional usage/performance fields only; it must
+  // never disable recovery, leases, proof, review, or ship-gate state.
+  const eventInput = process.env.PI_SUBAGENTS_NO_TELEMETRY === "1"
+    ? withoutOptionalMetrics(input.event)
+    : input.event;
   const event: OrchestrationEvent = {
-    ...input.event,
+    ...eventInput,
     version: ORCHESTRATION_EVENT_VERSION,
     id: randomUUID(),
-    timestamp: input.event.timestamp ?? new Date().toISOString(),
+    timestamp: eventInput.timestamp ?? new Date().toISOString(),
   };
+  let persisted = event;
   await mkdir(dirname(input.eventPath), { recursive: true });
-  await appendFile(input.eventPath, `${JSON.stringify(event)}\n`, "utf8");
-  return event;
+  await withFileLock({
+    lockPath: `${input.eventPath}.lock`,
+    operation: async () => {
+      if (event.idempotencyKey) {
+        const existing = (await readOrchestrationEvents(input.eventPath)).find(
+          (candidate) => candidate.idempotencyKey === event.idempotencyKey,
+        );
+        if (existing) {
+          persisted = existing;
+          return;
+        }
+      }
+      await appendFile(input.eventPath, `${JSON.stringify(event)}\n`, "utf8");
+    },
+  });
+  return persisted;
 }
 
 export async function readOrchestrationEvents(
@@ -96,11 +124,18 @@ export async function readOrchestrationEvents(
   try {
     const content = await readFile(eventPath, "utf8");
     const events: OrchestrationEvent[] = [];
-    for (const line of content.split("\n")) {
-      if (!line.trim()) {
-        continue;
+    const lines = content.split("\n");
+    for (let index = 0; index < lines.length; index += 1) {
+      const line = lines[index] ?? "";
+      if (!line.trim()) continue;
+      let value: unknown;
+      try {
+        value = JSON.parse(line) as unknown;
+      } catch (error) {
+        const isCrashTail = index === lines.length - 1 && !content.endsWith("\n");
+        if (isCrashTail) break;
+        throw error;
       }
-      const value: unknown = JSON.parse(line);
       if (!isOrchestrationEvent(value)) {
         throw new Error(`Invalid orchestration event in ${eventPath}`);
       }
@@ -180,9 +215,18 @@ export function deriveOrchestrationMetrics(input: {
   const completions = input.events.filter(
     (event) => event.type === "task_completed",
   );
-  const failures = input.events.filter((event) => event.type === "task_failed");
+  const executionCompletions = input.events.filter(
+    (event) => event.type === "task_execution_completed",
+  );
+  const failures = input.events.filter(
+    (event) =>
+      event.type === "task_failed" ||
+      event.type === "task_cancelled" ||
+      event.type === "task_timed_out" ||
+      event.type === "proof_failed",
+  );
   const terminalTaskIds = new Set(
-    [...completions, ...failures]
+    [...executionCompletions, ...completions, ...failures]
       .map((event) => event.taskId)
       .filter((taskId): taskId is string => taskId !== undefined),
   );
@@ -193,11 +237,13 @@ export function deriveOrchestrationMetrics(input: {
       now.getTime() - Date.parse(event.timestamp) > staleAfterMs,
   ).length;
 
-  const totalDurationMs = completions.reduce(
+  const measuredCompletions =
+    executionCompletions.length > 0 ? executionCompletions : completions;
+  const totalDurationMs = measuredCompletions.reduce(
     (total, event) => total + (event.durationMs ?? 0),
     0,
   );
-  const verificationEvents = completions.filter(
+  const verificationEvents = measuredCompletions.filter(
     (event) => event.verificationPassed !== undefined,
   );
   const reviewEvents = input.events.filter(
@@ -233,7 +279,9 @@ export function deriveOrchestrationMetrics(input: {
     ),
     totalDurationMs,
     averageDurationMs:
-      completions.length === 0 ? 0 : totalDurationMs / completions.length,
+      measuredCompletions.length === 0
+        ? 0
+        : totalDurationMs / measuredCompletions.length,
     totalTokens,
     totalCost,
     verificationPassRate:
@@ -267,15 +315,36 @@ function isEventType(value: unknown): value is OrchestrationEventType {
   return (
     value === "task_started" ||
     value === "task_resumed" ||
+    value === "task_execution_completed" ||
     value === "task_completed" ||
     value === "task_failed" ||
+    value === "task_cancelled" ||
+    value === "task_timed_out" ||
+    value === "task_awaiting_review" ||
     value === "claim_acquired" ||
     value === "claim_released" ||
     value === "handoff_updated" ||
     value === "proof_passed" ||
     value === "proof_failed" ||
-    value === "review_completed"
+    value === "review_completed" ||
+    value === "task_reviewed" ||
+    value === "task_shipped" ||
+    value === "task_ship_blocked" ||
+    value === "task_worktree_merged" ||
+    value === "task_worktree_removed"
   );
+}
+
+function withoutOptionalMetrics(
+  event: NewOrchestrationEvent,
+): NewOrchestrationEvent {
+  const correctness = { ...event };
+  delete correctness.durationMs;
+  delete correctness.retryCount;
+  delete correctness.reviewFindings;
+  delete correctness.acceptedFindings;
+  delete correctness.usage;
+  return correctness;
 }
 
 function numericValue(value: unknown): number {

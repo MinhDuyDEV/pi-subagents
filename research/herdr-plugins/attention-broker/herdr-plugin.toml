@@ -1,0 +1,16 @@
+id = "local.attention-broker"
+name = "Attention Broker"
+version = "0.1.0"
+min_herdr_version = "0.7.4"
+description = "Wake a room Root once when another Herdr agent needs attention."
+platforms = ["linux"]
+
+[[actions]]
+id = "status"
+title = "Show pending attention events"
+contexts = ["global"]
+command = ["node", "attention-broker.js", "status"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["node", "attention-broker.js", "event"]

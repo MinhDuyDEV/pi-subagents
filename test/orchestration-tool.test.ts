@@ -7,11 +7,20 @@ import type {
   ExtensionContext,
   ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
-import type { TSchema } from "@sinclair/typebox";
+import type { TSchema } from "typebox";
 import { acquireResourceLease } from "../src/orchestration/claims.ts";
-import { buildContextPack, saveContextPack } from "../src/orchestration/context.ts";
-import { registerHerdrTool } from "../src/orchestration/tool.ts";
+import {
+  buildContextPack,
+  loadContextPack,
+  saveContextPack,
+} from "../src/orchestration/context.ts";
+import { getOrchestrationPaths } from "../src/orchestration/paths.ts";
+import { registerTaskControlTool } from "../src/orchestration/tool.ts";
 import { appendOrchestrationEvent } from "../src/orchestration/telemetry.ts";
+import {
+  createDurableRun,
+  putDurableRun,
+} from "../src/orchestration/run-store.ts";
 
 const temporaryDirectories: string[] = [];
 
@@ -43,16 +52,16 @@ afterEach(async () => {
   );
 });
 
-function createHerdrTool(): ToolDefinition<TSchema, unknown> {
+function createTaskControlTool(): ToolDefinition<TSchema, unknown> {
   let tool: ToolDefinition<TSchema, unknown> | undefined;
   const pi = {
     registerTool(definition: ToolDefinition<TSchema, unknown>) {
       tool = definition;
     },
   } as unknown as ExtensionAPI;
-  registerHerdrTool(pi);
+  registerTaskControlTool(pi);
   if (!tool) {
-    throw new Error("Herdr tool was not registered");
+    throw new Error("task_control tool was not registered");
   }
   return tool;
 }
@@ -64,7 +73,89 @@ function createContext(projectDirectory: string): ExtensionContext {
   } as unknown as ExtensionContext;
 }
 
-describe("herdr orchestration tool", () => {
+async function createSessionWithFinalText(
+  projectDirectory: string,
+  taskId: string,
+  finalText: string,
+): Promise<void> {
+  const sessionDirectory = join(
+    projectDirectory,
+    ".pi",
+    "artifacts",
+    "tasks",
+    "sessions",
+    taskId,
+  );
+  await mkdir(sessionDirectory, { recursive: true });
+  await writeFile(
+    join(sessionDirectory, "timestamp.jsonl"),
+    [
+      JSON.stringify({
+        type: "session",
+        version: 3,
+        id: "tool-session-id",
+        cwd: projectDirectory,
+      }),
+      JSON.stringify({
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: finalText }],
+        },
+      }),
+    ].join("\n"),
+    "utf8",
+  );
+}
+
+describe("task_control orchestration tool", () => {
+  it("binds evidence to a runtime-generated typed receipt", async () => {
+    const projectDirectory = await createTemporaryProject();
+    const paths = getOrchestrationPaths(projectDirectory);
+    const run = createDurableRun({
+      invocationId: "receipt-invocation",
+      projectDirectory,
+      description: "Receipt subject",
+      claims: [{ kind: "evidence", resource: "focused-test", mode: "exclusive" }],
+    });
+    run.taskId = "task-receipt";
+    run.executionPhase = "working";
+    await putDurableRun(paths.runStore, run);
+    await writeFile(join(projectDirectory, "test.log"), "all tests passed\n", "utf8");
+
+    const result = await createTaskControlTool().execute(
+      "record-receipt",
+      {
+        action: "record_evidence",
+        task_id: "task-receipt",
+        evidence_kind: "test",
+        evidence_description: "Focused tests pass",
+        evidence_reference: "test.log",
+        evidence_claim: "Focused tests pass",
+        evidence_exit_code: 0,
+      },
+      new AbortController().signal,
+      undefined,
+      createContext(projectDirectory),
+    );
+    expect(result.content[0]).toMatchObject({
+      type: "text",
+      text: expect.stringContaining("Recorded immutable evidence"),
+    });
+    const pack = await loadContextPack({
+      storeDirectory: paths.contextStore,
+      key: "task-receipt",
+    });
+    expect(pack?.evidence[0]).toMatchObject({
+      reference: "test.log",
+      source: "runtime-receipt",
+      receiptKind: "test",
+      exitCode: 0,
+      receiptId: expect.any(String),
+      sha256: expect.stringMatching(/^sha256:/u),
+    });
+  });
+
   it("returns canonical status and final result for a completed task", async () => {
     const projectDirectory = await createTemporaryProject();
     const taskId = "task-complete";
@@ -106,7 +197,7 @@ describe("herdr orchestration tool", () => {
       "utf8",
     );
 
-    const tool = createHerdrTool();
+    const tool = createTaskControlTool();
     const status = await tool.execute(
       "status-call",
       { action: "status", task_id: taskId },
@@ -129,6 +220,135 @@ describe("herdr orchestration tool", () => {
     expect(status.content[0]).toMatchObject({
       text: expect.stringContaining(sessionPath),
     });
+    expect(result.content[0]).toEqual({
+      type: "text",
+      text: "verified final result",
+    });
+  });
+
+  it("surfaces a claim-not-proven message for write-approved tasks when evidence-only proof fails", async () => {
+    const projectDirectory = await createTemporaryProject();
+    const taskId = "task-write-claim-unproven";
+    const sessionName = `task-${taskId}`;
+    const paths = getOrchestrationPaths(projectDirectory);
+    const completedAt = new Date("2026-07-19T01:00:00.000Z");
+
+    const pack = await buildContextPack({
+      projectDirectory,
+      input: {
+        goal: "Ship the change.",
+        authorization: "write-approved",
+        nextStep: "Run the build.",
+      },
+    });
+    await saveContextPack({
+      storeDirectory: paths.contextStore,
+      key: taskId,
+      pack,
+    });
+    await appendOrchestrationEvent({
+      eventPath: paths.eventLog,
+      event: {
+        type: "task_completed",
+        taskId,
+        orchestrationId: "orch-write-claim-unproven",
+        timestamp: completedAt.toISOString(),
+      },
+    });
+    await createSessionWithFinalText(
+      projectDirectory,
+      taskId,
+      "Claimed completion.",
+    );
+    await writeFile(
+      join(projectDirectory, ".pi", "task-session-history.json"),
+      `${JSON.stringify([
+        { id: taskId, sessionName, status: "completed", description: "Done" },
+      ])}\n`,
+      "utf8",
+    );
+
+    const tool = createTaskControlTool();
+    const result = await tool.execute(
+      "result-call",
+      { action: "result", task_id: taskId },
+      new AbortController().signal,
+      undefined,
+      createContext(projectDirectory),
+    );
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0]).toMatchObject({
+      type: "text",
+      text: expect.stringContaining("Claim not proven by evidence"),
+    });
+    expect(result.content[0]).toMatchObject({
+      type: "text",
+      text: expect.stringContaining("No completion evidence was provided"),
+    });
+  });
+
+  it("returns the raw result for write-approved tasks when evidence-only proof passes", async () => {
+    const projectDirectory = await createTemporaryProject();
+    const taskId = "task-write-claim-proven";
+    const sessionName = `task-${taskId}`;
+    const paths = getOrchestrationPaths(projectDirectory);
+    const completedAt = new Date("2026-07-19T01:00:00.000Z");
+
+    // Evidence references an existing file and is fresh relative to completion.
+    await writeFile(join(projectDirectory, "build.log"), "build passed\n", "utf8");
+    const pack = await buildContextPack({
+      projectDirectory,
+      input: {
+        goal: "Ship the change.",
+        authorization: "write-approved",
+        nextStep: "Run the build.",
+        evidence: [
+          {
+            description: "Build log confirms the change compiles.",
+            reference: "build.log",
+            recordedAt: completedAt.toISOString(),
+            source: "runtime-session",
+          },
+        ],
+      },
+    });
+    await saveContextPack({
+      storeDirectory: paths.contextStore,
+      key: taskId,
+      pack,
+    });
+    await appendOrchestrationEvent({
+      eventPath: paths.eventLog,
+      event: {
+        type: "task_completed",
+        taskId,
+        orchestrationId: "orch-write-claim-proven",
+        timestamp: completedAt.toISOString(),
+      },
+    });
+    await createSessionWithFinalText(
+      projectDirectory,
+      taskId,
+      "verified final result",
+    );
+    await writeFile(
+      join(projectDirectory, ".pi", "task-session-history.json"),
+      `${JSON.stringify([
+        { id: taskId, sessionName, status: "completed", description: "Done" },
+      ])}\n`,
+      "utf8",
+    );
+
+    const tool = createTaskControlTool();
+    const result = await tool.execute(
+      "result-call",
+      { action: "result", task_id: taskId },
+      new AbortController().signal,
+      undefined,
+      createContext(projectDirectory),
+    );
+
     expect(result.content[0]).toEqual({
       type: "text",
       text: "verified final result",
@@ -159,8 +379,17 @@ describe("herdr orchestration tool", () => {
       owner: "task-handoff",
       claims: [{ kind: "write", resource: "package/src", mode: "exclusive" }],
     });
+    const run = createDurableRun({
+      invocationId: "handoff-invocation",
+      projectDirectory,
+      lease,
+      contextPack: pack,
+    });
+    run.taskId = "task-handoff";
+    run.executionPhase = "working";
+    await putDurableRun(getOrchestrationPaths(projectDirectory).runStore, run);
 
-    const tool = createHerdrTool();
+    const tool = createTaskControlTool();
     const handoff = await tool.execute(
       "handoff-call",
       {
@@ -177,7 +406,7 @@ describe("herdr orchestration tool", () => {
     );
     const release = await tool.execute(
       "release-call",
-      { action: "release", lease_id: lease.id },
+      { action: "release", task_id: "task-handoff", lease_id: lease.id },
       new AbortController().signal,
       undefined,
       createContext(projectDirectory),
@@ -222,7 +451,7 @@ describe("herdr orchestration tool", () => {
       },
     });
 
-    const tool = createHerdrTool();
+    const tool = createTaskControlTool();
     await tool.execute(
       "review-call",
       {

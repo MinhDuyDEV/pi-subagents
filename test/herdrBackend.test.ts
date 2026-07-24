@@ -72,10 +72,13 @@ test("grouped HerdR launch starts Pi in the new workspace root pane", async () =
     resourceId: "w2:p1",
     socketPath: "/tmp/herdr.sock",
     terminalId: "term-1",
+    parentPaneId: "w1:p1",
+    agentName: "pi-task",
     workspaceId: "w2",
     workspaceGroup: "parallel-retry",
   });
-  assert.deepEqual(calls.map(({ args }) => args), [
+  const launchCalls = calls.map(({ args }) => args);
+  assert.deepEqual(launchCalls.slice(0, 3), [
     [
       "workspace",
       "create",
@@ -98,6 +101,11 @@ test("grouped HerdR launch starts Pi in the new workspace root pane", async () =
       "--session",
       "task",
     ],
+  ]);
+  assert.deepEqual(launchCalls[3]?.slice(0, 3), [
+    "pane",
+    "report-metadata",
+    "w2:p1",
   ]);
 });
 
@@ -192,8 +200,10 @@ test("ungrouped HerdR launch splits the caller pane before starting Pi", async (
     resourceId: "w1:p2",
     socketPath: "/tmp/herdr.sock",
     terminalId: "term-2",
+    parentPaneId: "w1:p1",
+    agentName: "pi-task",
   });
-  assert.deepEqual(calls, [
+  assert.deepEqual(calls.slice(0, 2), [
     [
       "pane",
       "split",
@@ -216,6 +226,11 @@ test("ungrouped HerdR launch splits the caller pane before starting Pi", async (
       "--session",
       "task",
     ],
+  ]);
+  assert.deepEqual(calls[2]?.slice(0, 3), [
+    "pane",
+    "report-metadata",
+    "w1:p2",
   ]);
 });
 
@@ -253,12 +268,10 @@ test("HerdR sends the initial task prompt as raw agent input after startup", asy
     initialPrompt,
   });
 
-  assert.deepEqual(calls.at(-1), [
-    "agent",
-    "prompt",
-    "w1:p2",
-    initialPrompt,
-  ]);
+  assert.deepEqual(
+    calls.find((args) => args[0] === "agent" && args[1] === "prompt"),
+    ["agent", "prompt", "w1:p2", initialPrompt],
+  );
 });
 
 test("parallel HerdR launches serialize workspace and pane creation", async () => {
@@ -443,7 +456,7 @@ test("HerdR cleanup after restart closes only an untracked grouped task pane", a
   assert.deepEqual(calls, [["pane", "close", "w2:p2"]]);
 });
 
-test("sync steering accepts HerdR mutation commands with empty stdout", () => {
+test("sync steering uses atomic HerdR agent prompt", () => {
   const calls: string[][] = [];
   const control = createSyncHerdrControl(
     { HERDR_SOCKET_PATH: "/tmp/herdr.sock" },
@@ -467,8 +480,7 @@ test("sync steering accepts HerdR mutation commands with empty stdout", () => {
   control.send(handle, "follow up");
   assert.deepEqual(calls, [
     ["pane", "get", "w1:p2"],
-    ["pane", "send-text", "w1:p2", "follow up"],
-    ["pane", "send-keys", "w1:p2", "enter"],
+    ["agent", "prompt", "w1:p2", "follow up"],
   ]);
 });
 
@@ -534,7 +546,7 @@ test("sync cleanup ignores an already-closed HerdR workspace", () => {
   );
 });
 
-test("async steering sends text followed by exactly one delayed Enter", async () => {
+test("async steering uses atomic HerdR agent prompt", async () => {
   const calls: string[][] = [];
   const backend = createHerdrTerminalBackend({
     env: {
@@ -548,6 +560,18 @@ test("async steering sends text followed by exactly one delayed Enter", async ()
         return {
           stdout: JSON.stringify({
             pane: { pane_id: "w1:p2", terminal_id: "term-2" },
+          }),
+          stderr: "",
+        };
+      }
+      if (args[0] === "agent" && args[1] === "prompt") {
+        return {
+          stdout: JSON.stringify({
+            agent: {
+              pane_id: "w1:p2",
+              terminal_id: "term-2",
+              agent_status: "working",
+            },
           }),
           stderr: "",
         };
@@ -568,8 +592,7 @@ test("async steering sends text followed by exactly one delayed Enter", async ()
 
   assert.deepEqual(calls, [
     ["pane", "get", "w1:p2"],
-    ["pane", "send-text", "w1:p2", "follow up"],
-    ["pane", "send-keys", "w1:p2", "enter"],
+    ["agent", "prompt", "w1:p2", "follow up"],
   ]);
 });
 

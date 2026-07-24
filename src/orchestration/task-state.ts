@@ -61,7 +61,7 @@ export async function persistTaskHistoryReference(
       ...current,
       id: taskId,
       taskId,
-      sessionName,
+      sessionName: stringValue(current?.sessionName) ?? sessionName,
       sessionRef: sessionReference,
       status: stringValue(current?.status) ?? "completed",
     },

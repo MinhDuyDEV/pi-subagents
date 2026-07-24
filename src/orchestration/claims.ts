@@ -5,7 +5,7 @@ import {
   rename,
   writeFile,
 } from "node:fs/promises";
-import { dirname } from "node:path";
+import { dirname, isAbsolute } from "node:path";
 import { withFileLock } from "./file-lock.js";
 
 const STORE_VERSION = 1;
@@ -25,6 +25,7 @@ export interface ResourceLease {
   owner: string;
   claims: ResourceClaim[];
   acquiredAt: string;
+  heartbeatAt?: string;
   expiresAt: string;
 }
 
@@ -56,6 +57,14 @@ export interface TransferResourceLeaseOwnershipInput {
   storePath: string;
   leaseId: string;
   owner: string;
+  now?: Date;
+}
+
+export interface RenewResourceLeaseInput {
+  storePath: string;
+  leaseId: string;
+  owner: string;
+  ttlMs?: number;
   now?: Date;
 }
 
@@ -126,6 +135,7 @@ export async function acquireResourceLease(
       owner: input.owner,
       claims,
       acquiredAt: now.toISOString(),
+      heartbeatAt: now.toISOString(),
       expiresAt: new Date(now.getTime() + ttlMs).toISOString(),
     };
     store.leases.push(lease);
@@ -165,8 +175,40 @@ export async function transferResourceLeaseOwnership(
       return undefined;
     }
     lease.owner = input.owner;
+    lease.heartbeatAt = now.toISOString();
     await writeStore(input.storePath, store);
     return lease;
+  });
+}
+
+export async function renewResourceLease(
+  input: RenewResourceLeaseInput,
+): Promise<ResourceLease | undefined> {
+  if (!input.owner.trim()) {
+    throw new Error("Resource lease owner must not be empty");
+  }
+  const now = input.now ?? new Date();
+  const ttlMs = input.ttlMs ?? DEFAULT_LEASE_TTL_MS;
+  if (!Number.isFinite(ttlMs) || ttlMs <= 0) {
+    throw new Error("Resource lease ttlMs must be greater than zero");
+  }
+  return withStoreLock(input.storePath, async () => {
+    const store = await readStore(input.storePath);
+    store.leases = activeLeases(store.leases, now);
+    const lease = store.leases.find((candidate) => candidate.id === input.leaseId);
+    if (!lease) {
+      await writeStore(input.storePath, store);
+      return undefined;
+    }
+    if (lease.owner !== input.owner) {
+      throw new Error(
+        `Resource lease ${input.leaseId} is owned by ${lease.owner}, not ${input.owner}`,
+      );
+    }
+    lease.heartbeatAt = now.toISOString();
+    lease.expiresAt = new Date(now.getTime() + ttlMs).toISOString();
+    await writeStore(input.storePath, store);
+    return { ...lease, claims: lease.claims.map((claim) => ({ ...claim })) };
   });
 }
 
@@ -183,6 +225,88 @@ export async function releaseResourceLease(
     await writeStore(input.storePath, store);
     return released;
   });
+}
+
+export interface ReleaseOrphanedLeasesInput {
+  storePath: string;
+  aliveOwnerIds: ReadonlySet<string>;
+  now?: Date;
+}
+
+/** Release active leases whose owner is no longer an alive task (Herdr §16.3 — handle
+ * abandoned locks on crash/freeze/compact, don't wait for TTL expiry). Returns the
+ * reaped lease ids. */
+export async function releaseOrphanedLeases(
+  input: ReleaseOrphanedLeasesInput,
+): Promise<string[]> {
+  const now = input.now ?? new Date();
+  const active = await listActiveResourceLeases({ storePath: input.storePath, now });
+  const reaped: string[] = [];
+  for (const lease of active) {
+    if (input.aliveOwnerIds.has(lease.owner)) continue;
+    await releaseResourceLease({ storePath: input.storePath, leaseId: lease.id, now });
+    reaped.push(lease.id);
+  }
+  return reaped;
+}
+
+export function claimCoversPath(resource: string, path: string): boolean {
+  const parent = staticGlobPrefix(normalizeResource(resource));
+  const child = normalizeResource(path);
+  return pathContains(parent, child);
+}
+
+export function leaseCoversPath(lease: ResourceLease, path: string): boolean {
+  return lease.claims.some(
+    (claim) =>
+      (claim.kind === "write" || claim.kind === "test") &&
+      claimCoversPath(claim.resource, path),
+  );
+}
+
+export interface FindClaimCoveringPathInput {
+  storePath: string;
+  path: string;
+  now?: Date;
+}
+
+export async function findClaimCoveringPath(
+  input: FindClaimCoveringPathInput,
+): Promise<ResourceLease | undefined> {
+  const now = input.now ?? new Date();
+  const leases = await listActiveResourceLeases({
+    storePath: input.storePath,
+    now,
+  });
+  return leases.find((lease) => leaseCoversPath(lease, input.path));
+}
+
+export interface AssertNoConflictingWriteInput {
+  storePath: string;
+  ownerTaskId: string;
+  path: string;
+  now?: Date;
+}
+
+export async function assertNoConflictingWrite(
+  input: AssertNoConflictingWriteInput,
+): Promise<void> {
+  const lease = await findClaimCoveringPath({
+    storePath: input.storePath,
+    path: input.path,
+    now: input.now,
+  });
+  if (!lease || lease.owner === input.ownerTaskId) {
+    return;
+  }
+  const claim = lease.claims.find(
+    (item) =>
+      (item.kind === "write" || item.kind === "test") &&
+      claimCoversPath(item.resource, input.path),
+  );
+  throw new Error(
+    `Write blocked: ${input.path} is locked by task ${lease.owner} (${claim?.mode ?? "exclusive"} ${claim?.kind ?? "write"} claim)`,
+  );
 }
 
 export function claimsConflict(
@@ -206,6 +330,21 @@ function normalizeClaim(claim: ResourceClaim): ResourceClaim {
   const resource = normalizeResource(claim.resource);
   if (!resource) {
     throw new Error("Resource claim must not be empty");
+  }
+  if (claim.kind === "write") {
+    if (claim.mode !== "exclusive") {
+      throw new Error("Write resource claims must be exclusive");
+    }
+    if (
+      resource === ".." ||
+      resource.startsWith("../") ||
+      resource.includes("/../") ||
+      isAbsolute(resource) ||
+      /^[A-Za-z]:\//u.test(resource) ||
+      resource.startsWith("//")
+    ) {
+      throw new Error(`Write resource claim must stay inside the project: ${claim.resource}`);
+    }
   }
   return { ...claim, resource };
 }

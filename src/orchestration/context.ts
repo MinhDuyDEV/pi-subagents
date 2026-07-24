@@ -1,5 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  readFile,
+  realpath,
+  rename,
+  writeFile,
+} from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { withFileLock } from "./file-lock.js";
 
@@ -32,6 +38,12 @@ export interface ContextEvidence {
   description: string;
   reference: string;
   recordedAt?: string;
+  claim?: string;
+  receiptId?: string;
+  sha256?: string;
+  source?: "declared" | "runtime-receipt" | "runtime-session";
+  receiptKind?: "file" | "test" | "command-output" | "session" | "diff";
+  exitCode?: number;
 }
 
 export interface ContextReferenceInput {
@@ -51,6 +63,7 @@ export interface ContextPackInput {
   decisions?: readonly ContextDecision[];
   references?: readonly ContextReferenceInput[];
   evidence?: readonly ContextEvidence[];
+  claims?: readonly string[];
   nextStep: string;
 }
 
@@ -67,6 +80,7 @@ export interface ContextPack {
   decisions: ContextDecision[];
   references: ContextReference[];
   evidence: ContextEvidence[];
+  claims: string[];
   nextStep: string;
 }
 
@@ -101,6 +115,7 @@ export async function buildContextPack(input: {
       input.input.references ?? [],
     ),
     evidence: (input.input.evidence ?? []).map(redactEvidence),
+    claims: (input.input.claims ?? []).map(redactSensitiveText),
     nextStep: redactSensitiveText(input.input.nextStep),
   };
 }
@@ -128,9 +143,16 @@ export function renderContextPackForPrompt(pack: ContextPack): string {
   }
   for (const evidence of pack.evidence) {
     const recordedAt = evidence.recordedAt ? ` @ ${evidence.recordedAt}` : "";
+    const claimTag = evidence.claim ? ` [claim: ${evidence.claim}]` : "";
     lines.push(
-      `Evidence: ${evidence.description} (${evidence.reference}${recordedAt})`,
+      `Evidence: ${evidence.description} (${evidence.reference}${recordedAt})${claimTag}`,
     );
+  }
+  if (pack.claims.length > 0) {
+    lines.push("Claims to prove:");
+    for (const claim of pack.claims) {
+      lines.push(`- ${claim}`);
+    }
   }
   lines.push(`Next step: ${pack.nextStep}`);
 
@@ -225,7 +247,7 @@ async function buildReferences(
   projectDirectory: string,
   references: readonly ContextReferenceInput[],
 ): Promise<ContextReference[]> {
-  const projectRoot = resolve(projectDirectory);
+  const projectRoot = await realpath(resolve(projectDirectory));
   const result: ContextReference[] = [];
 
   for (const reference of references) {
@@ -237,7 +259,14 @@ async function buildReferences(
       throw new Error(`Context reference is outside the project: ${reference.path}`);
     }
 
-    const content = await readFile(absolutePath);
+    const realPath = await realpath(absolutePath);
+    const realRelative = relative(projectRoot, realPath);
+    if (realRelative.startsWith("..") || isAbsolute(realRelative)) {
+      throw new Error(
+        `Context reference resolves outside the project: ${reference.path}`,
+      );
+    }
+    const content = await readFile(realPath);
     result.push({
       path: relativePath.replaceAll("\\", "/"),
       digest: `sha256:${createHash("sha256").update(content).digest("hex")}`,
@@ -288,6 +317,12 @@ function redactEvidence(evidence: ContextEvidence): ContextEvidence {
     description: redactSensitiveText(evidence.description),
     reference: redactSensitiveText(evidence.reference),
     ...(evidence.recordedAt ? { recordedAt: evidence.recordedAt } : {}),
+    ...(evidence.claim ? { claim: redactSensitiveText(evidence.claim) } : {}),
+    ...(evidence.receiptId ? { receiptId: evidence.receiptId } : {}),
+    ...(evidence.sha256 ? { sha256: evidence.sha256 } : {}),
+    source: evidence.source ?? "declared",
+    ...(evidence.receiptKind ? { receiptKind: evidence.receiptKind } : {}),
+    ...(evidence.exitCode !== undefined ? { exitCode: evidence.exitCode } : {}),
   };
 }
 
@@ -311,6 +346,8 @@ function isContextPack(value: unknown): value is ContextPack {
     value.references.every(isContextReference) &&
     Array.isArray(value.evidence) &&
     value.evidence.every(isContextEvidence) &&
+    Array.isArray(value.claims) &&
+    value.claims.every((item) => typeof item === "string") &&
     typeof value.nextStep === "string"
   );
 }
@@ -348,7 +385,21 @@ function isContextEvidence(value: unknown): value is ContextEvidence {
     isRecord(value) &&
     typeof value.description === "string" &&
     typeof value.reference === "string" &&
-    (value.recordedAt === undefined || typeof value.recordedAt === "string")
+    (value.recordedAt === undefined || typeof value.recordedAt === "string") &&
+    (value.claim === undefined || typeof value.claim === "string") &&
+    (value.receiptId === undefined || typeof value.receiptId === "string") &&
+    (value.sha256 === undefined || typeof value.sha256 === "string") &&
+    (value.source === undefined ||
+      value.source === "declared" ||
+      value.source === "runtime-receipt" ||
+      value.source === "runtime-session") &&
+    (value.receiptKind === undefined ||
+      value.receiptKind === "file" ||
+      value.receiptKind === "test" ||
+      value.receiptKind === "command-output" ||
+      value.receiptKind === "session" ||
+      value.receiptKind === "diff") &&
+    (value.exitCode === undefined || typeof value.exitCode === "number")
   );
 }
 

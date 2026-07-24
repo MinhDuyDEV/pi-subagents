@@ -4,6 +4,11 @@ import { join } from "node:path";
 import { claimsConflict, listActiveResourceLeases } from "./claims.js";
 import { loadContextPack } from "./context.js";
 import { resolveTaskSessionReference } from "./lifecycle.js";
+import { getOrchestrationPaths } from "./paths.js";
+import {
+  isTerminalExecutionPhase,
+  listDurableRuns,
+} from "./run-store.js";
 import { readOrchestrationEvents } from "./telemetry.js";
 
 export type DoctorIssueSeverity = "error" | "warning";
@@ -42,14 +47,34 @@ export async function runOrchestrationDoctor(input: {
   if (input.delegationPrompt !== undefined) {
     issues.push(...validateDelegationContract(input.delegationPrompt));
   }
-  issues.push(...validateCeremony(input.ceremonySteps ?? []));
-  issues.push(
-    ...(await validateRuntimeParity(input.projectDirectory)),
-    ...(await validateTaskHistory(input.projectDirectory)),
-    ...(await validateLifecycleEvents(input.projectDirectory, now, staleAfterMs)),
-    ...(await validateResourceLeases(input.projectDirectory, now)),
-    ...(await validateContextEvidence(input.projectDirectory, now, staleAfterMs)),
-  );
+  issues.push(...validateCeremony(input.ceremonySteps ?? [], input.projectDirectory));
+  const checks = await Promise.all([
+    safeDoctorCheck("runtime-parity-check-failed", () =>
+      validateRuntimeParity(input.projectDirectory),
+    ),
+    safeDoctorCheck("task-history-check-failed", () =>
+      validateTaskHistory(input.projectDirectory),
+    ),
+    safeDoctorCheck("durable-run-check-failed", () =>
+      validateDurableRuns(input.projectDirectory, now, staleAfterMs),
+    ),
+    safeDoctorCheck("lifecycle-check-failed", () =>
+      validateLifecycleEvents(input.projectDirectory, now, staleAfterMs),
+    ),
+    safeDoctorCheck("lease-check-failed", () =>
+      validateResourceLeases(input.projectDirectory, now),
+    ),
+    safeDoctorCheck("context-check-failed", () =>
+      validateContextEvidence(input.projectDirectory, now, staleAfterMs),
+    ),
+    safeDoctorCheck("ship-gate-check-failed", () =>
+      validateShipGate(input.projectDirectory),
+    ),
+    safeDoctorCheck("write-claim-check-failed", () =>
+      validateWriteClaims(input.projectDirectory),
+    ),
+  ]);
+  issues.push(...checks.flat());
 
   return {
     ok: issues.length === 0,
@@ -57,6 +82,25 @@ export async function runOrchestrationDoctor(input: {
     exitCode: issues.length === 0 ? 0 : 1,
     issues,
   };
+}
+
+async function safeDoctorCheck(
+  code: string,
+  check: () => Promise<DoctorIssue[]>,
+): Promise<DoctorIssue[]> {
+  try {
+    return await check();
+  } catch (error) {
+    return [
+      {
+        code,
+        severity: "error",
+        message: `Doctor check failed: ${error instanceof Error ? error.message : String(error)}`,
+        remediation:
+          "Inspect the referenced orchestration files and rerun /task-doctor after repair.",
+      },
+    ];
+  }
 }
 
 function validateDelegationContract(prompt: string): DoctorIssue[] {
@@ -86,15 +130,29 @@ function validateDelegationContract(prompt: string): DoctorIssue[] {
       ];
 }
 
-function validateCeremony(steps: readonly CeremonyStep[]): DoctorIssue[] {
+function validateCeremony(
+  steps: readonly CeremonyStep[],
+  projectDirectory: string,
+): DoctorIssue[] {
+  // Herdr §11.3 (anti-ceremony): every ceremony component must justify itself with
+  // real substance. A non-empty-string check is itself the ceremony it warns against,
+  // so a uniqueValue must be VERIFIABLE — an existing artifact path or a content hash —
+  // or the step is valueless ceremony at error severity.
   return steps
-    .filter((step) => !step.uniqueValue.trim())
+    .filter((step) => {
+      const value = step.uniqueValue.trim();
+      if (!value) return true;
+      const isHash = /^[a-f0-9]{16,}$/iu.test(value);
+      const isExistingArtifact =
+        existsSync(value) || existsSync(join(projectDirectory, value));
+      return !isHash && !isExistingArtifact;
+    })
     .map((step) => ({
       code: "valueless-ceremony",
-      severity: "warning" as const,
-      message: `Ceremony step has no unique value: ${step.name}.`,
+      severity: "error" as const,
+      message: `Ceremony step "${step.name}" has no verifiable unique value: "${step.uniqueValue}".`,
       remediation:
-        "Remove the step or state the distinct safety, information, or proof it provides.",
+        "Point uniqueValue at a real produced artifact (path) or its content hash, or remove the step — ceremony must justify itself with proof (Herdr §11.3).",
     }));
 }
 
@@ -127,7 +185,15 @@ async function validateRuntimeParity(
       reference: settingsPath,
     });
   }
-  if (!existsSync(liveEntryPath)) {
+
+  // Additive/external-package integration: a consumer that loads the runtime
+  // through .pi/settings.json `packages` (e.g. npm:@minhduydev/pi-subagents@...)
+  // is a valid architecture. The wrapper and packaged runtime are provided by
+  // the pinned package, so the embedded-source wiring checks below do not apply
+  // and must not be flagged as runtime-wrapper-missing/packaged-runtime-drift.
+  const externallyProvidedRuntime = hasPiSubagentsPackage(packages);
+
+  if (!externallyProvidedRuntime && !existsSync(liveEntryPath)) {
     issues.push({
       code: "runtime-wrapper-missing",
       severity: "error",
@@ -144,7 +210,10 @@ async function validateRuntimeParity(
     Array.isArray(packageManifest.pi.extensions)
       ? packageManifest.pi.extensions
       : [];
-  if (!packagedExtensions.includes("./dist/task-runtime.js")) {
+  if (
+    !externallyProvidedRuntime &&
+    !packagedExtensions.includes("./dist/task-runtime.js")
+  ) {
     issues.push({
       code: "packaged-runtime-drift",
       severity: "error",
@@ -156,6 +225,18 @@ async function validateRuntimeParity(
   }
 
   return issues;
+}
+
+function hasPiSubagentsPackage(packages: unknown): boolean {
+  if (!Array.isArray(packages)) {
+    return false;
+  }
+  return packages.some(
+    (entry) =>
+      typeof entry === "string" &&
+      (entry.includes("@minhduydev/pi-subagents") ||
+        /\/pi-subagents\//u.test(entry)),
+  );
 }
 
 async function validateTaskHistory(
@@ -200,6 +281,90 @@ async function validateTaskHistory(
   return issues;
 }
 
+async function validateDurableRuns(
+  projectDirectory: string,
+  now: Date,
+  staleAfterMs: number,
+): Promise<DoctorIssue[]> {
+  const paths = getOrchestrationPaths(projectDirectory);
+  let runs: Awaited<ReturnType<typeof listDurableRuns>>;
+  try {
+    runs = await listDurableRuns(paths.runStore);
+  } catch (error) {
+    return [
+      {
+        code: "run-store-corrupt",
+        severity: "error",
+        message: `Durable task store cannot be read: ${error instanceof Error ? error.message : String(error)}`,
+        remediation: "Restore runs.json from version control/backup or move it aside after inspecting active tasks.",
+        reference: paths.runStore,
+      },
+    ];
+  }
+  const issues: DoctorIssue[] = [];
+  for (const run of runs) {
+    const label = run.taskId ?? run.invocationId;
+    if (
+      !isTerminalExecutionPhase(run.executionPhase) &&
+      now.getTime() - Date.parse(run.heartbeatAt) > staleAfterMs
+    ) {
+      issues.push({
+        code: "stale-run-heartbeat",
+        severity: "warning",
+        message: `Task ${label} has a stale durable heartbeat.`,
+        remediation: "Reconnect its backend, resume it, or stop it and release its lease.",
+        reference: paths.runStore,
+      });
+    }
+    if (run.verificationPhase === "failed") {
+      issues.push({
+        code: "verification-failed",
+        severity: "error",
+        message: `Task ${label} failed verification: ${run.verificationIssues.join(" ")}`,
+        remediation: "Produce fresh local evidence or rerun the delegated task.",
+        reference: paths.runStore,
+      });
+    }
+    if (
+      run.worktreeDisposition === "retained" &&
+      (!run.worktree || !existsSync(run.worktree.path))
+    ) {
+      issues.push({
+        code: "retained-worktree-missing",
+        severity: "error",
+        message: `Task ${label} records a retained worktree that no longer exists.`,
+        remediation:
+          "Restore the owned worktree/branch, or explicitly mark the task worktree removed after confirming the changes are no longer needed.",
+        reference: run.worktree?.path ?? paths.runStore,
+      });
+    }
+    if (
+      isTerminalExecutionPhase(run.executionPhase) &&
+      run.worktree &&
+      run.worktreeDisposition === undefined
+    ) {
+      issues.push({
+        code: "worktree-disposition-unknown",
+        severity: "warning",
+        message: `Task ${label} completed without a durable worktree disposition.`,
+        remediation:
+          "Inspect the task worktree, then use task_control worktree_status, worktree_merge, or worktree_remove.",
+        reference: run.worktree.path,
+      });
+    }
+    if (run.reviewPhase === "awaiting") {
+      issues.push({
+        code: "awaiting-review",
+        severity: "warning",
+        message: `Task ${label} is awaiting independent review.`,
+        remediation: "Complete a distinct reviewer task, record its receipt, then ship.",
+        reference: paths.runStore,
+      });
+    }
+  }
+  return issues;
+}
+
 async function validateLifecycleEvents(
   projectDirectory: string,
   now: Date,
@@ -213,11 +378,30 @@ async function validateLifecycleEvents(
     "orchestration",
     "events.jsonl",
   );
-  const events = await readOrchestrationEvents(eventPath);
+  let events: Awaited<ReturnType<typeof readOrchestrationEvents>>;
+  try {
+    events = await readOrchestrationEvents(eventPath);
+  } catch (error) {
+    return [
+      {
+        code: "event-journal-corrupt",
+        severity: "error",
+        message: `Correctness event journal cannot be read: ${error instanceof Error ? error.message : String(error)}`,
+        remediation:
+          "Preserve the journal for diagnosis, repair malformed non-tail records, then rerun /task-doctor.",
+        reference: eventPath,
+      },
+    ];
+  }
   const terminalTaskIds = new Set(
     events
       .filter(
-        (event) => event.type === "task_completed" || event.type === "task_failed",
+        (event) =>
+          event.type === "task_execution_completed" ||
+          event.type === "task_completed" ||
+          event.type === "task_failed" ||
+          event.type === "task_cancelled" ||
+          event.type === "task_timed_out",
       )
       .map((event) => event.taskId)
       .filter((taskId): taskId is string => taskId !== undefined),
@@ -253,6 +437,55 @@ async function validateLifecycleEvents(
   return issues;
 }
 
+async function validateShipGate(
+  projectDirectory: string,
+): Promise<DoctorIssue[]> {
+  const eventPath = join(
+    projectDirectory,
+    ".pi",
+    "artifacts",
+    "tasks",
+    "orchestration",
+    "events.jsonl",
+  );
+  const events = await readOrchestrationEvents(eventPath).catch(() => []);
+  const lastBlocked = new Map<string, number>();
+  const lastShipped = new Map<string, number>();
+  events.forEach((event, index) => {
+    if (event.type === "task_ship_blocked" && event.taskId) {
+      lastBlocked.set(event.taskId, index);
+    }
+    if (event.type === "task_shipped" && event.taskId) {
+      lastShipped.set(event.taskId, index);
+    }
+  });
+  const issues: DoctorIssue[] = [];
+  for (const [taskId, blockedIndex] of lastBlocked) {
+    const shippedIndex = lastShipped.get(taskId);
+    if (shippedIndex === undefined || shippedIndex < blockedIndex) {
+      issues.push({
+        code: "unverified-ship",
+        severity: "error",
+        message: `Task ${taskId} was ship-blocked and never cleared by an independent review.`,
+        remediation:
+          "Record an independent review with task_control review, then task_control ship.",
+        reference: eventPath,
+      });
+    }
+  }
+  return issues;
+}
+
+async function validateWriteClaims(
+  _projectDirectory: string,
+): Promise<DoctorIssue[]> {
+  // A shared working-tree `git status` cannot attribute paths to one task and
+  // produces false positives for pre-existing or concurrent changes. Write
+  // coverage is therefore validated from an isolated worktree's changed-path
+  // receipt during completion, never from global repository dirtiness here.
+  return [];
+}
+
 async function validateResourceLeases(
   projectDirectory: string,
   now: Date,
@@ -265,7 +498,21 @@ async function validateResourceLeases(
     "orchestration",
     "leases.json",
   );
-  const leases = await listActiveResourceLeases({ storePath, now });
+  let leases: Awaited<ReturnType<typeof listActiveResourceLeases>>;
+  try {
+    leases = await listActiveResourceLeases({ storePath, now });
+  } catch (error) {
+    return [
+      {
+        code: "lease-store-corrupt",
+        severity: "error",
+        message: `Lease store cannot be read: ${error instanceof Error ? error.message : String(error)}`,
+        remediation:
+          "Inspect active tasks before repairing leases.json; use PI_SUBAGENTS_NO_CLAIMS=1 only as an explicit emergency override.",
+        reference: storePath,
+      },
+    ];
+  }
   const issues: DoctorIssue[] = [];
 
   for (let leftIndex = 0; leftIndex < leases.length; leftIndex += 1) {
@@ -325,10 +572,20 @@ async function validateContextEvidence(
       continue;
     }
     const key = entry.name.slice(0, -".json".length);
-    const pack = await loadContextPack({ storeDirectory, key });
-    if (!pack) {
+    let pack: Awaited<ReturnType<typeof loadContextPack>>;
+    try {
+      pack = await loadContextPack({ storeDirectory, key });
+    } catch (error) {
+      issues.push({
+        code: "context-pack-corrupt",
+        severity: "error",
+        message: `Context Pack ${key} cannot be read: ${error instanceof Error ? error.message : String(error)}`,
+        remediation: "Restore or recreate this Context Pack before resuming its task.",
+        reference: join(storeDirectory, entry.name),
+      });
       continue;
     }
+    if (!pack) continue;
     for (const evidence of pack.evidence) {
       const recordedAt = evidence.recordedAt
         ? Date.parse(evidence.recordedAt)
@@ -353,6 +610,11 @@ async function readJson(path: string): Promise<unknown> {
     return JSON.parse(await readFile(path, "utf8")) as unknown;
   } catch (error) {
     if (isNodeError(error) && error.code === "ENOENT") {
+      return undefined;
+    }
+    // Treat unparseable JSON as "no usable file" so a corrupt settings.json or
+    // manifest cannot crash the doctor; downstream guards derive an empty view.
+    if (error instanceof SyntaxError) {
       return undefined;
     }
     throw error;

@@ -4,9 +4,16 @@ import {
   upsertTaskSessionHistory,
   writeRegistry,
 } from "../conversation.js";
-import { hasAgentFinished } from "../session-text.js";
+import {
+  getAgentTerminalStopReason,
+  hasAgentFinished,
+} from "../session-text.js";
 import { killAgentPane, paneExists } from "../subagent/tmux.js";
 import type { BackgroundTask, RegistryEntry } from "../types.js";
+import {
+  finalizeTaskWorktree,
+  type WorktreeResult,
+} from "../worktree.js";
 
 export function restoreActiveBackgroundTasks(
   piDir: string,
@@ -28,6 +35,15 @@ export function restoreActiveBackgroundTasks(
       entry.sessionName,
       entry.startedAt,
     );
+    const terminalStopReason = sessionFinished
+      ? getAgentTerminalStopReason(entry.dir, entry.sessionName, entry.startedAt)
+      : undefined;
+    const terminalStatus =
+      terminalStopReason === "error"
+        ? "failed"
+        : terminalStopReason === "aborted"
+          ? "cancelled"
+          : "done";
     const paneId = entry.handle?.resourceId ?? entry.paneId;
     let paneAlive: boolean;
     try {
@@ -42,9 +58,10 @@ export function restoreActiveBackgroundTasks(
     }
 
     if (sessionFinished) {
+      const worktreeResult = settleWorktree(entry);
       upsertTaskSessionHistory(piDir, {
         id: entry.id,
-        status: "done",
+        status: terminalStatus,
         background: true,
         agentType: entry.agentType,
         description: entry.description,
@@ -52,7 +69,9 @@ export function restoreActiveBackgroundTasks(
         startedAt: entry.startedAt,
         piDir: entry.piDir,
         dir: entry.dir,
-        paneId: entry.paneId,
+                paneId: entry.paneId,
+        worktree: entry.worktree,
+        worktreeResult,
         completedAt: Date.now(),
       });
       if (entry.handle?.backend === "herdr" && entry.handle.workspaceId) {
@@ -75,6 +94,7 @@ export function restoreActiveBackgroundTasks(
     }
 
     if (!paneAlive) {
+      const worktreeResult = settleWorktree(entry);
       if (entry.handle?.backend === "herdr" && entry.handle.workspaceId) {
         try {
           closeResource?.(entry);
@@ -93,6 +113,8 @@ export function restoreActiveBackgroundTasks(
         piDir: entry.piDir,
         dir: entry.dir,
         paneId: entry.paneId,
+        worktree: entry.worktree,
+        worktreeResult,
         completedAt: Date.now(),
       });
       staleIds.push(entry.id);
@@ -112,6 +134,8 @@ export function restoreActiveBackgroundTasks(
       toolUses: 0,
       turns: 0,
       conversationId: entry.conversationId,
+      worktree: entry.worktree,
+      worktreeResult: entry.worktreeResult,
       recentCalls: [],
     });
   }
@@ -121,5 +145,20 @@ export function restoreActiveBackgroundTasks(
       piDir,
       registry.filter((entry) => !staleIds.includes(entry.id)),
     );
+  }
+}
+
+function settleWorktree(entry: RegistryEntry): WorktreeResult | undefined {
+  if (entry.worktreeResult) return entry.worktreeResult;
+  if (!entry.worktree) return undefined;
+  try {
+    return finalizeTaskWorktree(entry.worktree);
+  } catch {
+    return {
+      ...entry.worktree,
+      changedPaths: [],
+      diffDigest: "unavailable",
+      retained: true,
+    };
   }
 }

@@ -1,17 +1,25 @@
 {
   "name": "@minhduydev/pi-subagents",
-  "version": "0.1.0",
-  "description": "Delegation runtime for Pi: a robust task/subagent tool (foreground/background, HerdR/tmux/SDK) plus machine-checkable orchestration (resource claims/leases, context packs, evidence-only review, doctor, telemetry) and pane-creation retry. Runtime-only \u2014 ships no agent profiles; agents resolve from the consumer's .pi/agents/.",
+  "version": "0.5.0",
+  "description": "Herdr-native delegation runtime for Pi with durable task state, foreground/background agents, worktree isolation, claims/lease heartbeats, evidence and independent review gates, grouped completion, schedules, RPC v3, recovery, and SDK/tmux fallback. Runtime-only: agent profiles remain consumer-owned.",
   "type": "module",
   "main": "dist/task-runtime.js",
   "exports": {
     ".": {
       "types": "./dist/task-runtime.d.ts",
       "import": "./dist/task-runtime.js"
+    },
+    "./api": {
+      "types": "./dist/api.d.ts",
+      "import": "./dist/api.js"
     }
   },
   "files": [
     "dist",
+    "skills",
+    "herdr-plugin",
+    "docs",
+    "implementation-notes.md",
     "README.md",
     "LICENSE"
   ],
@@ -23,6 +31,7 @@
     "prepack": "npm run build",
     "postversion": "git push --follow-tags",
     "test:orchestration": "vitest run test/orchestration-*.test.ts",
+    "test:package": "node test/package-install.mjs",
     "test:base": "tsx --test test/helpers.test.ts test/prompt.test.ts test/frontmatter.test.ts test/renderHint.test.ts test/polling.test.ts test/taskWidget.test.ts test/sdkWidgetEvents.test.ts test/sdkBackground.test.ts test/sdkPolling.test.ts test/widgetLifecycle.test.ts test/handles.test.ts test/terminalBackend.test.ts test/herdrBackend.test.ts test/exitSentinel.test.ts test/waitCompletion.test.ts test/restore.test.ts test/lifecycleCompletion.test.ts test/failure-diagnostics.test.ts test/taskTitle.test.ts test/modelSelection.test.ts test/herdr-retry.test.ts test/staleCtx.test.ts"
   },
   "keywords": [
@@ -41,23 +50,25 @@
     "session-management"
   ],
   "license": "MIT",
+  "engines": {
+    "node": ">=20.0.0"
+  },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": ">=0.81.1",
     "@earendil-works/pi-tui": ">=0.81.1",
     "typebox": "*"
   },
   "dependencies": {
-    "@sinclair/typebox": "^0.34.48"
+    "croner": "^9.1.0"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.81.0",
-    "@earendil-works/pi-tui": "^0.81.0",
-    "@sinclair/typebox": "^0.34.48",
+    "@earendil-works/pi-coding-agent": "^0.81.1",
+    "@earendil-works/pi-tui": "^0.81.1",
     "@types/node": "^20.0.0",
     "tsx": "^4.20.6",
     "typebox": "1.1.38",
     "typescript": "^5.0.0",
-    "vitest": "^2.1.9"
+    "vitest": "^4.1.10"
   },
   "publishConfig": {
     "access": "public"
@@ -65,6 +76,9 @@
   "pi": {
     "extensions": [
       "./dist/task-runtime.js"
+    ],
+    "skills": [
+      "./skills/pi-subagents"
     ]
   },
   "repository": {

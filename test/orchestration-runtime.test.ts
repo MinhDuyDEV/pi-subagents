@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { Type, type TSchema } from "@sinclair/typebox";
+import { Type, type TSchema } from "typebox";
 import type {
   ExtensionAPI,
   ExtensionContext,
@@ -12,6 +12,13 @@ import {
   createTaskRuntime,
   resolveUpstreamTaskExtension,
 } from "../src/orchestration/runtime.ts";
+import { acquireResourceLease } from "../src/orchestration/claims.ts";
+import { getOrchestrationPaths } from "../src/orchestration/paths.ts";
+import {
+  createDurableRun,
+  patchDurableRun,
+  putDurableRun,
+} from "../src/orchestration/run-store.ts";
 
 const temporaryDirectories: string[] = [];
 
@@ -25,6 +32,7 @@ async function createTemporaryProject(): Promise<string> {
 }
 
 afterEach(async () => {
+  delete process.env.PI_TASK_TOOL_DISABLED;
   await Promise.all(
     temporaryDirectories.splice(0).map((directory) =>
       rm(directory, { recursive: true, force: true }),
@@ -36,23 +44,30 @@ interface FakePi {
   api: ExtensionAPI;
   tools: Map<string, ToolDefinition<TSchema, unknown>>;
   messages: unknown[];
+  handlers: Map<string, Array<(...args: unknown[]) => unknown>>;
 }
 
 function createFakePi(): FakePi {
   const tools = new Map<string, ToolDefinition<TSchema, unknown>>();
   const messages: unknown[] = [];
+  const handlers = new Map<string, Array<(...args: unknown[]) => unknown>>();
   const api = {
     registerTool(tool: ToolDefinition<TSchema, unknown>) {
       tools.set(tool.name, tool);
     },
-    on() {},
+    on(event: string, handler: (...args: unknown[]) => unknown) {
+      const values = handlers.get(event) ?? [];
+      values.push(handler);
+      handlers.set(event, values);
+    },
+    registerCommand() {},
     sendMessage(message: unknown) {
       messages.push(message);
     },
-    events: { on() {}, emit() {} },
+    events: { on() { return () => undefined; }, emit() {} },
     ui: { notify() {} },
   } as unknown as ExtensionAPI;
-  return { api, tools, messages };
+  return { api, tools, messages, handlers };
 }
 
 function createContext(projectDirectory: string): ExtensionContext {
@@ -107,6 +122,9 @@ describe("orchestrated task runtime", () => {
     };
     expect(parameters.required).toEqual(["agent_type", "prompt", "description"]);
     expect(parameters.properties).toHaveProperty("orchestration");
+    expect(parameters.properties).not.toHaveProperty(
+      "__pi_subagents_invocation_id",
+    );
   });
 
   it("extends task calls with claims and a Context Pack without leaking wrapper fields upstream", async () => {
@@ -143,7 +161,7 @@ describe("orchestrated task runtime", () => {
     createTaskRuntime(upstream)(fakePi.api);
     const task = fakePi.tools.get("task");
     expect(task).toBeDefined();
-    expect(task?.description).toContain("resource claims");
+    expect(task?.description).toContain("resource ownership");
     expect(task?.description).toContain("Context Pack");
     expect(
       "orchestration" in
@@ -269,6 +287,226 @@ describe("orchestrated task runtime", () => {
     ).rejects.toThrow(/Evidence-only review failed/u);
   });
 
+  it("defaults write-approved tasks to evidence-only proof when no proof is passed", async () => {
+    const projectDirectory = await createTemporaryProject();
+    const fakePi = createFakePi();
+    const upstream = (pi: ExtensionAPI) => {
+      pi.registerTool({
+        name: "task",
+        label: "Task",
+        description: "Fake upstream task",
+        parameters: Type.Object({
+          agent_type: Type.String(),
+          prompt: Type.String(),
+          description: Type.String(),
+          background: Type.Optional(Type.Boolean()),
+        }),
+        async execute() {
+          return {
+            content: [{ type: "text" as const, text: "Claimed completion." }],
+            details: { taskId: "task-write-default-proof", phase: "completed" },
+          };
+        },
+      });
+    };
+
+    createTaskRuntime(upstream)(fakePi.api);
+    // No explicit `proof` is passed; the curriculum default for write-approved
+    // tasks must still run validateEvidenceOnlyProof, which fails on no evidence.
+    await expect(
+      fakePi.tools.get("task")?.execute(
+        "write-default-proof",
+        {
+          agent_type: "reviewer",
+          prompt: "Verify evidence only.",
+          description: "Write default proof",
+          background: false,
+          orchestration: {
+            context: {
+              goal: "Ship the change.",
+              authorization: "write-approved",
+              next_step: "Run the build.",
+            },
+          },
+        },
+        new AbortController().signal,
+        undefined,
+        createContext(projectDirectory),
+      ),
+    ).rejects.toThrow(/Evidence-only review failed/u);
+  });
+
+  it("does not default non-write tasks to evidence-only proof", async () => {
+    const projectDirectory = await createTemporaryProject();
+    const fakePi = createFakePi();
+    const upstream = (pi: ExtensionAPI) => {
+      pi.registerTool({
+        name: "task",
+        label: "Task",
+        description: "Fake upstream task",
+        parameters: Type.Object({
+          agent_type: Type.String(),
+          prompt: Type.String(),
+          description: Type.String(),
+          background: Type.Optional(Type.Boolean()),
+        }),
+        async execute() {
+          return {
+            content: [{ type: "text" as const, text: "Read-only findings." }],
+            details: { taskId: "task-read-only-no-proof", phase: "completed" },
+          };
+        },
+      });
+    };
+
+    createTaskRuntime(upstream)(fakePi.api);
+    const result = await fakePi.tools.get("task")?.execute(
+      "read-only-no-proof",
+      {
+        agent_type: "reviewer",
+        prompt: "Read-only review.",
+        description: "Read-only no proof",
+        background: false,
+        orchestration: {
+          context: {
+            goal: "Inspect the code.",
+            authorization: "read-only",
+            next_step: "Report findings.",
+          },
+        },
+      },
+      new AbortController().signal,
+      undefined,
+      createContext(projectDirectory),
+    );
+
+    // Non-write tasks keep the existing behavior: the raw subagent result is
+    // returned without an evidence-only proof gate.
+    expect(result?.content[0]?.text).toBe("Read-only findings.");
+  });
+
+  it("does not let PI_SUBAGENTS_NO_PROOF silently disable the default proof for write-approved tasks", async () => {
+    const projectDirectory = await createTemporaryProject();
+    const fakePi = createFakePi();
+    const upstream = (pi: ExtensionAPI) => {
+      pi.registerTool({
+        name: "task",
+        label: "Task",
+        description: "Fake upstream task",
+        parameters: Type.Object({
+          agent_type: Type.String(),
+          prompt: Type.String(),
+          description: Type.String(),
+          background: Type.Optional(Type.Boolean()),
+        }),
+        async execute() {
+          return {
+            content: [{ type: "text" as const, text: "Claimed completion." }],
+            details: { taskId: "task-write-env-proof", phase: "completed" },
+          };
+        },
+      });
+    };
+
+    createTaskRuntime(upstream)(fakePi.api);
+    const previous = process.env.PI_SUBAGENTS_NO_PROOF;
+    process.env.PI_SUBAGENTS_NO_PROOF = "1";
+    try {
+      // The env-var escape hatch must not silently disable the curriculum
+      // default for write-approved tasks that did not pass an explicit proof.
+      await expect(
+        fakePi.tools.get("task")?.execute(
+          "write-env-proof",
+          {
+            agent_type: "reviewer",
+            prompt: "Verify evidence only.",
+            description: "Write env proof",
+            background: false,
+            orchestration: {
+              context: {
+                goal: "Ship the change.",
+                authorization: "write-approved",
+                next_step: "Run the build.",
+              },
+            },
+          },
+          new AbortController().signal,
+          undefined,
+          createContext(projectDirectory),
+        ),
+      ).rejects.toThrow(/Evidence-only review failed/u);
+    } finally {
+      if (previous === undefined) {
+        delete process.env.PI_SUBAGENTS_NO_PROOF;
+      } else {
+        process.env.PI_SUBAGENTS_NO_PROOF = previous;
+      }
+    }
+  });
+
+  it("does not lose a completion emitted before task registration finishes", async () => {
+    const projectDirectory = await createTemporaryProject();
+    const fakePi = createFakePi();
+    const upstream = (pi: ExtensionAPI) => {
+      pi.registerTool({
+        name: "task",
+        label: "Task",
+        description: "Racing upstream task",
+        parameters: Type.Object({
+          agent_type: Type.String(),
+          prompt: Type.String(),
+          description: Type.String(),
+          background: Type.Optional(Type.Boolean()),
+        }),
+        async execute() {
+          pi.sendMessage(
+            {
+              customType: "task-complete",
+              content: "Finished immediately",
+              display: true,
+              details: { task_id: "task-race", duration_ms: 1 },
+            },
+            { triggerTurn: false },
+          );
+          return {
+            content: [{ type: "text" as const, text: "Started task task-race." }],
+            details: { taskId: "task-race", phase: "running" },
+          };
+        },
+      });
+    };
+
+    createTaskRuntime(upstream)(fakePi.api);
+    await fakePi.tools.get("task")?.execute(
+      "race-call",
+      {
+        agent_type: "general",
+        prompt: "Finish immediately.",
+        description: "Completion registration race",
+        background: true,
+      },
+      new AbortController().signal,
+      undefined,
+      createContext(projectDirectory),
+    );
+
+    await vi.waitFor(() => {
+      expect(fakePi.messages).toEqual([
+        expect.objectContaining({
+          customType: "task-complete",
+          content: "Finished immediately",
+        }),
+      ]);
+    });
+    const paths = getOrchestrationPaths(projectDirectory);
+    const runs = JSON.parse(await readFile(paths.runStore, "utf8")) as {
+      runs: Array<{ taskId?: string; executionPhase: string }>;
+    };
+    expect(runs.runs).toEqual([
+      expect.objectContaining({ taskId: "task-race", executionPhase: "completed" }),
+    ]);
+  });
+
   it("records background evidence-only proof failures as task failures", async () => {
     const projectDirectory = await createTemporaryProject();
     const fakePi = createFakePi();
@@ -339,7 +577,7 @@ describe("orchestrated task runtime", () => {
         .map((line) => JSON.parse(line) as { type: string; taskId?: string });
       expect(events).toEqual(
         expect.arrayContaining([
-          expect.objectContaining({ type: "task_failed", taskId: "task-proof-fail" }),
+          expect.objectContaining({ type: "task_execution_completed", taskId: "task-proof-fail" }),
           expect.objectContaining({ type: "proof_failed", taskId: "task-proof-fail" }),
         ]),
       );
@@ -552,6 +790,204 @@ describe("orchestrated task runtime", () => {
     );
   });
 
+  it("settles a canonical background launch failure without waiting for a completion hook", async () => {
+    const projectDirectory = await createTemporaryProject();
+    const fakePi = createFakePi();
+    const upstream = (pi: ExtensionAPI) => {
+      pi.registerTool({
+        name: "task",
+        label: "Task",
+        description: "Failing upstream task",
+        parameters: Type.Object({
+          agent_type: Type.String(),
+          prompt: Type.String(),
+          description: Type.String(),
+          background: Type.Optional(Type.Boolean()),
+        }),
+        async execute() {
+          return {
+            content: [{ type: "text" as const, text: "Could not launch task task-launch-failed." }],
+            details: {
+              task_id: "task-launch-failed",
+              phase: "failed",
+              error: "backend unavailable",
+            },
+            isError: true,
+          };
+        },
+      });
+    };
+
+    createTaskRuntime(upstream)(fakePi.api);
+    const result = await fakePi.tools.get("task")?.execute(
+      "launch-failed",
+      {
+        agent_type: "general",
+        prompt: "Fail at launch.",
+        description: "Canonical launch failure",
+        background: true,
+        orchestration: {
+          claims: [{ kind: "write", resource: "src", mode: "exclusive" }],
+        },
+      },
+      new AbortController().signal,
+      undefined,
+      createContext(projectDirectory),
+    );
+    expect((result as { isError?: boolean }).isError).toBe(true);
+
+    const paths = getOrchestrationPaths(projectDirectory);
+    const document = JSON.parse(await readFile(paths.runStore, "utf8")) as {
+      runs: Array<{ taskId?: string; executionPhase: string }>;
+    };
+    expect(document.runs).toEqual([
+      expect.objectContaining({
+        taskId: "task-launch-failed",
+        executionPhase: "failed",
+      }),
+    ]);
+    const leases = JSON.parse(await readFile(paths.leaseStore, "utf8")) as {
+      leases: unknown[];
+    };
+    expect(leases.leases).toEqual([]);
+  });
+
+  it("recovers an allocating background run from the durable task registry", async () => {
+    const projectDirectory = await createTemporaryProject();
+    const paths = getOrchestrationPaths(projectDirectory);
+    const startedAt = new Date().toISOString();
+    await putDurableRun(
+      paths.runStore,
+      createDurableRun({
+        invocationId: "recover-invocation",
+        agentType: "general",
+        description: "Recover me",
+        projectDirectory,
+        startedAt,
+      }),
+    );
+    await writeFile(
+      join(projectDirectory, ".pi", "task-registry.json"),
+      `${JSON.stringify([
+        {
+          id: "task-recovered",
+          agentType: "general",
+          description: "Recover me",
+          sessionName: "task-task-recovered",
+          startedAt: Date.parse(startedAt) + 10,
+          piDir: join(projectDirectory, ".pi"),
+          dir: join(projectDirectory, ".pi", "artifacts", "tasks"),
+        },
+      ])}\n`,
+      "utf8",
+    );
+    const fakePi = createFakePi();
+    const upstream = (pi: ExtensionAPI) => {
+      pi.registerTool({
+        name: "task",
+        label: "Task",
+        description: "Recovery upstream",
+        parameters: Type.Object({}),
+        async execute() {
+          return { content: [{ type: "text" as const, text: "unused" }], details: {} };
+        },
+      });
+    };
+    createTaskRuntime(upstream)(fakePi.api);
+    const sessionStart = fakePi.handlers.get("session_start")?.[0];
+    await sessionStart?.({}, createContext(projectDirectory));
+
+    const document = JSON.parse(await readFile(paths.runStore, "utf8")) as {
+      runs: Array<{ taskId?: string; executionPhase: string }>;
+    };
+    expect(document.runs).toEqual([
+      expect.objectContaining({
+        taskId: "task-recovered",
+        executionPhase: "working",
+      }),
+    ]);
+  });
+
+  it("reconciles terminal JSONL completion after a parent restart", async () => {
+    const projectDirectory = await createTemporaryProject();
+    const paths = getOrchestrationPaths(projectDirectory);
+    const run = createDurableRun({
+      invocationId: "restart-invocation",
+      agentType: "general",
+      description: "Restarted task",
+      projectDirectory,
+    });
+    await putDurableRun(paths.runStore, run);
+    await patchDurableRun(paths.runStore, run.invocationId, {
+      taskId: "task-restart",
+      executionPhase: "working",
+    });
+    const sessionDirectory = join(
+      projectDirectory,
+      ".pi",
+      "artifacts",
+      "tasks",
+      "sessions",
+      "task-restart",
+    );
+    const sessionPath = join(sessionDirectory, "restart.jsonl");
+    await mkdir(sessionDirectory, { recursive: true });
+    await writeFile(
+      sessionPath,
+      [
+        JSON.stringify({ type: "session_info", name: "task-task-restart" }),
+        JSON.stringify({
+          type: "message",
+          message: {
+            role: "assistant",
+            stopReason: "stop",
+            content: [{ type: "text", text: "Recovered final result" }],
+          },
+        }),
+      ].join("\n"),
+      "utf8",
+    );
+    await writeFile(
+      join(projectDirectory, ".pi", "task-session-history.json"),
+      `${JSON.stringify([
+        {
+          id: "task-restart",
+          status: "done",
+          sessionName: "task-task-restart",
+          sessionRef: sessionPath,
+        },
+      ])}\n`,
+      "utf8",
+    );
+
+    const fakePi = createFakePi();
+    createTaskRuntime((pi) => {
+      pi.registerTool({
+        name: "task",
+        label: "Task",
+        description: "Recovery upstream",
+        parameters: Type.Object({}),
+        async execute() {
+          return { content: [{ type: "text" as const, text: "unused" }], details: {} };
+        },
+      });
+    })(fakePi.api);
+    await fakePi.handlers
+      .get("session_start")?.[0]
+      ?.({}, createContext(projectDirectory));
+
+    expect(fakePi.messages).toEqual([
+      expect.objectContaining({
+        customType: "task-complete",
+        content: expect.stringContaining("Recovered final result"),
+      }),
+    ]);
+    const document = JSON.parse(await readFile(paths.runStore, "utf8")) as {
+      runs: Array<{ executionPhase: string }>;
+    };
+    expect(document.runs[0]?.executionPhase).toBe("completed");
+  });
+
   it("seeds a canonical session reference before resuming a completed task", async () => {
     const projectDirectory = await createTemporaryProject();
     const taskId = "task-completed";
@@ -644,5 +1080,44 @@ describe("orchestrated task runtime", () => {
     expect(repairedHistory.find((entry) => entry.id === taskId)?.sessionRef).toBe(
       sessionPath,
     );
+  });
+
+  it("does not register the parent control plane inside child Pi processes", () => {
+    process.env.PI_TASK_TOOL_DISABLED = "1";
+    const fakePi = createFakePi();
+    const upstream = (pi: ExtensionAPI) => {
+      pi.registerTool({
+        name: "child-marker",
+        label: "Child marker",
+        description: "marker",
+        parameters: Type.Object({}),
+        async execute() {
+          return { content: [{ type: "text" as const, text: "ok" }] };
+        },
+      });
+    };
+    createTaskRuntime(upstream)(fakePi.api);
+    expect(fakePi.tools.has("child-marker")).toBe(true);
+    expect(fakePi.tools.has("task_control")).toBe(false);
+    expect(fakePi.handlers.has("tool_call")).toBe(false);
+  });
+
+  it("guards real Pi built-in writes through the tool_call event", async () => {
+    const projectDirectory = await createTemporaryProject();
+    const paths = getOrchestrationPaths(projectDirectory);
+    await acquireResourceLease({
+      storePath: paths.leaseStore,
+      owner: "task-owner",
+      claims: [{ kind: "write", resource: "src", mode: "exclusive" }],
+    });
+    const fakePi = createFakePi();
+    createTaskRuntime(() => undefined)(fakePi.api);
+    const handler = fakePi.handlers.get("tool_call")?.[0];
+    expect(handler).toBeDefined();
+    const blocked = await handler?.(
+      { type: "tool_call", toolName: "edit", input: { path: "src/a.ts" } },
+      createContext(projectDirectory),
+    );
+    expect(blocked).toMatchObject({ block: true });
   });
 });
