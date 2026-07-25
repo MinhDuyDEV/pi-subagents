@@ -17,7 +17,9 @@ export type ContextProvenance =
   | "user"
   | "repository"
   | "delegated"
-  | "external";
+  | "external"
+  /** Non-authoritative facts imported from the learning store. */
+  | "learning";
 export type ContextAuthorization =
   | "read-only"
   | "write-approved"
@@ -367,7 +369,8 @@ function isContextFact(value: unknown): value is ContextFact {
     (value.source === "user" ||
       value.source === "repository" ||
       value.source === "delegated" ||
-      value.source === "external") &&
+      value.source === "external" ||
+      value.source === "learning") &&
     (value.reference === undefined || typeof value.reference === "string")
   );
 }

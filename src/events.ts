@@ -16,6 +16,7 @@
  * ───────────────────────────────────────────────────────────────────────────
  */
 
+import { redactSensitiveText } from "./orchestration/context.js";
 import type { ContextFact } from "./orchestration/context.js";
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -97,6 +98,8 @@ export interface ContextRequestPayloadV1 {
   protocolVersion: 1;
   /** The task ID that is about to be launched. */
   taskId: string;
+  /** Stable orchestration correlation; taskId remains the task identity. */
+  correlationId: string;
   /** Agent type name (e.g. "general", "reviewer"). */
   agentType: string;
   /** Short description of the task goal. */
@@ -118,6 +121,8 @@ export interface ContextRequestPayloadV1 {
 export interface ProofVerifiedPayloadV1 {
   protocolVersion: 1;
   taskId: string;
+  /** Stable orchestration correlation shared with context and review events. */
+  correlationId: string;
   /** true = proof passed, false = proof failed. */
   verificationPassed: boolean;
   /** Human-readable issues from proof validation (empty on pass).
@@ -153,6 +158,15 @@ const SHA256_HEX_LENGTH = 64;
  * Returns the clamped string. If the string contains potential secrets
  * (e.g. long base64-like sequences), it is fully redacted.
  */
+function safeRedact(value: unknown): string {
+  if (typeof value !== "string") return "";
+  try {
+    return redactSensitiveText(value);
+  } catch {
+    return "";
+  }
+}
+
 export function clampString(value: string, maxLength: number): string {
   if (typeof value !== "string") return "";
   // Redact if it looks like a long base64/hex token (no spaces, mostly alphanumeric)
@@ -167,7 +181,10 @@ export function clampString(value: string, maxLength: number): string {
  * The array itself is bounded to MAX_ISSUES items.
  */
 export function clampIssues(issues: readonly string[]): readonly string[] {
-  return issues.slice(0, MAX_ISSUES).map((i) => clampString(i, MAX_ISSUE_LENGTH));
+  if (!Array.isArray(issues)) return [];
+  return issues
+    .slice(0, MAX_ISSUES)
+    .map((issue) => clampString(safeRedact(issue), MAX_ISSUE_LENGTH));
 }
 
 /**
@@ -189,6 +206,7 @@ export function validateSha256Hex(value: string): string | undefined {
 export function validateEvidenceDigests(
   digests: readonly string[],
 ): readonly string[] {
+  if (!Array.isArray(digests)) return [];
   return digests
     .slice(0, MAX_EVIDENCE_DIGESTS)
     .map((d) => validateSha256Hex(d))
@@ -207,12 +225,14 @@ export function makeContextRequestPayload(
   taskId: string,
   agentType: string,
   description: string,
+  correlationId = taskId,
 ): ContextRequestPayloadV1 {
   return {
     protocolVersion: 1,
     taskId: clampString(taskId, MAX_TASK_ID),
-    agentType: clampString(agentType, MAX_AGENT_TYPE),
-    description: clampString(description, MAX_DESCRIPTION),
+    correlationId: clampString(correlationId, MAX_ID),
+    agentType: clampString(safeRedact(agentType), MAX_AGENT_TYPE),
+    description: clampString(safeRedact(description), MAX_DESCRIPTION),
   };
 }
 
@@ -227,10 +247,12 @@ export function makeProofVerifiedPayload(
   verificationPassed: boolean,
   issues: readonly string[],
   evidenceDigests: readonly string[],
+  correlationId = taskId,
 ): ProofVerifiedPayloadV1 {
   return {
     protocolVersion: 1,
     taskId: clampString(taskId, MAX_TASK_ID),
+    correlationId: clampString(correlationId, MAX_ID),
     verificationPassed,
     verificationIssues: clampIssues(issues),
     evidenceDigests: validateEvidenceDigests(evidenceDigests),
@@ -250,11 +272,13 @@ export function makeReviewCompletedPayload(
   reviewerTaskId: string,
   reviewerInvocationId: string,
   subjectDigest: string,
+  correlationId = taskId,
 ): ReviewCompletedPayloadV1 {
   return {
     protocolVersion: 1,
     taskId: clampString(taskId, MAX_TASK_ID),
-    verdict: clampString(verdict, MAX_VERDICT),
+    correlationId: clampString(correlationId, MAX_ID),
+    verdict: clampString(safeRedact(verdict), MAX_VERDICT),
     reviewerTaskId: clampString(reviewerTaskId, MAX_ID),
     reviewerInvocationId: clampString(reviewerInvocationId, MAX_ID),
     subjectDigest: validateSha256Hex(subjectDigest) ?? "",
@@ -271,6 +295,8 @@ export function makeReviewCompletedPayload(
 export interface ReviewCompletedPayloadV1 {
   protocolVersion: 1;
   taskId: string;
+  /** Stable orchestration correlation shared with context and proof events. */
+  correlationId: string;
   /** The review verdict text. */
   verdict: string;
   /** Task ID of the reviewer subagent. */
@@ -371,7 +397,7 @@ export function validateLearningContext(
  *
  * Each learning fact is converted to a `ContextFact` with:
  * - `statement`: `[learning] <domain>: <summary>`
- * - `source`: `"repository"`
+ * - `source`: `"learning"` (explicitly non-authoritative)
  * - `reference`: `"pi-learning:<evidenceDigest-or-active>"`
  *
  * @param knownFacts - The existing knownFacts array (may be undefined).
@@ -392,16 +418,16 @@ export function mergeLearningFacts(
     return knownFacts ?? [];
   }
   const base = knownFacts ? [...knownFacts] : [];
-  let totalChars = base.reduce((sum, f) => sum + f.statement.length, 0);
+  let addedChars = 0;
   for (const fact of learningCtx.facts) {
     const statement = `[learning] ${fact.domain}: ${fact.summary}`;
-    if (totalChars + statement.length > maxTotalChars) break;
+    if (addedChars + statement.length > maxTotalChars) continue;
     base.push({
       statement,
-      source: "repository" as const,
+      source: "learning" as const,
       reference: `pi-learning:${fact.evidenceDigest ?? "active"}`,
     });
-    totalChars += statement.length;
+    addedChars += statement.length;
   }
   return base;
 }

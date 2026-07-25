@@ -303,6 +303,7 @@ async function executeHerdrAction(
           proof.valid,
           proof.issues,
           (pack?.evidence ?? []).map((e) => e.sha256 ?? "").filter(Boolean),
+          run.correlationId ?? run.invocationId,
         );
         try {
           await pi.events.emit(SUBAGENT_LEARNING_EVENTS_V1.PROOF_VERIFIED, proofPayload);
@@ -461,6 +462,7 @@ async function executeHerdrAction(
           reviewerTaskId,
           reviewer.invocationId,
           subjectDigest,
+          subject.correlationId ?? subject.invocationId,
         );
         try {
           await pi.events.emit(SUBAGENT_LEARNING_EVENTS_V1.REVIEW_COMPLETED, reviewPayload);

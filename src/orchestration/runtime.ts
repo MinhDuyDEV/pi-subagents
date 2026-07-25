@@ -403,12 +403,36 @@ function createOrchestratedTaskTool(
           await seedResumeRegistry(ctx.cwd, resumedTaskId);
         }
 
+        // The context request is an event, so establish the durable run first.
+        // This preserves durable-before-emit without changing task ID semantics.
+        if (!resumedTaskId) {
+          await putDurableRun(
+            paths.runStore,
+            createDurableRun({
+              invocationId,
+              correlationId: orchestration?.id,
+              batchId: orchestration?.batchId,
+              joinMode: orchestration?.join,
+              agentType,
+              description,
+              projectDirectory: ctx.cwd,
+              startedAt,
+              claims: orchestration?.claims,
+              lease,
+              leaseTtlMs: orchestration?.leaseTtlMs,
+              proof: effectiveProof,
+              verifier: orchestration?.verifier,
+            }),
+          );
+        }
+
         // ── Optional learning context request (fail-open) ──────────
         if (pi?.events && !resumedTaskId) {
           const contextRequest = makeContextRequestPayload(
             invocationId,
             agentType ?? "unknown",
             description ?? "",
+            orchestration?.id ?? invocationId,
           );
           try {
             await pi.events.emit(

@@ -34,7 +34,10 @@ try {
     "pi-subagents",
   );
   const manifest = JSON.parse(await readFile(join(packageRoot, "package.json"), "utf8"));
-  if (manifest.version !== "0.5.0") throw new Error("Installed package version mismatch");
+  const expectedManifest = JSON.parse(await readFile(join(repository, "package.json"), "utf8"));
+  if (manifest.version !== expectedManifest.version) {
+    throw new Error(`Installed package version mismatch: expected ${expectedManifest.version}, got ${manifest.version}`);
+  }
   for (const path of [
     "dist/task-runtime.js",
     "dist/api.js",

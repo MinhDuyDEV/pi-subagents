@@ -24,6 +24,40 @@ import {
 } from "../src/events.js";
 import type { ContextFact } from "../src/orchestration/context.js";
 
+describe("learning event emission contracts", () => {
+  it("uses one explicit correlation ID and redacts bounded payload fields", () => {
+    const correlationId = "orchestration-1";
+    const context = makeContextRequestPayload(
+      "task-1",
+      "worker",
+      "deploy api_key=secret-value",
+      correlationId,
+    );
+    const proof = makeProofVerifiedPayload(
+      "task-1",
+      false,
+      ["password=hunter2"],
+      ["a".repeat(64)],
+      correlationId,
+    );
+    const review = makeReviewCompletedPayload(
+      "task-1",
+      "rejected secret=bad-value",
+      "review-task",
+      "review-invocation",
+      "b".repeat(64),
+      correlationId,
+    );
+
+    expect(context.correlationId).toBe(correlationId);
+    expect(proof.correlationId).toBe(correlationId);
+    expect(review.correlationId).toBe(correlationId);
+    expect(context.description).not.toContain("secret-value");
+    expect(proof.verificationIssues[0]).not.toContain("hunter2");
+    expect(review.verdict).not.toContain("bad-value");
+  });
+});
+
 // ───────────────────────────────────────────────────────────────────────────
 //  validateLearningContext
 // ───────────────────────────────────────────────────────────────────────────
@@ -62,7 +96,7 @@ describe("validateLearningContext", () => {
           domain: "typescript",
           summary: "Use branded types for domain modeling",
           confidence: "high",
-          evidenceDigest: "abc123",
+          evidenceDigest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         },
       ],
     };
@@ -73,7 +107,7 @@ describe("validateLearningContext", () => {
     expect(result!.facts[0].domain).toBe("typescript");
     expect(result!.facts[0].summary).toBe("Use branded types for domain modeling");
     expect(result!.facts[0].confidence).toBe("high");
-    expect(result!.facts[0].evidenceDigest).toBe("abc123");
+    expect(result!.facts[0].evidenceDigest).toBe("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
   });
 
   it("rejects facts with invalid confidence", () => {
@@ -157,7 +191,7 @@ describe("validateLearningContext", () => {
     expect(result!.facts[0].summary.length).toBe(1200);
   });
 
-  it("clamps evidenceDigest to 128 chars", () => {
+  it("rejects non-SHA-256 evidenceDigest", () => {
     const input = {
       version: 1,
       facts: [
@@ -170,8 +204,7 @@ describe("validateLearningContext", () => {
       ],
     };
     const result = validateLearningContext(input);
-    expect(result).toBeDefined();
-    expect(result!.facts[0].evidenceDigest!.length).toBe(128);
+    expect(result).toBeUndefined();
   });
 
   it("accepts optional patterns and clamps them", () => {
@@ -286,7 +319,7 @@ describe("mergeLearningFacts", () => {
     expect(result).toHaveLength(2);
     expect(result[0].statement).toBe("user fact");
     expect(result[1].statement).toBe("[learning] typescript: Use branded types");
-    expect(result[1].source).toBe("repository");
+    expect(result[1].source).toBe("learning");
     expect(result[1].reference).toBe("pi-learning:active");
   });
 
@@ -294,11 +327,11 @@ describe("mergeLearningFacts", () => {
     const ctx: LearningContextV1 = {
       version: 1,
       facts: [
-        { domain: "test", summary: "fact with digest", confidence: "high", evidenceDigest: "abc123" },
+        { domain: "test", summary: "fact with digest", confidence: "high", evidenceDigest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
       ],
     };
     const result = mergeLearningFacts([], ctx);
-    expect(result[0].reference).toBe("pi-learning:abc123");
+    expect(result[0].reference).toBe("pi-learning:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
   });
 
   it("caps total merged chars at 1200 by default", () => {
@@ -313,8 +346,8 @@ describe("mergeLearningFacts", () => {
       ],
     };
     const result = mergeLearningFacts(existing, ctx);
-    // First fact would exceed 1200 total, so it's dropped
-    expect(result).toHaveLength(1);
+    // Learning budget counts only added learning chars; existing context is not charged
+    expect(result).toHaveLength(3);
   });
 
   it("respects custom maxTotalChars", () => {
@@ -342,6 +375,7 @@ describe("ContextRequestPayloadV1", () => {
     const payload: ContextRequestPayloadV1 = {
       protocolVersion: 1,
       taskId: "task-123",
+      correlationId: "corr-123",
       agentType: "general",
       description: "Implement feature X",
     };
@@ -362,6 +396,7 @@ describe("ContextRequestPayloadV1", () => {
     const payload: ContextRequestPayloadV1 = {
       protocolVersion: 1,
       taskId: "task-123",
+      correlationId: "corr-123",
       agentType: "general",
       description: "test",
       response: ctx,
@@ -376,9 +411,10 @@ describe("ProofVerifiedPayloadV1", () => {
     const payload: ProofVerifiedPayloadV1 = {
       protocolVersion: 1,
       taskId: "task-123",
+      correlationId: "corr-123",
       verificationPassed: true,
       verificationIssues: [],
-      evidenceDigests: ["abc123", "def456"],
+      evidenceDigests: ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],
       timestamp: "2026-07-19T00:00:00.000Z",
     };
     expect(payload.verificationPassed).toBe(true);
@@ -392,6 +428,7 @@ describe("ProofVerifiedPayloadV1", () => {
     const payload: ProofVerifiedPayloadV1 = {
       protocolVersion: 1,
       taskId: "task-123",
+      correlationId: "corr-123",
       verificationPassed: false,
       verificationIssues: ["No evidence provided", "Stale reference"],
       evidenceDigests: [],
@@ -406,6 +443,7 @@ describe("ProofVerifiedPayloadV1", () => {
     const payload: ProofVerifiedPayloadV1 = {
       protocolVersion: 1,
       taskId: "task-123",
+      correlationId: "corr-123",
       verificationPassed: true,
       verificationIssues: [],
       evidenceDigests: [],
@@ -424,6 +462,7 @@ describe("ReviewCompletedPayloadV1", () => {
     const payload: ReviewCompletedPayloadV1 = {
       protocolVersion: 1,
       taskId: "task-123",
+      correlationId: "corr-123",
       verdict: "accepted",
       reviewerTaskId: "reviewer-456",
       reviewerInvocationId: "invoc-789",
@@ -789,6 +828,7 @@ describe("content privacy", () => {
     const payload: ProofVerifiedPayloadV1 = {
       protocolVersion: 1,
       taskId: "task-123",
+      correlationId: "corr-123",
       verificationPassed: true,
       verificationIssues: [],
       evidenceDigests: [],
@@ -804,6 +844,7 @@ describe("content privacy", () => {
     const payload: ReviewCompletedPayloadV1 = {
       protocolVersion: 1,
       taskId: "task-123",
+      correlationId: "corr-123",
       verdict: "accepted",
       reviewerTaskId: "reviewer-456",
       reviewerInvocationId: "invoc-789",
