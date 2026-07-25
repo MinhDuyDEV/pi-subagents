@@ -28,6 +28,12 @@ import {
   type ContextPack,
 } from "./context.js";
 import {
+  SUBAGENT_LEARNING_EVENTS_V1,
+  makeContextRequestPayload,
+  validateLearningContext,
+  mergeLearningFacts,
+} from "../events.js";
+import {
   recordBackgroundCompletion,
   recordForegroundCompletion,
   releaseLeaseAndRecord,
@@ -397,7 +403,44 @@ function createOrchestratedTaskTool(
           await seedResumeRegistry(ctx.cwd, resumedTaskId);
         }
 
-        if (orchestration?.context) {
+        // ── Optional learning context request (fail-open) ──────────
+        if (pi?.events && !resumedTaskId) {
+          const contextRequest = makeContextRequestPayload(
+            invocationId,
+            agentType ?? "unknown",
+            description ?? "",
+          );
+          try {
+            await pi.events.emit(
+              SUBAGENT_LEARNING_EVENTS_V1.CONTEXT_REQUEST,
+              contextRequest,
+            );
+            if (contextRequest.response) {
+              const validated = validateLearningContext(contextRequest.response);
+              if (validated && validated.facts.length > 0) {
+                // Merge learning facts into orchestration context as
+                // provenance-labelled non-authoritative entries.
+                // This never overrides user prompt or policy.
+                const existingFacts = orchestration?.context?.knownFacts;
+                const mergedFacts = mergeLearningFacts(existingFacts, validated, 1200);
+                if (mergedFacts.length > (existingFacts?.length ?? 0)) {
+                  const contextInput = {
+                    ...(orchestration?.context ?? { goal: description ?? "", authorization: "read-only" as const, nextStep: "" }),
+                    knownFacts: mergedFacts,
+                  };
+                  contextPack = await buildContextPack({
+                    projectDirectory: ctx.cwd,
+                    input: contextInput,
+                  });
+                }
+              }
+            }
+          } catch {
+            // fail-open: listener error must not block task launch
+          }
+        }
+
+        if (!contextPack && orchestration?.context) {
           contextPack = await buildContextPack({
             projectDirectory: ctx.cwd,
             input: orchestration.context,
