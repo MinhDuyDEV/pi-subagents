@@ -4,6 +4,11 @@ import { basename, dirname, isAbsolute, relative, resolve } from "node:path";
 import { Type, type Static } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
+  SUBAGENT_LEARNING_EVENTS_V1,
+  makeProofVerifiedPayload,
+  makeReviewCompletedPayload,
+} from "../events.js";
+import {
   inspectTaskWorktree,
   mergeTaskWorktree,
   removeTaskWorktree,
@@ -132,7 +137,7 @@ export function registerTaskControlTool(pi: ExtensionAPI): void {
       "Query delegated task status/results, append scoped handoffs or evidence, inspect local orchestration health, and perform explicit review or cleanup actions.",
     parameters: TaskControlParameters,
     async execute(_toolCallId, input, _signal, _onUpdate, ctx) {
-      return executeHerdrAction(input, ctx.cwd);
+      return executeHerdrAction(input, ctx.cwd, pi);
     },
   });
 }
@@ -143,6 +148,7 @@ export const registerHerdrTool = registerTaskControlTool;
 async function executeHerdrAction(
   input: TaskControlInput,
   projectDirectory: string,
+  pi?: ExtensionAPI,
 ) {
   const paths = getOrchestrationPaths(projectDirectory);
   switch (input.action) {
@@ -290,6 +296,20 @@ async function executeHerdrAction(
           },
         });
       }
+      // Emit learning event after durable recording (fail-open)
+      if (pi?.events) {
+        const proofPayload = makeProofVerifiedPayload(
+          taskId,
+          proof.valid,
+          proof.issues,
+          (pack?.evidence ?? []).map((e) => e.sha256 ?? "").filter(Boolean),
+        );
+        try {
+          await pi.events.emit(SUBAGENT_LEARNING_EVENTS_V1.PROOF_VERIFIED, proofPayload);
+        } catch {
+          // fail-open: listener error must not block task control
+        }
+      }
       return {
         content: [
           {
@@ -432,6 +452,21 @@ async function executeHerdrAction(
         await patchDurableRun(paths.runStore, subject.invocationId, {
           reviewPhase: "rejected",
         });
+      }
+      // Emit learning event after durable recording (fail-open)
+      if (pi?.events) {
+        const reviewPayload = makeReviewCompletedPayload(
+          taskId,
+          verdict,
+          reviewerTaskId,
+          reviewer.invocationId,
+          subjectDigest,
+        );
+        try {
+          await pi.events.emit(SUBAGENT_LEARNING_EVENTS_V1.REVIEW_COMPLETED, reviewPayload);
+        } catch {
+          // fail-open: listener error must not block task control
+        }
       }
       return {
         content: [

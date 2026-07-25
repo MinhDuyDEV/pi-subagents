@@ -46,11 +46,38 @@ export {
   type TaskSchedule,
 } from "./orchestration/scheduler.js";
 
+import {
+  SUBAGENT_LEARNING_EVENTS_V1,
+  validateLearningContext,
+  mergeLearningFacts,
+  type LearningContextV1,
+  type LearningFactV1,
+  type LearningPatternV1,
+  type LearningMetricsV1,
+  type ContextRequestPayloadV1,
+  type ProofVerifiedPayloadV1,
+  type ReviewCompletedPayloadV1,
+} from "./events.js";
+
+export {
+  SUBAGENT_LEARNING_EVENTS_V1,
+  validateLearningContext,
+  mergeLearningFacts,
+  type LearningContextV1,
+  type LearningFactV1,
+  type LearningPatternV1,
+  type LearningMetricsV1,
+  type ContextRequestPayloadV1,
+  type ProofVerifiedPayloadV1,
+  type ReviewCompletedPayloadV1,
+};
+
 export const TASK_LIFECYCLE_PROTOCOL_VERSION = 1;
 export const TASK_LIFECYCLE_EVENTS = [
   "pi-subagents:task-started",
   "pi-subagents:task-settled",
   "pi-subagents:batch-settled",
+  ...Object.values(SUBAGENT_LEARNING_EVENTS_V1),
 ] as const;
 
 export interface TaskStartedEventV1 {
