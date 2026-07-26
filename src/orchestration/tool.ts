@@ -741,16 +741,17 @@ async function executeHerdrAction(
       const now = Date.now();
       const staleAfterMs = input.stale_after_ms ?? 30 * 60 * 1_000;
       const runs = await listDurableRuns(paths.runStore);
-      const aliveOwnerIds = new Set(
-        runs
-          .filter(
-            (run) =>
-              run.taskId &&
-              !isTerminalExecutionPhase(run.executionPhase) &&
-              now - Date.parse(run.heartbeatAt) < staleAfterMs,
-          )
-          .map((run) => run.taskId as string),
-      );
+      // Count BOTH ids a run can own a lease under. A lease is acquired under
+      // the invocation id and only transferred to the task id once the task has
+      // been allocated; a run reaped inside that window is alive but was not in
+      // this set, so its live lease was released out from under it.
+      const aliveOwnerIds = new Set<string>();
+      for (const run of runs) {
+        if (isTerminalExecutionPhase(run.executionPhase)) continue;
+        if (now - Date.parse(run.heartbeatAt) >= staleAfterMs) continue;
+        aliveOwnerIds.add(run.invocationId);
+        if (run.taskId) aliveOwnerIds.add(run.taskId);
+      }
       const reaped = await releaseOrphanedLeases({
         storePath: paths.leaseStore,
         aliveOwnerIds,

@@ -263,9 +263,12 @@ describe("resource claims", () => {
 
     const persisted = JSON.parse(await readFile(storePath, "utf8")) as {
       version: number;
+      nextFence: number;
       leases: unknown[];
     };
-    expect(persisted).toEqual({ version: 1, leases: [] });
+    // `nextFence` never rewinds when a lease is released — a fence must not be
+    // handed out twice, or a superseded writer's token would become valid again.
+    expect(persisted).toEqual({ version: 2, nextFence: 2, leases: [] });
   });
 
   it("releaseOrphanedLeases reaps leases whose owner is not alive", async () => {

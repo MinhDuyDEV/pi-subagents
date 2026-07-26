@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, realpathSync } from "node:fs";
-import { dirname, isAbsolute, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import type { TSchema } from "typebox";
 import { readRegistry } from "../conversation.js";
 import { findPiDir } from "../helpers.js";
@@ -15,8 +15,10 @@ import type {
 import {
   acquireResourceLease,
   assertNoConflictingWrite,
+  DEFAULT_LEASE_TTL_MS,
   listActiveResourceLeases,
   renewResourceLease,
+  setStoreQuarantineReporter,
   transferResourceLeaseOwnership,
   type ResourceLease,
 } from "./claims.js";
@@ -175,7 +177,8 @@ export function createTaskRuntime(
     registerTaskControlTool(pi);
     registerTaskCommands(pi);
     registerWriteClaimGuard(pi);
-    state.heartbeatTimer = startLeaseHeartbeats(state);
+    registerStoreQuarantineReporter(pi, state);
+    state.heartbeatTimer = startLeaseHeartbeats(state, pi);
     pi.on("session_start", async (_event, ctx) => {
       state.currentContext = ctx;
       state.projectDirectories.add(ctx.cwd);
@@ -1418,11 +1421,12 @@ function queueBatchCompletion(
   state.batchTimers.set(batchId, timer);
 }
 
-function startLeaseHeartbeats(state: RuntimeState): NodeJS.Timeout {
+function startLeaseHeartbeats(state: RuntimeState, pi: ExtensionAPI): NodeJS.Timeout {
   const timer = setInterval(() => {
     const now = Date.now();
     void Promise.all(
       [...state.activeRuns.values()].map(async (run) => {
+        if (run.leaseLost) return;
         const interval = run.lease
           ? leaseHeartbeatInterval(run.leaseTtlMs)
           : 60_000;
@@ -1430,14 +1434,43 @@ function startLeaseHeartbeats(state: RuntimeState): NodeJS.Timeout {
         const paths = getOrchestrationPaths(run.projectDirectory);
         let renewed = run.lease;
         if (run.lease) {
+          // Monotonic gap check: if more real time elapsed than the TTL allows,
+          // the lease lapsed while this process was suspended — a closed laptop
+          // is enough at the 30-minute default. Renewing now would silently
+          // re-acquire a resource someone else may already hold, so give up
+          // voluntarily instead of trusting the wall clock.
+          const ttlMs = run.leaseTtlMs ?? DEFAULT_LEASE_TTL_MS;
+          const sinceRenew =
+            run.lastRenewMonotonicMs === undefined
+              ? 0
+              : monotonicNowMs() - run.lastRenewMonotonicMs;
+          if (sinceRenew > ttlMs) {
+            await abandonLostLease(
+              pi,
+              state,
+              run,
+              paths,
+              `lease TTL elapsed while the process was suspended (${Math.round(sinceRenew / 1000)}s > ${Math.round(ttlMs / 1000)}s)`,
+            );
+            return;
+          }
+
           renewed = await renewResourceLease({
             storePath: paths.leaseStore,
             leaseId: run.lease.id,
             owner: run.taskId,
             ttlMs: run.leaseTtlMs,
           }).catch(() => undefined);
-          if (!renewed) return;
+          // A failed renewal is not a transient hiccup to swallow: the lease is
+          // gone, another task may already hold the resource, and this run must
+          // stop writing. It used to `return` silently — leaving the run alive,
+          // its in-memory lease intact, and mutual exclusion lost.
+          if (!renewed) {
+            await abandonLostLease(pi, state, run, paths, "lease renewal failed or the lease expired");
+            return;
+          }
           run.lease = renewed;
+          run.lastRenewMonotonicMs = monotonicNowMs();
         }
         const heartbeatAt = new Date(now).toISOString();
         if (run.invocationId) {
@@ -1454,6 +1487,121 @@ function startLeaseHeartbeats(state: RuntimeState): NodeJS.Timeout {
   }, 250);
   timer.unref();
   return timer;
+}
+
+/** Monotonic milliseconds — immune to wall-clock adjustments. */
+function monotonicNowMs(): number {
+  return Math.round(performance.now());
+}
+
+/**
+ * Surface a quarantined lease store instead of losing it in a log nobody reads.
+ *
+ * Quarantining is silent recovery — the system keeps working with an empty
+ * store — and silent recovery from a corrupt lock file is exactly the situation
+ * where an operator needs to know that mutual exclusion was reset, because any
+ * lease held at that moment is gone and the tasks holding them do not know it.
+ */
+function registerStoreQuarantineReporter(
+  pi: ExtensionAPI,
+  state: RuntimeState,
+): void {
+  setStoreQuarantineReporter(({ storePath, quarantinePath, reason }) => {
+    // Every run's lease was in the file that just moved aside.
+    for (const run of state.activeRuns.values()) {
+      run.leaseLost = true;
+      run.lease = undefined;
+    }
+
+    void appendOrchestrationEvent({
+      eventPath: join(dirname(storePath), "events.jsonl"),
+      event: {
+        type: "claim_store_quarantined",
+        orchestrationId: `quarantine-${basename(quarantinePath)}`,
+        reason: `${reason} (moved to ${quarantinePath})`,
+      },
+    }).catch(() => undefined);
+
+    pi.events.emit("pi-subagents:v1:claim-store-quarantined", {
+      version: 1,
+      storePath,
+      quarantinePath,
+      reason,
+    });
+
+    pi.sendMessage(
+      {
+        customType: "orchestration-claim-store-quarantined",
+        content:
+          `The resource lease store at ${storePath} was unreadable (${reason}) and has been ` +
+          `moved to ${quarantinePath}. Orchestration continues with an empty store, but any ` +
+          `lease held before this point is gone — re-run tasks that were writing to claimed ` +
+          `resources rather than assuming they are still protected.`,
+        display: true,
+      },
+      { triggerTurn: false },
+    );
+  });
+}
+
+/**
+ * A run has lost its lease. Move it to `blocked`, stop the task, and say so.
+ *
+ * `blocked` was previously a dead execution phase. This is what it is for: the
+ * run is not failed (nothing went wrong with the work) and not running (it may
+ * not touch the resource), and a human or the parent has to decide what next.
+ */
+async function abandonLostLease(
+  pi: ExtensionAPI,
+  state: RuntimeState,
+  run: ActiveRun,
+  paths: OrchestrationPaths,
+  reason: string,
+): Promise<void> {
+  if (run.leaseLost) return;
+  run.leaseLost = true;
+  const lostLease = run.lease;
+  run.lease = undefined;
+
+  if (run.invocationId) {
+    await patchDurableRun(paths.runStore, run.invocationId, {
+      executionPhase: "blocked",
+      blockedReason: reason,
+    }).catch(() => undefined);
+  }
+
+  await appendOrchestrationEvent({
+    eventPath: paths.eventLog,
+    event: {
+      type: "claim_lease_lost",
+      orchestrationId: run.orchestrationId,
+      taskId: run.taskId,
+      ...(lostLease ? { leaseId: lostLease.id, fence: lostLease.fence } : {}),
+      reason,
+    },
+  }).catch(() => undefined);
+
+  pi.events.emit("pi-subagents:v1:lease-lost", {
+    version: 1,
+    taskId: run.taskId,
+    orchestrationId: run.orchestrationId,
+    ...(lostLease ? { leaseId: lostLease.id, fence: lostLease.fence } : {}),
+    reason,
+  });
+
+  pi.sendMessage(
+    {
+      customType: "orchestration-lease-lost",
+      content:
+        `Task ${run.taskId} lost its resource lease (${reason}). It is now blocked and ` +
+        `must not write to its claimed resources. Re-run it to re-acquire the lease.`,
+      display: true,
+    },
+    { triggerTurn: false },
+  );
+
+  await stopOwnedTask(run.projectDirectory, run.taskId, `lease lost: ${reason}`).catch(() => undefined);
+  state.activeRuns.delete(run.taskId);
 }
 
 function leaseHeartbeatInterval(ttlMs = 30 * 60 * 1_000): number {

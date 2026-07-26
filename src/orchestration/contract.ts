@@ -1,5 +1,6 @@
 import { Type, type Static } from "typebox";
 import { parseLearningClaims } from "../learning-contract.js";
+import { isResourceClaim } from "./claims.js";
 import type { ResourceClaim } from "./claims.js";
 import type { ContextPackInput } from "./context.js";
 
@@ -177,6 +178,16 @@ export interface OrchestrationRequest {
   };
 }
 
+/**
+ * Parse an untrusted orchestration request.
+ *
+ * `claims` is validated here rather than trusted. This function used to be a
+ * bare cast, so a claim like `{kind:"bogus",mode:"wat"}` was accepted, written
+ * to the lease store, and then made every subsequent read of that store throw —
+ * one malformed request disabled all writes until the file was deleted by hand.
+ * A request carrying an invalid claim is rejected outright: silently dropping
+ * the claim would grant the task a lease weaker than it asked for.
+ */
 export function parseOrchestrationRequest(
   value: unknown,
 ): OrchestrationRequest | undefined {
@@ -184,6 +195,14 @@ export function parseOrchestrationRequest(
     return undefined;
   }
   const publicValue = value as PublicOrchestrationRequest;
+  if (publicValue.claims !== undefined) {
+    if (
+      !Array.isArray(publicValue.claims) ||
+      !publicValue.claims.every(isResourceClaim)
+    ) {
+      return undefined;
+    }
+  }
   return {
     ...(publicValue.id ? { id: publicValue.id } : {}),
     ...(publicValue.batch_id ? { batchId: publicValue.batch_id } : {}),

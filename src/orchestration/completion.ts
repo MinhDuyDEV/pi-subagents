@@ -32,6 +32,14 @@ export interface ActiveRun {
   lease?: ResourceLease;
   leaseTtlMs?: number;
   lastHeartbeatAt?: number;
+  /**
+   * Monotonic timestamp of the last successful lease renewal, used to detect
+   * that the process was suspended long enough for the lease to lapse. The wall
+   * clock cannot tell a 30-minute sleep from a 30-minute pause.
+   */
+  lastRenewMonotonicMs?: number;
+  /** Set when the run lost its lease; the write guard refuses it from then on. */
+  leaseLost?: boolean;
   contextPack?: ContextPack;
   proof?: OrchestrationRequest["proof"];
   verifier?: OrchestrationRequest["verifier"];

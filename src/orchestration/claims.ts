@@ -1,3 +1,18 @@
+/**
+ * Resource leases with fencing tokens.
+ *
+ * A lease alone is not mutual exclusion. Expiry is decided by wall clock, so a
+ * suspended laptop, a long GC pause, or a clock adjustment can let a lease
+ * lapse while its holder still believes it owns the resource — and with the
+ * default 30-minute TTL, closing a lid is enough. The holder only found out when
+ * it tried to write, and only if someone else had already taken the resource.
+ *
+ * Every lease therefore carries a monotonically increasing {@link ResourceLease.fence}
+ * drawn from the store. A writer presents the fence it was issued; a fence lower
+ * than the one currently recorded for the covering lease means the writer's
+ * lease was superseded, and the write is refused even though the owner id still
+ * matches. That is the part expiry alone cannot express.
+ */
 import { randomUUID } from "node:crypto";
 import {
   mkdir,
@@ -8,8 +23,10 @@ import {
 import { dirname, isAbsolute } from "node:path";
 import { withFileLock } from "./file-lock.js";
 
-const STORE_VERSION = 1;
-const DEFAULT_LEASE_TTL_MS = 30 * 60 * 1_000;
+const STORE_VERSION = 2;
+/** Store versions this build can read. Older ones are migrated forward on read. */
+const SUPPORTED_STORE_VERSIONS = [1, 2] as const;
+export const DEFAULT_LEASE_TTL_MS = 30 * 60 * 1_000;
 
 export type ResourceClaimKind = "write" | "test" | "evidence";
 export type ResourceClaimMode = "shared" | "exclusive";
@@ -27,11 +44,35 @@ export interface ResourceLease {
   acquiredAt: string;
   heartbeatAt?: string;
   expiresAt: string;
+  /**
+   * Monotonically increasing token, unique per store. Present it on every write;
+   * a stale fence is refused even when the owner id still matches.
+   */
+  fence: number;
 }
 
 interface ResourceLeaseStore {
   version: number;
+  /** Next fence to hand out. Never decreases, never reused. */
+  nextFence: number;
   leases: ResourceLease[];
+}
+
+/**
+ * Reporter for a store that had to be quarantined. Wired to the Pi event bus by
+ * the runtime; a corrupt store used to throw on every subsequent operation, so
+ * one bad claim bricked all writes until a human deleted the file by hand.
+ */
+export type StoreQuarantineReporter = (info: {
+  storePath: string;
+  quarantinePath: string;
+  reason: string;
+}) => void;
+
+let reportQuarantine: StoreQuarantineReporter = () => undefined;
+
+export function setStoreQuarantineReporter(reporter: StoreQuarantineReporter): void {
+  reportQuarantine = reporter;
 }
 
 export interface AcquireResourceLeaseInput {
@@ -50,6 +91,13 @@ export interface ListResourceLeasesInput {
 export interface ReleaseResourceLeaseInput {
   storePath: string;
   leaseId: string;
+  /**
+   * The owner the caller believes holds the lease. Required in new code:
+   * `release` used to take only a lease id, so any caller could drop any other
+   * task's lease. Omitting it is still accepted for callers that legitimately
+   * reap on behalf of the system (see {@link releaseOrphanedLeases}).
+   */
+  expectedOwner?: string;
   now?: Date;
 }
 
@@ -57,6 +105,8 @@ export interface TransferResourceLeaseOwnershipInput {
   storePath: string;
   leaseId: string;
   owner: string;
+  /** The owner the caller believes currently holds the lease. */
+  expectedOwner?: string;
   now?: Date;
 }
 
@@ -107,6 +157,16 @@ export async function acquireResourceLease(
     throw new Error("Resource lease ttlMs must be greater than zero");
   }
 
+  // Type-guard at the INPUT boundary, not just when reading the store back.
+  // `parseOrchestrationRequest` used to bare-cast, so a claim like
+  // `{kind:"bogus",mode:"wat"}` was written to disk and then made every
+  // subsequent store read throw — one bad request bricked all writes.
+  for (const claim of input.claims) {
+    if (!isResourceClaim(claim)) {
+      throw new Error(`Invalid resource claim: ${JSON.stringify(claim)}`);
+    }
+  }
+
   return withStoreLock(input.storePath, async () => {
     const store = await readStore(input.storePath);
     store.leases = activeLeases(store.leases, now);
@@ -137,25 +197,48 @@ export async function acquireResourceLease(
       acquiredAt: now.toISOString(),
       heartbeatAt: now.toISOString(),
       expiresAt: new Date(now.getTime() + ttlMs).toISOString(),
+      fence: store.nextFence,
     };
+    store.nextFence += 1;
     store.leases.push(lease);
     await writeStore(input.storePath, store);
     return lease;
   });
 }
 
+/**
+ * Active leases. A pure READ — it never rewrites the store.
+ *
+ * It used to prune expired leases and write them back, so every read was a
+ * write: it took the lock, produced disk I/O on a hot path, and a read racing a
+ * write could drop a lease another caller had just acquired. Pruning is now an
+ * explicit operation ({@link pruneExpiredLeases}).
+ */
 export async function listActiveResourceLeases(
   input: ListResourceLeasesInput,
 ): Promise<ResourceLease[]> {
   const now = input.now ?? new Date();
   return withStoreLock(input.storePath, async () => {
     const store = await readStore(input.storePath);
-    const leases = activeLeases(store.leases, now);
-    if (leases.length !== store.leases.length) {
-      store.leases = leases;
-      await writeStore(input.storePath, store);
-    }
-    return leases;
+    return activeLeases(store.leases, now);
+  });
+}
+
+/** Drop expired leases from the store. Returns the ids removed. */
+export async function pruneExpiredLeases(
+  input: ListResourceLeasesInput,
+): Promise<string[]> {
+  const now = input.now ?? new Date();
+  return withStoreLock(input.storePath, async () => {
+    const store = await readStore(input.storePath);
+    const live = activeLeases(store.leases, now);
+    if (live.length === store.leases.length) return [];
+    const dropped = store.leases
+      .filter((lease) => !live.some((candidate) => candidate.id === lease.id))
+      .map((lease) => lease.id);
+    store.leases = live;
+    await writeStore(input.storePath, store);
+    return dropped;
   });
 }
 
@@ -171,11 +254,22 @@ export async function transferResourceLeaseOwnership(
     store.leases = activeLeases(store.leases, now);
     const lease = store.leases.find((candidate) => candidate.id === input.leaseId);
     if (!lease) {
-      await writeStore(input.storePath, store);
       return undefined;
+    }
+    // Transfer used to prove nothing: any caller could reassign any lease to any
+    // owner. `renewResourceLease` already checked ownership, so the asymmetry
+    // was an oversight rather than a design.
+    if (input.expectedOwner !== undefined && lease.owner !== input.expectedOwner) {
+      throw new Error(
+        `Resource lease ${input.leaseId} is owned by ${lease.owner}, not ${input.expectedOwner}`,
+      );
     }
     lease.owner = input.owner;
     lease.heartbeatAt = now.toISOString();
+    // A new owner gets a new fence: writes issued under the previous owner's
+    // fence must stop being accepted the moment ownership moves.
+    lease.fence = store.nextFence;
+    store.nextFence += 1;
     await writeStore(input.storePath, store);
     return lease;
   });
@@ -219,11 +313,23 @@ export async function releaseResourceLease(
   return withStoreLock(input.storePath, async () => {
     const store = await readStore(input.storePath);
     const current = activeLeases(store.leases, now);
-    const remaining = current.filter((lease) => lease.id !== input.leaseId);
-    const released = remaining.length !== current.length;
-    store.leases = remaining;
+    const target = current.find((lease) => lease.id === input.leaseId);
+    if (!target) {
+      // Nothing to release. Still prune while we hold the lock.
+      if (current.length !== store.leases.length) {
+        store.leases = current;
+        await writeStore(input.storePath, store);
+      }
+      return false;
+    }
+    if (input.expectedOwner !== undefined && target.owner !== input.expectedOwner) {
+      throw new Error(
+        `Resource lease ${input.leaseId} is owned by ${target.owner}, not ${input.expectedOwner}`,
+      );
+    }
+    store.leases = current.filter((lease) => lease.id !== input.leaseId);
     await writeStore(input.storePath, store);
-    return released;
+    return true;
   });
 }
 
@@ -233,21 +339,29 @@ export interface ReleaseOrphanedLeasesInput {
   now?: Date;
 }
 
-/** Release active leases whose owner is no longer an alive task (Herdr §16.3 — handle
- * abandoned locks on crash/freeze/compact, don't wait for TTL expiry). Returns the
- * reaped lease ids. */
+/**
+ * Release active leases whose owner is no longer an alive task (Herdr §16.3 —
+ * handle abandoned locks on crash/freeze/compact, don't wait for TTL expiry).
+ * Returns the reaped lease ids.
+ *
+ * Runs inside a SINGLE lock. It used to snapshot the leases, drop the lock, and
+ * then re-acquire it once per release — so a lease acquired between the snapshot
+ * and its release was reaped on the strength of a stale observation.
+ */
 export async function releaseOrphanedLeases(
   input: ReleaseOrphanedLeasesInput,
 ): Promise<string[]> {
   const now = input.now ?? new Date();
-  const active = await listActiveResourceLeases({ storePath: input.storePath, now });
-  const reaped: string[] = [];
-  for (const lease of active) {
-    if (input.aliveOwnerIds.has(lease.owner)) continue;
-    await releaseResourceLease({ storePath: input.storePath, leaseId: lease.id, now });
-    reaped.push(lease.id);
-  }
-  return reaped;
+  return withStoreLock(input.storePath, async () => {
+    const store = await readStore(input.storePath);
+    const active = activeLeases(store.leases, now);
+    const orphaned = active.filter((lease) => !input.aliveOwnerIds.has(lease.owner));
+    if (orphaned.length === 0 && active.length === store.leases.length) return [];
+    const orphanIds = new Set(orphaned.map((lease) => lease.id));
+    store.leases = active.filter((lease) => !orphanIds.has(lease.id));
+    await writeStore(input.storePath, store);
+    return [...orphanIds];
+  });
 }
 
 export function claimCoversPath(resource: string, path: string): boolean {
@@ -285,6 +399,13 @@ export interface AssertNoConflictingWriteInput {
   storePath: string;
   ownerTaskId: string;
   path: string;
+  /**
+   * The fence the caller was issued when it acquired its lease. When supplied,
+   * a write is refused if the covering lease has moved past it — the caller's
+   * lease lapsed and was re-acquired (possibly by itself) while it was not
+   * looking, so its in-memory belief about the resource is stale.
+   */
+  fence?: number;
   now?: Date;
 }
 
@@ -296,7 +417,16 @@ export async function assertNoConflictingWrite(
     path: input.path,
     now: input.now,
   });
-  if (!lease || lease.owner === input.ownerTaskId) {
+  if (!lease) {
+    return;
+  }
+  if (lease.owner === input.ownerTaskId) {
+    if (input.fence !== undefined && lease.fence > input.fence) {
+      throw new Error(
+        `Write blocked: ${input.path} is covered by a newer lease generation ` +
+          `(fence ${lease.fence} > ${input.fence}); this task's lease was superseded`,
+      );
+    }
     return;
   }
   const claim = lease.claims.find(
@@ -403,19 +533,92 @@ function activeLeases(leases: readonly ResourceLease[], now: Date): ResourceLeas
   return leases.filter((lease) => Date.parse(lease.expiresAt) > timestamp);
 }
 
+function emptyStore(): ResourceLeaseStore {
+  return { version: STORE_VERSION, nextFence: 1, leases: [] };
+}
+
+/**
+ * Read the lease store, migrating older versions forward and quarantining a
+ * store that cannot be understood.
+ *
+ * Throwing on a bad store was a denial of service on the whole write path: one
+ * malformed claim made `readStore` throw, and every operation that touches
+ * leases — acquire, renew, release, the write guard — threw with it, forever,
+ * until someone deleted `leases.json` by hand. Quarantining moves the bad file
+ * aside, reports it, and lets the system continue with an empty store.
+ */
 async function readStore(storePath: string): Promise<ResourceLeaseStore> {
+  let raw: string;
   try {
-    const value: unknown = JSON.parse(await readFile(storePath, "utf8"));
-    if (!isResourceLeaseStore(value)) {
-      throw new Error(`Invalid resource lease store: ${storePath}`);
-    }
-    return value;
+    raw = await readFile(storePath, "utf8");
   } catch (error) {
-    if (isNodeError(error) && error.code === "ENOENT") {
-      return { version: STORE_VERSION, leases: [] };
-    }
+    if (isNodeError(error) && error.code === "ENOENT") return emptyStore();
     throw error;
   }
+
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch (error) {
+    return quarantineStore(storePath, `unparseable JSON: ${(error as Error).message}`);
+  }
+
+  const migrated = migrateStore(value);
+  if (!migrated) {
+    return quarantineStore(storePath, "store failed schema validation");
+  }
+  return migrated;
+}
+
+/**
+ * Bring a persisted store up to {@link STORE_VERSION}, or return undefined if it
+ * is not a store this build understands.
+ *
+ * A version NEWER than this build is not an error to repair by force — it means
+ * the user rolled back — so it is quarantined by the caller rather than
+ * reinterpreted.
+ */
+function migrateStore(value: unknown): ResourceLeaseStore | undefined {
+  if (!isRecord(value) || typeof value.version !== "number" || !Array.isArray(value.leases)) {
+    return undefined;
+  }
+  if (!(SUPPORTED_STORE_VERSIONS as readonly number[]).includes(value.version)) {
+    return undefined;
+  }
+  if (!value.leases.every(isPersistedLease)) return undefined;
+
+  // v1 had no fences. Assign them in persisted order so existing leases keep a
+  // stable relative generation, and start `nextFence` above all of them.
+  let nextFence =
+    typeof value.nextFence === "number" && Number.isSafeInteger(value.nextFence) && value.nextFence >= 1
+      ? value.nextFence
+      : 1;
+  const leases: ResourceLease[] = value.leases.map((lease) => {
+    if (typeof lease.fence === "number" && Number.isSafeInteger(lease.fence)) {
+      nextFence = Math.max(nextFence, lease.fence + 1);
+      return lease as ResourceLease;
+    }
+    const assigned = nextFence;
+    nextFence += 1;
+    return { ...(lease as ResourceLease), fence: assigned };
+  });
+  return { version: STORE_VERSION, nextFence, leases };
+}
+
+async function quarantineStore(storePath: string, reason: string): Promise<ResourceLeaseStore> {
+  const quarantinePath = `${storePath}.corrupt-${Date.now()}-${randomUUID().slice(0, 8)}`;
+  try {
+    await rename(storePath, quarantinePath);
+  } catch {
+    // If we cannot move it aside we still continue with an empty store rather
+    // than bricking every write; the next write overwrites the bad file.
+  }
+  try {
+    reportQuarantine({ storePath, quarantinePath, reason });
+  } catch {
+    // A reporter must never be able to break the store.
+  }
+  return emptyStore();
 }
 
 async function writeStore(
@@ -435,14 +638,12 @@ async function withStoreLock<T>(
   return withFileLock({ lockPath: `${storePath}.lock`, operation });
 }
 
-function isResourceLeaseStore(value: unknown): value is ResourceLeaseStore {
-  if (!isRecord(value) || value.version !== STORE_VERSION || !Array.isArray(value.leases)) {
-    return false;
-  }
-  return value.leases.every(isResourceLease);
+/** A lease as persisted — `fence` may be absent in a v1 store. */
+function isPersistedLease(value: unknown): value is Omit<ResourceLease, "fence"> & { fence?: number } {
+  return isResourceLease(value);
 }
 
-function isResourceLease(value: unknown): value is ResourceLease {
+export function isResourceLease(value: unknown): value is ResourceLease {
   return (
     isRecord(value) &&
     typeof value.id === "string" &&
@@ -454,7 +655,7 @@ function isResourceLease(value: unknown): value is ResourceLease {
   );
 }
 
-function isResourceClaim(value: unknown): value is ResourceClaim {
+export function isResourceClaim(value: unknown): value is ResourceClaim {
   return (
     isRecord(value) &&
     (value.kind === "write" || value.kind === "test" || value.kind === "evidence") &&

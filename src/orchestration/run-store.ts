@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
+import { isResourceClaim } from "./claims.js";
 import type { ResourceClaim, ResourceLease } from "./claims.js";
 import type { TaggedSha256V1, UsageReceiptV1 } from "../learning-contract.js";
 import type { ContextPack } from "./context.js";
@@ -58,6 +59,8 @@ export interface DurableTaskRun {
   updatedAt: string;
   heartbeatAt: string;
   executionPhase: TaskExecutionPhase;
+  /** Why the run is `blocked` — e.g. it lost its resource lease. */
+  blockedReason?: string;
   verificationPhase: TaskVerificationPhase;
   reviewPhase: TaskReviewPhase;
   verificationIssues: string[];
@@ -306,7 +309,11 @@ function isDurableTaskRun(value: unknown): value is DurableTaskRun {
     isReviewPhase(value.reviewPhase) &&
     Array.isArray(value.verificationIssues) &&
     value.verificationIssues.every((issue) => typeof issue === "string") &&
-    Array.isArray(value.claims)
+    // Validate the ELEMENTS, not just the array. A run whose claims were never
+    // checked is re-acquired verbatim on recovery, so a malformed claim that
+    // never passed through the tool boundary still reached the lease store.
+    Array.isArray(value.claims) &&
+    value.claims.every(isResourceClaim)
   );
 }
 

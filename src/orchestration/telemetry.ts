@@ -17,6 +17,8 @@ export type OrchestrationEventType =
   | "task_awaiting_review"
   | "claim_acquired"
   | "claim_released"
+  | "claim_lease_lost"
+  | "claim_store_quarantined"
   | "handoff_updated"
   | "proof_passed"
   | "proof_failed"
@@ -45,6 +47,8 @@ export interface NewOrchestrationEvent {
   taskId?: string;
   agentType?: string;
   leaseId?: string;
+  /** Lease generation token; a stale fence is refused by the write guard. */
+  fence?: number;
   durationMs?: number;
   retryCount?: number;
   verificationPassed?: boolean;
