@@ -1,5 +1,24 @@
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+/**
+ * The task registry and session history — the records `restoreActiveBackgroundTasks`
+ * reads to find panes, processes, and worktrees left behind by a previous run.
+ *
+ * Both files are also written by `orchestration/task-state.ts`. Neither module
+ * used to lock, and this one wrote in place with a bare `writeFileSync`, so a
+ * write interrupted at the wrong moment truncated the file and a concurrent
+ * read-modify-write silently dropped whichever update lost the race. A parse
+ * failure then returned an empty array, which is indistinguishable from "no
+ * tasks" — so restore found nothing to restore and every pane, agent process,
+ * and worktree from the previous session was orphaned with nothing reaped and
+ * nothing reported.
+ *
+ * Writes are now atomic (temp + rename) and every read-modify-write runs under
+ * the same lock `task-state.ts` takes. A file that cannot be parsed is
+ * quarantined and reported rather than silently read as empty.
+ */
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
+import { withFileLockSync } from "./orchestration/file-lock-sync.js";
 import { isTerminalHandle, type TerminalHandle } from "./subagent/terminalBackend.js";
 import type { RegistryEntry, TaskSessionHistoryEntry } from "./types.js";
 
@@ -13,23 +32,92 @@ export interface TaskSessionRegistryEntry {
   updated_at: string;
 }
 
+/**
+ * Reporter for a registry file that had to be quarantined. Wired to the Pi
+ * event bus by the extension; losing the registry means orphaned panes and
+ * processes, which an operator has to know about to clean up.
+ */
+export type RegistryQuarantineReporter = (info: {
+  file: string;
+  quarantinePath: string;
+  reason: string;
+}) => void;
+
+let reportQuarantine: RegistryQuarantineReporter = () => undefined;
+
+export function setRegistryQuarantineReporter(
+  reporter: RegistryQuarantineReporter,
+): void {
+  reportQuarantine = reporter;
+}
+
+/** The lock guarding a registry file. Must match `task-state.ts`. */
+export function registryLockPath(file: string): string {
+  return `${file}.lock`;
+}
+
 function ensureDir(path: string): void {
   mkdirSync(path, { recursive: true });
 }
 
 function readJsonFile<T>(file: string, fallback: T): T {
+  if (!existsSync(file)) return fallback;
+  let raw: string;
   try {
-    if (!existsSync(file)) return fallback;
-    const parsed = JSON.parse(readFileSync(file, "utf-8")) as unknown;
-    return parsed as T;
+    raw = readFileSync(file, "utf-8");
   } catch {
     return fallback;
+  }
+  try {
+    return JSON.parse(raw) as T;
+  } catch (error) {
+    quarantineRegistryFile(file, `unparseable JSON: ${(error as Error).message}`);
+    return fallback;
+  }
+}
+
+/**
+ * Move a corrupt registry aside and say so. Returning the fallback keeps the
+ * extension alive, but silence here is what turned a truncated file into
+ * orphaned processes nobody knew to clean up.
+ */
+function quarantineRegistryFile(file: string, reason: string): void {
+  const quarantinePath = `${file}.corrupt-${Date.now()}-${randomUUID().slice(0, 8)}`;
+  try {
+    renameSync(file, quarantinePath);
+  } catch {
+    // If it cannot be moved we still report; the next write replaces it.
+  }
+  try {
+    reportQuarantine({ file, quarantinePath, reason });
+  } catch {
+    // A reporter must never be able to break the registry.
   }
 }
 
 function writeJsonFile(file: string, value: unknown): void {
   ensureDir(dirname(file));
-  writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`, "utf-8");
+  // Temp + rename: a reader either sees the whole previous file or the whole
+  // new one. A bare `writeFileSync` truncates first, so a reader arriving mid
+  // write — or a crash — saw a partial file that parsed as nothing.
+  const temporaryPath = `${file}.${process.pid}.${randomUUID()}.tmp`;
+  writeFileSync(temporaryPath, `${JSON.stringify(value, null, 2)}\n`, "utf-8");
+  renameSync(temporaryPath, file);
+}
+
+/** Read, mutate, and write a registry file as one atomic, locked operation. */
+function updateJsonFile<T>(
+  file: string,
+  fallback: T,
+  mutate: (current: T) => T,
+): void {
+  ensureDir(dirname(file));
+  withFileLockSync({
+    lockPath: registryLockPath(file),
+    operation: () => {
+      writeJsonFile(file, mutate(readJsonFile<T>(file, fallback)));
+    },
+  });
 }
 
 export function normalizeConversationId(value: unknown): string | undefined {
@@ -73,7 +161,12 @@ export function writeTaskSessionsRegistry(
   piDir: string,
   registry: Record<string, TaskSessionRegistryEntry>,
 ): void {
-  writeJsonFile(getTaskSessionsRegistryPath(piDir), registry);
+  const file = getTaskSessionsRegistryPath(piDir);
+  ensureDir(dirname(file));
+  withFileLockSync({
+    lockPath: registryLockPath(file),
+    operation: () => writeJsonFile(file, registry),
+  });
 }
 
 function getRegistryPath(piDir: string): string {
@@ -109,7 +202,13 @@ export function readRegistry(piDir: string): RegistryEntry[] {
 }
 
 export function writeRegistry(piDir: string, entries: RegistryEntry[]): void {
-  writeJsonFile(getRegistryPath(piDir), entries.map((entry) => migrateRegistryEntry(entry)));
+  const file = getRegistryPath(piDir);
+  ensureDir(dirname(file));
+  withFileLockSync({
+    lockPath: registryLockPath(file),
+    operation: () =>
+      writeJsonFile(file, entries.map((entry) => migrateRegistryEntry(entry))),
+  });
 }
 
 function getTaskSessionHistoryPath(piDir: string): string {
@@ -121,25 +220,29 @@ export function readTaskSessionHistory(piDir: string): TaskSessionHistoryEntry[]
   return Array.isArray(parsed) ? (parsed as TaskSessionHistoryEntry[]) : [];
 }
 
-function writeTaskSessionHistory(
-  piDir: string,
-  entries: TaskSessionHistoryEntry[],
-): void {
-  writeJsonFile(getTaskSessionHistoryPath(piDir), entries);
-}
-
+/**
+ * Merge one entry into the history.
+ *
+ * The read and the write are one locked operation. Interleaved as separate
+ * steps, two concurrent upserts each read the same array and the second write
+ * erased the first entry — the update was lost with no error anywhere.
+ */
 export function upsertTaskSessionHistory(
   piDir: string,
   entry: TaskSessionHistoryEntry,
 ): void {
-  const entries = readTaskSessionHistory(piDir);
-  const idx = entries.findIndex((existing) => existing.id === entry.id);
-  if (idx >= 0) {
-    entries[idx] = { ...entries[idx], ...entry };
-  } else {
-    entries.push(entry);
-  }
-  writeTaskSessionHistory(piDir, entries);
+  updateJsonFile<unknown>(getTaskSessionHistoryPath(piDir), [], (current) => {
+    const entries = Array.isArray(current)
+      ? (current as TaskSessionHistoryEntry[])
+      : [];
+    const idx = entries.findIndex((existing) => existing.id === entry.id);
+    if (idx >= 0) {
+      entries[idx] = { ...entries[idx], ...entry };
+    } else {
+      entries.push(entry);
+    }
+    return entries;
+  });
 }
 
 export function findTaskSessionHistory(

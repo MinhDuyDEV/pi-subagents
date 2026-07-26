@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync, realpathSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import type { TSchema } from "typebox";
-import { readRegistry } from "../conversation.js";
+import { readRegistry, setRegistryQuarantineReporter } from "../conversation.js";
 import { findPiDir } from "../helpers.js";
 import { getAgentTerminalStopReason } from "../session-text.js";
 import type { WorktreeHandle } from "../worktree.js";
@@ -1506,6 +1506,30 @@ function registerStoreQuarantineReporter(
   pi: ExtensionAPI,
   state: RuntimeState,
 ): void {
+  // Losing the task registry means the panes, processes, and worktrees recorded
+  // in it will never be reaped — restore reads this file to find them. That has
+  // to reach a human; it used to be indistinguishable from "no tasks".
+  setRegistryQuarantineReporter(({ file, quarantinePath, reason }) => {
+    pi.events.emit("pi-subagents:v1:registry-quarantined", {
+      version: 1,
+      file,
+      quarantinePath,
+      reason,
+    });
+    pi.sendMessage(
+      {
+        customType: "orchestration-registry-quarantined",
+        content:
+          `The task registry at ${file} was unreadable (${reason}) and has been moved to ` +
+          `${quarantinePath}. Background tasks recorded there cannot be restored, so any ` +
+          `panes, agent processes, or worktrees they owned are now orphaned and need to be ` +
+          `closed by hand.`,
+        display: true,
+      },
+      { triggerTurn: false },
+    );
+  });
+
   setStoreQuarantineReporter(({ storePath, quarantinePath, reason }) => {
     // Every run's lease was in the file that just moved aside.
     for (const run of state.activeRuns.values()) {

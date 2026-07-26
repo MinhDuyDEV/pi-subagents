@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { registryLockPath } from "../conversation.js";
+import { withFileLock } from "./file-lock.js";
 import { resolveTaskSessionReference } from "./lifecycle.js";
 
 export async function seedResumeRegistry(
@@ -25,7 +27,6 @@ export async function seedResumeRegistry(
     return;
   }
 
-  const registry = await readJsonArray(registryPath);
   const entry = {
     ...historyEntry,
     id: taskId,
@@ -35,9 +36,20 @@ export async function seedResumeRegistry(
     phase: stringValue(historyEntry?.phase) ?? "completed",
     status: stringValue(historyEntry?.status) ?? "completed",
   };
-  const repairedHistory = withoutTask(history, taskId);
-  await writeJsonAtomic(historyPath, [...repairedHistory, entry]);
-  await writeJsonAtomic(registryPath, [...withoutTask(registry, taskId), entry]);
+
+  // Each file is re-read inside its own lock rather than reusing the read from
+  // above: `resolveTaskSessionReference` touches the filesystem, so anything
+  // read before it is already a stale observation by the time we write. The
+  // locks are taken one at a time, never nested, so two callers cannot deadlock
+  // by taking them in opposite orders.
+  await withRegistryLock(historyPath, async () => {
+    const current = await readJsonArray(historyPath);
+    await writeJsonAtomic(historyPath, [...withoutTask(current, taskId), entry]);
+  });
+  await withRegistryLock(registryPath, async () => {
+    const current = await readJsonArray(registryPath);
+    await writeJsonAtomic(registryPath, [...withoutTask(current, taskId), entry]);
+  });
 }
 
 export async function persistTaskHistoryReference(
@@ -51,21 +63,34 @@ export async function persistTaskHistoryReference(
     ".pi",
     "task-session-history.json",
   );
-  const history = await readJsonArray(historyPath);
-  const current = history.find(
-    (entry) => stringValue(entry.id) === taskId || stringValue(entry.taskId) === taskId,
-  );
-  await writeJsonAtomic(historyPath, [
-    ...withoutTask(history, taskId),
-    {
-      ...current,
-      id: taskId,
-      taskId,
-      sessionName: stringValue(current?.sessionName) ?? sessionName,
-      sessionRef: sessionReference,
-      status: stringValue(current?.status) ?? "completed",
-    },
-  ]);
+  await withRegistryLock(historyPath, async () => {
+    const history = await readJsonArray(historyPath);
+    const current = history.find(
+      (entry) => stringValue(entry.id) === taskId || stringValue(entry.taskId) === taskId,
+    );
+    await writeJsonAtomic(historyPath, [
+      ...withoutTask(history, taskId),
+      {
+        ...current,
+        id: taskId,
+        taskId,
+        sessionName: stringValue(current?.sessionName) ?? sessionName,
+        sessionRef: sessionReference,
+        status: stringValue(current?.status) ?? "completed",
+      },
+    ]);
+  });
+}
+
+/**
+ * Guard a registry file with the lock `conversation.ts` uses for the same path.
+ *
+ * These two files have two writers — this module and `conversation.ts` — and
+ * before this they shared no lock at all, so an async atomic rename here could
+ * land on top of a synchronous read-modify-write there and drop it.
+ */
+function withRegistryLock<T>(file: string, operation: () => Promise<T>): Promise<T> {
+  return withFileLock({ lockPath: registryLockPath(file), operation });
 }
 
 function withoutTask(
