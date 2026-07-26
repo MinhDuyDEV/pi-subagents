@@ -19,13 +19,11 @@
 import { redactSensitiveText } from "./orchestration/context.js";
 import type { ContextFact } from "./orchestration/context.js";
 import {
-  parseLearningClaims,
   parseSupportedLearningClaims,
   parseUsageReceipts,
   taggedDigest,
-  type LearningClaimV1,
   type SupportedLearningClaimV1,
-    type TaggedSha256V1,
+  type TaggedSha256V1,
   type UsageReceiptV1,
 } from "./learning-contract.js";
 
@@ -55,6 +53,19 @@ export interface LearningFactV1 {
   /** Optional hex-encoded SHA-256 digest of the evidence backing this fact. */
   evidenceDigest?: string;
 }
+
+// The context-request payload and its constructor come from pi-core: the
+// producer's digest preimage and the consumers' expectations are the same
+// function there, and `confidence` is emitted at the source with a default —
+// two packages no longer need a third to bridge them (audit §2.2, §2.3).
+export {
+  contextRequestPreimage,
+  makeContextRequestPayload,
+  parseContextRequest,
+  withContextRequestBinding,
+  type ContextRequestPayloadV1,
+  type LearningConfidenceV1,
+} from "@minhduydev/pi-core";
 
 export interface LearningPatternV1 {
   /** Category label (e.g. "error-pattern", "workflow"). */
@@ -109,37 +120,6 @@ export const SUBAGENT_LEARNING_EVENTS_V1 = {
 // ───────────────────────────────────────────────────────────────────────────
 //  Event payload types
 // ───────────────────────────────────────────────────────────────────────────
-
-/**
- * Payload for `pi-subagents:context-request`.
- *
- * Listeners inspect the task metadata and, if they wish, set `.response`
- * to a validated `LearningContextV1`. The emitter reads `.response` after
- * event propagation completes.
- */
-export interface ContextRequestPayloadV1 {
-  protocolVersion: 1;
-  /** The task ID that is about to be launched. */
-  taskId: string;
-  /** Stable orchestration correlation; taskId remains the task identity. */
-  correlationId: string;
-  /** Agent type name (e.g. "general", "reviewer"). */
-  agentType: string;
-  /** Short description of the task goal. */
-  description: string;
-  /** Canonical digest of the bounded request and explicit claims. */
-  requestDigest: TaggedSha256V1;
-  projectId?: string;
-  trustEpoch?: string;
-  sessionGeneration?: string;
-  /** Explicit reusable claims; task description is never treated as a claim. */
-  learningClaims: readonly LearningClaimV1[];
-  /**
-   * Mutable container: a listener sets this to provide learning context.
-   * The emitter validates and clamps the value after propagation.
-   */
-  response?: LearningContextV1 | Promise<LearningContextV1 | undefined>;
-}
 
 /**
  * Payload for `pi-subagents:proof-verified`.
@@ -253,28 +233,6 @@ export function validateEvidenceDigests(
 // ───────────────────────────────────────────────────────────────────────────
 //  Bounded constructors (single validation path for emission boundaries)
 // ───────────────────────────────────────────────────────────────────────────
-
-/**
- * Construct a bounded `ContextRequestPayloadV1`.
- * All string fields are clamped/redacted at emission time.
- */
-export function makeContextRequestPayload(
-  taskId: string,
-  agentType: string,
-  description: string,
-  correlationId = taskId,
-  learningClaims: readonly unknown[] = [],
-): ContextRequestPayloadV1 {
-  const request = {
-    protocolVersion: 1 as const,
-    taskId: clampString(taskId, MAX_TASK_ID),
-    correlationId: clampString(correlationId, MAX_ID),
-    agentType: clampString(safeRedact(agentType), MAX_AGENT_TYPE),
-    description: clampString(safeRedact(description), MAX_DESCRIPTION),
-    learningClaims: parseLearningClaims(learningClaims),
-  };
-  return { ...request, requestDigest: taggedDigest(request) };
-}
 
 /**
  * Construct a bounded `ProofVerifiedPayloadV1`.

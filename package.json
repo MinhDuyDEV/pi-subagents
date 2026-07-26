@@ -64,7 +64,8 @@
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": ">=0.81.1",
     "@earendil-works/pi-tui": ">=0.81.1",
-    "typebox": "*"
+    "typebox": "*",
+    "@minhduydev/pi-core": "^0.1.0"
   },
   "dependencies": {
     "croner": "^9.1.0"
@@ -72,6 +73,7 @@
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.81.1",
     "@earendil-works/pi-tui": "^0.81.1",
+    "@minhduydev/pi-core": "file:../pi-core",
     "@types/node": "^20.0.0",
     "tsx": "^4.20.6",
     "typebox": "1.1.38",

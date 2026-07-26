@@ -1,5 +1,11 @@
+import { assertPiCoreProtocolVersion } from "@minhduydev/pi-core";
 import piTaskExtension from "./index.js";
 import { createTaskRuntime } from "./orchestration/runtime.js";
+
+// A second pi-core copy with different canonicalization rules would recreate
+// the digest divergence the shared package exists to end — refuse to load
+// against a core speaking a different protocol.
+assertPiCoreProtocolVersion(1);
 
 // pi-subagents is a runtime-only fork of the upstream task extension.
 // The "upstream" is in-repo (./index.js). We wrap it with orchestration
