@@ -63,6 +63,12 @@ import {
   startBackgroundPolling,
   startToolStatsPolling,
 } from "./lifecycle/index.js";
+import { listActiveResourceLeases } from "./orchestration/claims.js";
+import { getOrchestrationPaths } from "./orchestration/paths.js";
+import {
+  CHILD_CLAIM_GUARD_ENV,
+  type ChildClaimGuardConfig,
+} from "./orchestration/runtime.js";
 import { formatSdkBackgroundReceipt, startSdkBackgroundTask } from "./subagent/sdkBackground.js";
 import { runSdkSubagent } from "./subagent/runSdk.js";
 import {
@@ -583,6 +589,46 @@ export default function (pi: ExtensionAPI) {
       }
       const executionCwd = worktree?.path ?? ctx.cwd;
 
+      // Everything the child needs to enforce write claims on itself: where
+      // the parent's lease store is, and which identities it may write under.
+      // Without this, the child — the process doing the delegated writing —
+      // was the one process whose writes were never checked (audit S-A).
+      const claimGuardConfig: ChildClaimGuardConfig = {
+        version: 1,
+        projectDirectory: ctx.cwd,
+        leaseStore: getOrchestrationPaths(ctx.cwd).leaseStore,
+        ownerIds: [
+          id,
+          ...(params.__pi_subagents_invocation_id
+            ? [params.__pi_subagents_invocation_id]
+            : []),
+        ],
+      };
+      const claimGuardEnvValue = JSON.stringify(claimGuardConfig);
+
+      /**
+       * Does this launch hold write claims in the shared project directory?
+       * Owner is still the invocation id at this point — ownership transfers
+       * to the task id only after the tool result returns.
+       */
+      const holdsSharedWriteClaims = async (): Promise<boolean> => {
+        if (worktree) return false;
+        try {
+          const leases = await listActiveResourceLeases({
+            storePath: claimGuardConfig.leaseStore,
+          });
+          return leases.some(
+            (lease) =>
+              claimGuardConfig.ownerIds.includes(lease.owner) &&
+              lease.claims.some((claim) => claim.kind === "write"),
+          );
+        } catch {
+          // The store being unreadable is reported elsewhere; for backend
+          // selection, assume claims exist and take the enforceable path.
+          return true;
+        }
+      };
+
           // ── Build the prompt (instructions are inlined; no CONTEXT.md file) ─
           const promptContent = buildTaskPrompt({
             description: descText,
@@ -658,8 +704,18 @@ export default function (pi: ExtensionAPI) {
           const runSdkFallback = async (
             foregroundTask?: BackgroundTask,
             onSession?: (session: AgentSession) => () => void,
-          ) =>
-            runSdkSubagent({
+          ) => {
+            // The SDK subagent runs in-process with `noExtensions: true`, so no
+            // guard can see its writes. A launch holding write claims in the
+            // shared project directory is refused here rather than run
+            // unenforced — worktree isolation or a terminal backend both work.
+            if (await holdsSharedWriteClaims()) {
+              throw new Error(
+                "This task holds write claims but the SDK backend cannot enforce them. " +
+                  'Run inside tmux/Herdr, or pass isolation: "worktree" to isolate the writes.',
+              );
+            }
+            return runSdkSubagent({
               onSession: foregroundTask
                 ? (session) => subscribeToolEvents(session, foregroundTask, 10, taskWidget.requestRender)
                 : onSession,
@@ -673,6 +729,7 @@ export default function (pi: ExtensionAPI) {
               excludeTools: toolSelection.excludeTools,
               systemPrompt: agent.body,
             });
+          };
 
       const foregroundTask: BackgroundTask | undefined = isBackground
         ? undefined
@@ -891,7 +948,10 @@ export default function (pi: ExtensionAPI) {
             agentArgs: piArgs,
             initialPrompt: promptContent,
             cwd: executionCwd,
-            env: { PI_TASK_TOOL_DISABLED: "1" },
+            env: {
+              PI_TASK_TOOL_DISABLED: "1",
+              [CHILD_CLAIM_GUARD_ENV]: claimGuardEnvValue,
+            },
             label: `${agent.name}-${id.slice(0, 8)}`,
             workspaceGroup: params.workspace_group,
             signal,
@@ -899,7 +959,7 @@ export default function (pi: ExtensionAPI) {
           paneId = handle.resourceId;
           originalPane = process.env.HERDR_PANE_ID ?? null;
         } else {
-          const shellCommand = `PI_TASK_TOOL_DISABLED=1 pi ${piArgs.map((a) => shellQuote(a)).join(" ")}`;
+          const shellCommand = `PI_TASK_TOOL_DISABLED=1 ${CHILD_CLAIM_GUARD_ENV}=${shellQuote(claimGuardEnvValue)} pi ${piArgs.map((a) => shellQuote(a)).join(" ")}`;
           const sessionFile = join(sessionDir, sessionName + ".jsonl");
           const childCommand = `cd ${shellQuote(executionCwd)} && ${shellCommand}`;
           const terminalCommand = wrapWithPaneExitWatcher(sessionFile, childCommand);

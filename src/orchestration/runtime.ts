@@ -16,6 +16,7 @@ import {
   acquireResourceLease,
   assertNoConflictingWrite,
   DEFAULT_LEASE_TTL_MS,
+  findClaimCoveringPath,
   listActiveResourceLeases,
   renewResourceLease,
   setStoreQuarantineReporter,
@@ -121,8 +122,12 @@ export function createTaskRuntime(
 ): UpstreamTaskExtension {
   return (pi) => {
     // Child Pi processes load the package to resolve normal tools and profiles,
-    // but must never receive the parent control plane.
+    // but must never receive the parent control plane. They DO receive the
+    // write-claim guard: this early return used to skip it entirely, so the
+    // one process actually doing the delegated writing was the one process
+    // whose writes were never checked against the lease store.
     if (process.env.PI_TASK_TOOL_DISABLED === "1") {
+      registerChildWriteClaimGuard(pi);
       upstreamTaskExtension(pi);
       return;
     }
@@ -1076,6 +1081,8 @@ async function invokeTaskThroughRpc(
   const taskTool = state.taskTool;
   const ctx = state.currentContext;
   if (!taskTool || !ctx) throw new Error("No active Pi session for task RPC spawn");
+  // Options are sanitized at the RPC boundary; spreading them FIRST is still
+  // deliberate, so the named fields always win over anything a caller passes.
   const parameters = {
     ...(request.options ?? {}),
     agent_type: request.agentType,
@@ -1129,6 +1136,105 @@ async function ensureScheduler(
     }
   });
   return scheduler;
+}
+
+/** Configuration a parent passes to a child so it can enforce claims on itself. */
+export interface ChildClaimGuardConfig {
+  version: 1;
+  /** The PARENT project directory — where the lease store lives. */
+  projectDirectory: string;
+  leaseStore: string;
+  /** Identities this child may write under: its task id and its invocation id. */
+  ownerIds: string[];
+}
+
+export const CHILD_CLAIM_GUARD_ENV = "PI_SUBAGENTS_CLAIM_GUARD";
+
+export function parseChildClaimGuardConfig(
+  raw: string | undefined,
+): ChildClaimGuardConfig | undefined {
+  if (!raw) return undefined;
+  try {
+    const value: unknown = JSON.parse(raw);
+    if (
+      value !== null &&
+      typeof value === "object" &&
+      (value as Record<string, unknown>).version === 1 &&
+      typeof (value as Record<string, unknown>).projectDirectory === "string" &&
+      typeof (value as Record<string, unknown>).leaseStore === "string" &&
+      Array.isArray((value as Record<string, unknown>).ownerIds) &&
+      ((value as Record<string, unknown>).ownerIds as unknown[]).every(
+        (id) => typeof id === "string",
+      )
+    ) {
+      return value as unknown as ChildClaimGuardConfig;
+    }
+  } catch {
+    // Fall through to undefined; the caller decides how loud to be.
+  }
+  return undefined;
+}
+
+/**
+ * The write-claim guard for a CHILD Pi process.
+ *
+ * The parent registers a guard for its own session, but the child launched with
+ * `PI_TASK_TOOL_DISABLED=1` returned before that registration — so the process
+ * doing the delegated writing was exactly the one whose writes were never
+ * checked. A violation was only discovered post-hoc, if at all.
+ *
+ * The child checks its writes against the parent's lease store and allows a
+ * path only when the covering lease belongs to one of its own identities (task
+ * id or invocation id — ownership is transferred between them after launch).
+ * Fences are deliberately not checked here: the parent renews and transfers the
+ * lease on the child's behalf, so the child cannot know its current fence, and
+ * an ownership check against the live store is the property this guard exists
+ * to enforce.
+ */
+function registerChildWriteClaimGuard(pi: ExtensionAPI): void {
+  const config = parseChildClaimGuardConfig(process.env[CHILD_CLAIM_GUARD_ENV]);
+  if (!config) return;
+
+  pi.on("tool_call", async (event) => {
+    if (process.env.PI_SUBAGENTS_NO_CLAIMS === "1") return;
+    const pathsToCheck = extractWritePaths(event.toolName, event.input);
+    if (pathsToCheck.length === 0) return;
+
+    try {
+      for (const rawPath of pathsToCheck) {
+        const absolutePath = isAbsolute(rawPath)
+          ? resolve(rawPath)
+          : resolve(process.cwd(), rawPath.replace(/^@/u, ""));
+        const projectRelativePath = relative(config.projectDirectory, absolutePath);
+        if (
+          projectRelativePath === ".." ||
+          projectRelativePath.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`) ||
+          isAbsolute(projectRelativePath)
+        ) {
+          // Outside the parent project — a worktree, a temp dir. Not lease
+          // territory; the worktree merge gate owns those writes.
+          continue;
+        }
+        const covering = await findClaimCoveringPath({
+          storePath: config.leaseStore,
+          path: projectRelativePath.replaceAll("\\", "/"),
+        });
+        if (covering && !config.ownerIds.includes(covering.owner)) {
+          return {
+            block: true,
+            reason:
+              `Write blocked: ${rawPath} is claimed by task ${covering.owner} ` +
+              `(this subagent is ${config.ownerIds.join("/")})`,
+          };
+        }
+      }
+    } catch (error) {
+      return {
+        block: true,
+        reason: `Write blocked because the lease store could not be verified: ${errorMessage(error)}`,
+      };
+    }
+  });
 }
 
 function registerWriteClaimGuard(pi: ExtensionAPI): void {
