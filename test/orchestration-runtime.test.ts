@@ -35,7 +35,10 @@ afterEach(async () => {
   delete process.env.PI_TASK_TOOL_DISABLED;
   await Promise.all(
     temporaryDirectories.splice(0).map((directory) =>
-      rm(directory, { recursive: true, force: true }),
+      // Completion chains keep writing (journal index, lock dirs) briefly after
+      // the effects a test waits for become observable, so removal can race a
+      // file being created and fail with ENOTEMPTY. Retry until quiescent.
+      rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }),
     ),
   );
 });
