@@ -202,6 +202,36 @@ describe("task outcome telemetry", () => {
     expect(await readOrchestrationEvents(eventPath)).toHaveLength(1);
   });
 
+  it("repairs a truncated tail before allocating the next sequence under the journal lock", async () => {
+    const directory = await createTemporaryDirectory();
+    const eventPath = join(directory, "events.jsonl");
+    const first = await appendOrchestrationEvent({
+      eventPath,
+      event: {
+        type: "task_completed",
+        taskId: "task-first",
+        orchestrationId: "invocation-first",
+      },
+    });
+    await writeFile(eventPath, `${JSON.stringify(first)}\n{\"id\":\"truncated`, "utf8");
+
+    const second = await appendOrchestrationEvent({
+      eventPath,
+      event: {
+        type: "task_completed",
+        taskId: "task-second",
+        orchestrationId: "invocation-second",
+      },
+    });
+
+    expect(first.sequence).toBe(1);
+    expect(second.sequence).toBe(2);
+    expect((await readOrchestrationEvents(eventPath)).map((event) => event.id)).toEqual([
+      first.id,
+      second.id,
+    ]);
+  });
+
   it("keeps correctness events while telemetry fields are opted out", async () => {
     const directory = await createTemporaryDirectory();
     const eventPath = join(directory, "events.jsonl");

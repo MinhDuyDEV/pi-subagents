@@ -6,11 +6,17 @@ import {
   statSync,
 } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
+import type {
+  LearningClaimV1,
+  SupportedLearningClaimV1,
+  TaggedSha256V1,
+} from "../learning-contract.js";
 import type { ContextEvidence } from "./context.js";
 
 export interface EvidenceProofResult {
   valid: boolean;
   issues: string[];
+  supportedClaims: SupportedLearningClaimV1[];
 }
 
 export async function validateEvidenceOnlyProof(input: {
@@ -20,10 +26,15 @@ export async function validateEvidenceOnlyProof(input: {
   now?: Date;
   maxEvidenceAgeMs: number;
   claims?: readonly string[];
+  learningClaims?: readonly LearningClaimV1[];
 }): Promise<EvidenceProofResult> {
   const issues: string[] = [];
   if (input.evidence.length === 0) {
-    return { valid: false, issues: ["No completion evidence was provided."] };
+    return {
+      valid: false,
+      issues: ["No completion evidence was provided."],
+      supportedClaims: unsupportedLearningClaims(input.learningClaims),
+    };
   }
 
   const projectDirectories = [
@@ -37,8 +48,74 @@ export async function validateEvidenceOnlyProof(input: {
     validateReference(evidence, projectDirectories, issues);
   }
   validateSubstantiation(input.claims, input.evidence, projectDirectories, issues);
+  const supportedClaims = validateLearningClaims(
+    input.learningClaims,
+    input.evidence,
+    projectDirectories,
+    now,
+    input.maxEvidenceAgeMs,
+  );
 
-  return { valid: issues.length === 0, issues };
+  return { valid: issues.length === 0, issues, supportedClaims };
+}
+
+function unsupportedLearningClaims(
+  claims: readonly LearningClaimV1[] | undefined,
+): SupportedLearningClaimV1[] {
+  return (claims ?? []).map((claim) => ({
+    claimId: claim.claimId,
+    supported: false,
+    evidenceDigests: [],
+  }));
+}
+
+function validateLearningClaims(
+  claims: readonly LearningClaimV1[] | undefined,
+  evidence: readonly ContextEvidence[],
+  projectDirectories: readonly string[],
+  now: Date,
+  maxEvidenceAgeMs: number,
+): SupportedLearningClaimV1[] {
+  return (claims ?? []).map((claim): SupportedLearningClaimV1 => {
+    const boundEvidence = claim.support.evidenceRefs.map((reference) => ({
+      reference,
+      evidence: evidence.find(
+        (item) =>
+          item.reference === reference.ref || item.receiptId === reference.ref,
+      ),
+    }));
+    if (boundEvidence.some((item) => item.evidence === undefined)) {
+      return { claimId: claim.claimId, supported: false, evidenceDigests: [] };
+    }
+
+    const verifiedDigests: TaggedSha256V1[] = [];
+    let substantiated = false;
+    for (const binding of boundEvidence) {
+      const item = binding.evidence!;
+      const bindingIssues: string[] = [];
+      validateEvidenceAuthority(item, bindingIssues);
+      validateFreshness(item, now, maxEvidenceAgeMs, bindingIssues);
+      validateReference(item, projectDirectories, bindingIssues);
+      const filePath = resolveEvidenceFilePath(item, projectDirectories);
+      if (bindingIssues.length > 0 || filePath === undefined) {
+        return { claimId: claim.claimId, supported: false, evidenceDigests: [] };
+      }
+      const digest = `sha256:v1:${createHash("sha256")
+        .update(readFileSync(filePath))
+        .digest("hex")}` as TaggedSha256V1;
+      if (digest !== binding.reference.digest) {
+        return { claimId: claim.claimId, supported: false, evidenceDigests: [] };
+      }
+      verifiedDigests.push(digest);
+      substantiated ||= fileContainsClaimToken(filePath, claim.statement);
+    }
+
+    return {
+      claimId: claim.claimId,
+      supported: substantiated,
+      evidenceDigests: substantiated ? verifiedDigests : [],
+    };
+  });
 }
 
 function validateEvidenceAuthority(

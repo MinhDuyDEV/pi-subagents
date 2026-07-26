@@ -1,4 +1,5 @@
 import { Type, type Static } from "typebox";
+import { parseLearningClaims } from "../learning-contract.js";
 import type { ResourceClaim } from "./claims.js";
 import type { ContextPackInput } from "./context.js";
 
@@ -47,6 +48,36 @@ const ContextEvidenceSchema = Type.Object(
   { additionalProperties: false },
 );
 
+const TaggedDigestSchema = Type.String({ pattern: "^sha256:v1:[0-9a-f]{64}$" });
+const LearningReferenceSchema = Type.Object(
+  {
+    kind: Type.Union([
+      Type.Literal("evidence-receipt"),
+      Type.Literal("repository-file"),
+    ]),
+    ref: Type.String({ minLength: 1, maxLength: 512 }),
+    digest: TaggedDigestSchema,
+  },
+  { additionalProperties: false },
+);
+const LearningClaimSchema = Type.Object(
+  {
+    version: Type.Literal(1),
+    kind: Type.Union([Type.Literal("pattern"), Type.Literal("discovery")]),
+    claimId: TaggedDigestSchema,
+    statement: Type.String({ minLength: 1, maxLength: 400 }),
+    applicability: Type.String({ minLength: 1, maxLength: 300 }),
+    support: Type.Object(
+      {
+        mode: Type.Union([Type.Literal("direct-artifact"), Type.Literal("task-outcome")]),
+        evidenceRefs: Type.Array(LearningReferenceSchema, { minItems: 1, maxItems: 16 }),
+      },
+      { additionalProperties: false },
+    ),
+  },
+  { additionalProperties: false },
+);
+
 const ContextPackInputSchema = Type.Object(
   {
     goal: Type.String({ minLength: 1 }),
@@ -68,6 +99,7 @@ const ContextPackInputSchema = Type.Object(
     ),
     evidence: Type.Optional(Type.Array(ContextEvidenceSchema)),
     claims: Type.Optional(Type.Array(Type.String())),
+    learning_claims: Type.Optional(Type.Array(LearningClaimSchema, { maxItems: 32 })),
     next_step: Type.String({ minLength: 1 }),
   },
   { additionalProperties: false },
@@ -241,6 +273,9 @@ function normalizeContext(
         }
       : {}),
     ...(context.claims ? { claims: [...context.claims] } : {}),
+    ...(context.learning_claims
+      ? { learningClaims: parseLearningClaims(context.learning_claims) }
+      : {}),
     nextStep: context.next_step,
   };
 }

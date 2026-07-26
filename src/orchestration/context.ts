@@ -7,6 +7,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
+import { parseLearningClaims, type LearningClaimV1 } from "../learning-contract.js";
 import { withFileLock } from "./file-lock.js";
 
 const CONTEXT_PACK_VERSION = 1;
@@ -66,6 +67,7 @@ export interface ContextPackInput {
   references?: readonly ContextReferenceInput[];
   evidence?: readonly ContextEvidence[];
   claims?: readonly string[];
+  learningClaims?: readonly LearningClaimV1[];
   nextStep: string;
 }
 
@@ -83,6 +85,7 @@ export interface ContextPack {
   references: ContextReference[];
   evidence: ContextEvidence[];
   claims: string[];
+  learningClaims: LearningClaimV1[];
   nextStep: string;
 }
 
@@ -118,6 +121,7 @@ export async function buildContextPack(input: {
     ),
     evidence: (input.input.evidence ?? []).map(redactEvidence),
     claims: (input.input.claims ?? []).map(redactSensitiveText),
+    learningClaims: parseLearningClaims(input.input.learningClaims),
     nextStep: redactSensitiveText(input.input.nextStep),
   };
 }
@@ -154,6 +158,12 @@ export function renderContextPackForPrompt(pack: ContextPack): string {
     lines.push("Claims to prove:");
     for (const claim of pack.claims) {
       lines.push(`- ${claim}`);
+    }
+  }
+  if (pack.learningClaims.length > 0) {
+    lines.push("Explicit learning claims to prove:");
+    for (const claim of pack.learningClaims) {
+      lines.push(`- [${claim.claimId}] ${claim.statement}`);
     }
   }
   lines.push(`Next step: ${pack.nextStep}`);
@@ -350,8 +360,19 @@ function isContextPack(value: unknown): value is ContextPack {
     value.evidence.every(isContextEvidence) &&
     Array.isArray(value.claims) &&
     value.claims.every((item) => typeof item === "string") &&
+    (value.learningClaims === undefined ||
+      (Array.isArray(value.learningClaims) && parseStoredLearningClaims(value.learningClaims))) &&
     typeof value.nextStep === "string"
   );
+}
+
+function parseStoredLearningClaims(value: unknown): value is LearningClaimV1[] {
+  try {
+    parseLearningClaims(value);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function isContextAuthorization(value: unknown): value is ContextAuthorization {

@@ -124,6 +124,6 @@ describe("evidence-only review", () => {
       maxEvidenceAgeMs: 10 * 60 * 1_000,
     });
 
-    expect(result).toEqual({ valid: true, issues: [] });
+    expect(result).toEqual({ valid: true, issues: [], supportedClaims: [] });
   });
 });

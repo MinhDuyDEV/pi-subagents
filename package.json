@@ -1,6 +1,6 @@
 {
   "name": "@minhduydev/pi-subagents",
-  "version": "0.6.1",
+  "version": "0.7.1",
   "description": "Herdr-native delegation runtime for Pi with durable task state, foreground/background agents, worktree isolation, claims/lease heartbeats, evidence and independent review gates, grouped completion, schedules, RPC v3, recovery, and SDK/tmux fallback. Runtime-only: agent profiles remain consumer-owned.",
   "type": "module",
   "main": "dist/task-runtime.js",
@@ -12,6 +12,14 @@
     "./api": {
       "types": "./dist/api.d.ts",
       "import": "./dist/api.js"
+    },
+    "./events": {
+      "types": "./dist/events.d.ts",
+      "import": "./dist/events.js"
+    },
+    "./replay": {
+      "types": "./dist/replay.d.ts",
+      "import": "./dist/replay.js"
     }
   },
   "files": [
@@ -30,7 +38,7 @@
     "smoke": "tsx test/smoke.ts",
     "prepack": "npm run build",
     "postversion": "git push --follow-tags",
-    "test:orchestration": "vitest run test/orchestration-*.test.ts test/learning-events.test.ts",
+    "test:orchestration": "vitest run test/orchestration-*.test.ts test/learning-events.test.ts test/phase5-*.test.ts",
     "test:package": "node test/package-install.mjs",
     "test:base": "tsx --test test/helpers.test.ts test/prompt.test.ts test/frontmatter.test.ts test/renderHint.test.ts test/polling.test.ts test/taskWidget.test.ts test/sdkWidgetEvents.test.ts test/sdkBackground.test.ts test/sdkPolling.test.ts test/widgetLifecycle.test.ts test/handles.test.ts test/terminalBackend.test.ts test/herdrBackend.test.ts test/exitSentinel.test.ts test/waitCompletion.test.ts test/restore.test.ts test/lifecycleCompletion.test.ts test/failure-diagnostics.test.ts test/taskTitle.test.ts test/modelSelection.test.ts test/herdr-retry.test.ts test/staleCtx.test.ts"
   },

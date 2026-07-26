@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { ResourceClaim, ResourceLease } from "./claims.js";
+import type { TaggedSha256V1, UsageReceiptV1 } from "../learning-contract.js";
 import type { ContextPack } from "./context.js";
 import type { OrchestrationRequest } from "./contract.js";
 import type { WorktreeHandle, WorktreeResult } from "../worktree.js";
@@ -35,6 +36,13 @@ export interface DurableTaskRun {
   version: 1;
   invocationId: string;
   correlationId?: string;
+  contextRequestDigest?: TaggedSha256V1;
+  learningBinding?: {
+    projectId: string;
+    trustEpoch: string;
+    sessionGeneration: string;
+  };
+  usageBindings?: UsageReceiptV1[];
   taskId?: string;
   batchId?: string;
   joinMode?: "async" | "group";
@@ -71,6 +79,13 @@ interface RunStoreDocument {
 export interface CreateDurableRunInput {
   invocationId?: string;
   correlationId?: string;
+  contextRequestDigest?: TaggedSha256V1;
+  learningBinding?: {
+    projectId: string;
+    trustEpoch: string;
+    sessionGeneration: string;
+  };
+  usageBindings?: UsageReceiptV1[];
   batchId?: string;
   joinMode?: "async" | "group";
   agentType?: string;
@@ -92,6 +107,11 @@ export function createDurableRun(input: CreateDurableRunInput): DurableTaskRun {
     version: RUN_STORE_VERSION,
     invocationId: input.invocationId ?? randomUUID(),
     ...(input.correlationId ? { correlationId: input.correlationId } : {}),
+    ...(input.contextRequestDigest
+      ? { contextRequestDigest: input.contextRequestDigest }
+      : {}),
+    ...(input.learningBinding ? { learningBinding: { ...input.learningBinding } } : {}),
+    ...(input.usageBindings ? { usageBindings: [...input.usageBindings] } : {}),
     ...(input.batchId ? { batchId: input.batchId } : {}),
     ...(input.joinMode ? { joinMode: input.joinMode } : {}),
     ...(input.agentType ? { agentType: input.agentType } : {}),

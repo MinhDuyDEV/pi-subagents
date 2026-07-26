@@ -87,11 +87,12 @@ export async function recordForegroundCompletion(
 
   let proof = run.proof
     ? await validateEvidenceOnlyProof({
-                projectDirectory: run.executionDirectory ?? run.projectDirectory,
+        projectDirectory: run.executionDirectory ?? run.projectDirectory,
         allowedProjectDirectories: [run.projectDirectory],
         evidence,
         maxEvidenceAgeMs: run.proof.maxEvidenceAgeMs ?? 15 * 60 * 1_000,
         claims: run.contextPack?.claims,
+        learningClaims: run.contextPack?.learningClaims,
       })
     : undefined;
 
@@ -107,6 +108,7 @@ export async function recordForegroundCompletion(
           ...(proof?.issues ?? []),
           ...uncovered.map((path) => `Write outside declared claims: ${path}`),
         ],
+        supportedClaims: proof?.supportedClaims ?? [],
       };
     }
   }
@@ -209,6 +211,7 @@ export async function recordBackgroundCompletion(
         evidence,
         maxEvidenceAgeMs: run.proof.maxEvidenceAgeMs ?? 15 * 60 * 1_000,
         claims: run.contextPack?.claims,
+        learningClaims: run.contextPack?.learningClaims,
       })
     : undefined;
 
@@ -224,6 +227,7 @@ export async function recordBackgroundCompletion(
           ...(proof?.issues ?? []),
           ...uncovered.map((path) => `Write outside declared claims: ${path}`),
         ],
+        supportedClaims: proof?.supportedClaims ?? [],
       };
     }
   }

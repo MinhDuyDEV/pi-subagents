@@ -18,6 +18,28 @@
 
 import { redactSensitiveText } from "./orchestration/context.js";
 import type { ContextFact } from "./orchestration/context.js";
+import {
+  parseLearningClaims,
+  parseSupportedLearningClaims,
+  parseUsageReceipts,
+  taggedDigest,
+  type LearningClaimV1,
+  type SupportedLearningClaimV1,
+    type TaggedSha256V1,
+  type UsageReceiptV1,
+} from "./learning-contract.js";
+
+export {
+  makeLearningClaim,
+  parseLearningClaims,
+  parseSupportedLearningClaims,
+  parseUsageReceipts,
+  taggedDigest,
+  type LearningClaimV1,
+  type SupportedLearningClaimV1,
+  type TaggedSha256V1,
+  type UsageReceiptV1,
+} from "./learning-contract.js";
 
 // ───────────────────────────────────────────────────────────────────────────
 //  Bounded learning context (no raw transcripts, no secrets)
@@ -59,6 +81,7 @@ export interface LearningContextV1 {
   facts: LearningFactV1[];
   patterns?: LearningPatternV1[];
   metrics?: LearningMetricsV1;
+  usageReceipts?: UsageReceiptV1[];
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -104,11 +127,18 @@ export interface ContextRequestPayloadV1 {
   agentType: string;
   /** Short description of the task goal. */
   description: string;
+  /** Canonical digest of the bounded request and explicit claims. */
+  requestDigest: TaggedSha256V1;
+  projectId?: string;
+  trustEpoch?: string;
+  sessionGeneration?: string;
+  /** Explicit reusable claims; task description is never treated as a claim. */
+  learningClaims: readonly LearningClaimV1[];
   /**
    * Mutable container: a listener sets this to provide learning context.
    * The emitter validates and clamps the value after propagation.
    */
-  response?: LearningContextV1;
+  response?: LearningContextV1 | Promise<LearningContextV1 | undefined>;
 }
 
 /**
@@ -123,6 +153,13 @@ export interface ProofVerifiedPayloadV1 {
   taskId: string;
   /** Stable orchestration correlation shared with context and review events. */
   correlationId: string;
+  /** Canonical digest of the context request this proof answers. */
+  requestDigest: TaggedSha256V1;
+  projectId?: string;
+  trustEpoch?: string;
+  sessionGeneration?: string;
+  /** Per-claim support results bound to named evidence. */
+  supportedClaims: readonly SupportedLearningClaimV1[];
   /** true = proof passed, false = proof failed. */
   verificationPassed: boolean;
   /** Human-readable issues from proof validation (empty on pass).
@@ -226,14 +263,17 @@ export function makeContextRequestPayload(
   agentType: string,
   description: string,
   correlationId = taskId,
+  learningClaims: readonly unknown[] = [],
 ): ContextRequestPayloadV1 {
-  return {
-    protocolVersion: 1,
+  const request = {
+    protocolVersion: 1 as const,
     taskId: clampString(taskId, MAX_TASK_ID),
     correlationId: clampString(correlationId, MAX_ID),
     agentType: clampString(safeRedact(agentType), MAX_AGENT_TYPE),
     description: clampString(safeRedact(description), MAX_DESCRIPTION),
+    learningClaims: parseLearningClaims(learningClaims),
   };
+  return { ...request, requestDigest: taggedDigest(request) };
 }
 
 /**
@@ -248,11 +288,32 @@ export function makeProofVerifiedPayload(
   issues: readonly string[],
   evidenceDigests: readonly string[],
   correlationId = taskId,
+  details?: {
+    requestDigest: string;
+    projectId?: string;
+    trustEpoch?: string;
+    sessionGeneration?: string;
+    supportedClaims: readonly unknown[];
+  },
 ): ProofVerifiedPayloadV1 {
+  const boundedTaskId = clampString(taskId, MAX_TASK_ID);
+  const boundedCorrelationId = clampString(correlationId, MAX_ID);
+  const requestDigest = details?.requestDigest;
+  if (requestDigest !== undefined && !/^sha256:v1:[a-f0-9]{64}$/.test(requestDigest)) {
+    throw new Error("requestDigest must be a tagged SHA-256 digest");
+  }
   return {
     protocolVersion: 1,
-    taskId: clampString(taskId, MAX_TASK_ID),
-    correlationId: clampString(correlationId, MAX_ID),
+    taskId: boundedTaskId,
+    correlationId: boundedCorrelationId,
+    requestDigest: requestDigest as TaggedSha256V1
+      ?? taggedDigest({ taskId: boundedTaskId, correlationId: boundedCorrelationId }),
+    ...(details?.projectId ? { projectId: clampString(details.projectId, MAX_ID) } : {}),
+    ...(details?.trustEpoch ? { trustEpoch: clampString(details.trustEpoch, MAX_ID) } : {}),
+    ...(details?.sessionGeneration
+      ? { sessionGeneration: clampString(details.sessionGeneration, MAX_ID) }
+      : {}),
+    supportedClaims: parseSupportedLearningClaims(details?.supportedClaims),
     verificationPassed,
     verificationIssues: clampIssues(issues),
     evidenceDigests: validateEvidenceDigests(evidenceDigests),
@@ -373,6 +434,14 @@ export function validateLearningContext(
         description: String(p.description ?? "").slice(0, MAX_PATTERN_DESCRIPTION_LENGTH),
       }))
       .filter((p) => p.category.length > 0);
+  }
+
+  if (ctx.usageReceipts !== undefined) {
+    try {
+      result.usageReceipts = parseUsageReceipts(ctx.usageReceipts);
+    } catch {
+      return undefined;
+    }
   }
 
   if (ctx.metrics && typeof ctx.metrics === "object") {

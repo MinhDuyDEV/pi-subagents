@@ -427,20 +427,42 @@ function createOrchestratedTaskTool(
         }
 
         // ── Optional learning context request (fail-open) ──────────
+        let contextRequestDigest:
+          | ReturnType<typeof makeContextRequestPayload>["requestDigest"]
+          | undefined;
+        let learningBinding:
+          | { projectId: string; trustEpoch: string; sessionGeneration: string }
+          | undefined;
+        let usageBindings: import("../learning-contract.js").UsageReceiptV1[] | undefined;
         if (pi?.events && !resumedTaskId) {
           const contextRequest = makeContextRequestPayload(
             invocationId,
             agentType ?? "unknown",
             description ?? "",
             orchestration?.id ?? invocationId,
+            orchestration?.context?.learningClaims,
           );
           try {
             await pi.events.emit(
               SUBAGENT_LEARNING_EVENTS_V1.CONTEXT_REQUEST,
               contextRequest,
             );
+            contextRequestDigest = contextRequest.requestDigest;
+            if (
+              contextRequest.projectId &&
+              contextRequest.trustEpoch &&
+              contextRequest.sessionGeneration
+            ) {
+              learningBinding = {
+                projectId: contextRequest.projectId,
+                trustEpoch: contextRequest.trustEpoch,
+                sessionGeneration: contextRequest.sessionGeneration,
+              };
+            }
             if (contextRequest.response) {
-              const validated = validateLearningContext(contextRequest.response);
+              const response = await Promise.resolve(contextRequest.response);
+              const validated = validateLearningContext(response);
+              usageBindings = validated?.usageReceipts;
               if (validated && validated.facts.length > 0) {
                 // Merge learning facts into orchestration context as
                 // provenance-labelled non-authoritative entries.
@@ -481,6 +503,9 @@ function createOrchestratedTaskTool(
           createDurableRun({
             invocationId,
             correlationId: orchestration?.id,
+            contextRequestDigest,
+            learningBinding,
+            usageBindings,
             batchId: orchestration?.batchId,
             joinMode: orchestration?.join,
             agentType,

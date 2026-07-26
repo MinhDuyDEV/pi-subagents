@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
-import { appendFile, mkdir, readFile } from "node:fs/promises";
+import { mkdir, open, readFile, truncate } from "node:fs/promises";
 import { dirname } from "node:path";
+import type { UsageReceiptV1 } from "../learning-contract.js";
 import { withFileLock } from "./file-lock.js";
 
-const ORCHESTRATION_EVENT_VERSION = 1;
+export const ORCHESTRATION_EVENT_VERSION = 1;
 
 export type OrchestrationEventType =
   | "task_started"
@@ -50,7 +51,10 @@ export interface NewOrchestrationEvent {
   evidenceCount?: number;
   reviewFindings?: number;
   acceptedFindings?: number;
+  reviewStatus?: "approved" | "changes_requested" | "rejected";
+  reviewerAgent?: string;
   usage?: TaskUsageSummary;
+  usageBindings?: UsageReceiptV1[];
   reason?: string;
   verdict?: string;
   reviewerTaskId?: string;
@@ -62,6 +66,7 @@ export interface NewOrchestrationEvent {
 export interface OrchestrationEvent extends NewOrchestrationEvent {
   version: number;
   id: string;
+  sequence: number;
   timestamp: string;
 }
 
@@ -92,30 +97,79 @@ export async function appendOrchestrationEvent(input: {
   const eventInput = process.env.PI_SUBAGENTS_NO_TELEMETRY === "1"
     ? withoutOptionalMetrics(input.event)
     : input.event;
-  const event: OrchestrationEvent = {
-    ...eventInput,
-    version: ORCHESTRATION_EVENT_VERSION,
-    id: randomUUID(),
-    timestamp: eventInput.timestamp ?? new Date().toISOString(),
-  };
-  let persisted = event;
+  let persisted: OrchestrationEvent | undefined;
   await mkdir(dirname(input.eventPath), { recursive: true });
   await withFileLock({
     lockPath: `${input.eventPath}.lock`,
     operation: async () => {
-      if (event.idempotencyKey) {
-        const existing = (await readOrchestrationEvents(input.eventPath)).find(
-          (candidate) => candidate.idempotencyKey === event.idempotencyKey,
+      await repairJournalTail(input.eventPath);
+      const events = await readOrchestrationEvents(input.eventPath);
+      if (eventInput.idempotencyKey) {
+        const existing = events.find(
+          (candidate) => candidate.idempotencyKey === eventInput.idempotencyKey,
         );
         if (existing) {
           persisted = existing;
           return;
         }
       }
-      await appendFile(input.eventPath, `${JSON.stringify(event)}\n`, "utf8");
+      const event: OrchestrationEvent = {
+        ...eventInput,
+        version: ORCHESTRATION_EVENT_VERSION,
+        id: randomUUID(),
+        sequence: nextSequence(events),
+        timestamp: eventInput.timestamp ?? new Date().toISOString(),
+      };
+      await appendAndSync(input.eventPath, `${JSON.stringify(event)}\n`);
+      persisted = event;
     },
   });
+  if (!persisted) throw new Error("Orchestration event was not persisted");
   return persisted;
+}
+
+function nextSequence(events: readonly OrchestrationEvent[]): number {
+  return events.reduce((highest, event, index) => {
+    const sequence = Number.isInteger(event.sequence) ? event.sequence : index + 1;
+    return Math.max(highest, sequence);
+  }, 0) + 1;
+}
+
+async function appendAndSync(path: string, contents: string): Promise<void> {
+  const handle = await open(path, "a");
+  try {
+    await handle.writeFile(contents, "utf8");
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+async function repairJournalTail(path: string): Promise<void> {
+  let content: string;
+  try {
+    content = await readFile(path, "utf8");
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") return;
+    throw error;
+  }
+  if (!content || content.endsWith("\n")) return;
+
+  const lastNewline = content.lastIndexOf("\n");
+  const tail = content.slice(lastNewline + 1);
+  try {
+    const value: unknown = JSON.parse(tail);
+    if (!isOrchestrationEvent(value)) throw new Error("invalid event tail");
+    await appendAndSync(path, "\n");
+  } catch {
+    await truncate(path, lastNewline + 1);
+    const handle = await open(path, "r+");
+    try {
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+  }
 }
 
 export async function readOrchestrationEvents(

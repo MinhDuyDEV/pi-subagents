@@ -249,6 +249,7 @@ async function executeHerdrAction(
         allowedProjectDirectories: [projectDirectory],
         evidence: pack?.evidence ?? [],
         claims: pack?.claims,
+        learningClaims: pack?.learningClaims,
         maxEvidenceAgeMs: run.proof?.maxEvidenceAgeMs ?? 15 * 60 * 1_000,
       });
       const currentWorktree =
@@ -304,6 +305,13 @@ async function executeHerdrAction(
           proof.issues,
           (pack?.evidence ?? []).map((e) => e.sha256 ?? "").filter(Boolean),
           run.correlationId ?? run.invocationId,
+          run.contextRequestDigest
+            ? {
+                requestDigest: run.contextRequestDigest,
+                ...(run.learningBinding ?? {}),
+                supportedClaims: proof.supportedClaims,
+              }
+            : undefined,
         );
         try {
           await pi.events.emit(SUBAGENT_LEARNING_EVENTS_V1.PROOF_VERIFIED, proofPayload);
@@ -357,6 +365,7 @@ async function executeHerdrAction(
       if (accepted > findings) {
         throw new Error("accepted_findings must not exceed review_findings");
       }
+      const reviewedRun = await getDurableRunByTaskId(paths.runStore, taskId);
       await appendOrchestrationEvent({
         eventPath: paths.eventLog,
         event: {
@@ -366,6 +375,10 @@ async function executeHerdrAction(
           agentType: "reviewer",
           reviewFindings: findings,
           acceptedFindings: accepted,
+          reviewStatus: accepted > 0 ? "changes_requested" : "approved",
+          ...(reviewedRun?.usageBindings?.length
+            ? { usageBindings: reviewedRun.usageBindings }
+            : {}),
         },
       });
       return {

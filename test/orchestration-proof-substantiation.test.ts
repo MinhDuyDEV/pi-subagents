@@ -49,7 +49,7 @@ describe("claim substantiation", () => {
       maxEvidenceAgeMs: 10 * 60 * 1_000,
     });
 
-    expect(result).toEqual({ valid: true, issues: [] });
+    expect(result).toEqual({ valid: true, issues: [], supportedClaims: [] });
   });
 
   it("rejects a claim with no bound evidence", async () => {
@@ -137,7 +137,7 @@ describe("claim substantiation", () => {
       maxEvidenceAgeMs: 10 * 60 * 1_000,
     });
 
-    expect(result).toEqual({ valid: true, issues: [] });
+    expect(result).toEqual({ valid: true, issues: [], supportedClaims: [] });
   });
 
   it("binds evidence via case-insensitive contains when no exact match exists", async () => {
@@ -165,7 +165,7 @@ describe("claim substantiation", () => {
       maxEvidenceAgeMs: 10 * 60 * 1_000,
     });
 
-    expect(result).toEqual({ valid: true, issues: [] });
+    expect(result).toEqual({ valid: true, issues: [], supportedClaims: [] });
   });
 
   it("skips the overlap check for non-file references", async () => {
@@ -195,6 +195,6 @@ describe("claim substantiation", () => {
 
     // directory references pass validateReference but are not files, so the
     // token-overlap check is skipped and the bound claim is accepted.
-    expect(result).toEqual({ valid: true, issues: [] });
+    expect(result).toEqual({ valid: true, issues: [], supportedClaims: [] });
   });
 });
