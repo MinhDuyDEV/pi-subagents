@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, realpathSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { bindingDigestFor } from "@minhduydev/pi-core";
 import type { TSchema } from "typebox";
 import { readRegistry, setRegistryQuarantineReporter } from "../conversation.js";
 import { findPiDir } from "../helpers.js";
@@ -451,23 +452,43 @@ function createOrchestratedTaskTool(
             orchestration?.id ?? invocationId,
             orchestration?.context?.learningClaims,
           );
+          // pi-learning announces the project binding on its own event now,
+          // digest-bound to this request — it is no longer read off fields a
+          // listener wrote into OUR payload (which only worked while
+          // listeners ran in one undeclared order).
+          const unsubscribeServed = pi.events.on(
+            "pi-learning:v1:context-served",
+            (served: unknown) => {
+              if (!served || typeof served !== "object") return;
+              const record = served as Record<string, unknown>;
+              if (record.requestDigest !== contextRequest.requestDigest) return;
+              if (
+                typeof record.projectId !== "string" ||
+                typeof record.trustEpoch !== "string" ||
+                typeof record.sessionGeneration !== "string"
+              ) {
+                return;
+              }
+              const expectedBinding = bindingDigestFor({
+                requestDigest: contextRequest.requestDigest,
+                projectId: record.projectId,
+                trustEpoch: record.trustEpoch,
+                sessionGeneration: record.sessionGeneration,
+              });
+              if (record.bindingDigest !== expectedBinding) return;
+              learningBinding = {
+                projectId: record.projectId,
+                trustEpoch: record.trustEpoch,
+                sessionGeneration: record.sessionGeneration,
+              };
+            },
+          );
           try {
             await pi.events.emit(
               SUBAGENT_LEARNING_EVENTS_V1.CONTEXT_REQUEST,
               contextRequest,
             );
             contextRequestDigest = contextRequest.requestDigest;
-            if (
-              contextRequest.projectId &&
-              contextRequest.trustEpoch &&
-              contextRequest.sessionGeneration
-            ) {
-              learningBinding = {
-                projectId: contextRequest.projectId,
-                trustEpoch: contextRequest.trustEpoch,
-                sessionGeneration: contextRequest.sessionGeneration,
-              };
-            }
             if (contextRequest.response) {
               const response = await Promise.resolve(contextRequest.response);
               const validated = validateLearningContext(response);
@@ -492,6 +513,8 @@ function createOrchestratedTaskTool(
             }
           } catch {
             // fail-open: listener error must not block task launch
+          } finally {
+            unsubscribeServed();
           }
         }
 
