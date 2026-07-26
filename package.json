@@ -59,11 +59,11 @@
   ],
   "license": "MIT",
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=22.19.0"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": ">=0.81.1",
-    "@earendil-works/pi-tui": ">=0.81.1",
+    "@earendil-works/pi-coding-agent": ">=0.81.1 <0.82.0",
+    "@earendil-works/pi-tui": ">=0.81.1 <0.82.0",
     "typebox": "*",
     "@minhduydev/pi-core": "^0.1.0"
   },
@@ -89,7 +89,8 @@
     ],
     "skills": [
       "./skills/pi-subagents"
-    ]
+    ],
+    "replayPort": "./replay"
   },
   "repository": {
     "type": "git",
