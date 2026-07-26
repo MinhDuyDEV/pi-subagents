@@ -256,19 +256,69 @@ async function withRunStore<T>(
   });
 }
 
+/** Reporter for a run store that had to be quarantined; wired by the runtime. */
+export type RunStoreQuarantineReporter = (info: {
+  storePath: string;
+  quarantinePath: string;
+  reason: string;
+}) => void;
+
+let reportRunStoreQuarantine: RunStoreQuarantineReporter = () => undefined;
+
+export function setRunStoreQuarantineReporter(
+  reporter: RunStoreQuarantineReporter,
+): void {
+  reportRunStoreQuarantine = reporter;
+}
+
+/**
+ * Read the run store, quarantining one that cannot be understood.
+ *
+ * Same rationale as the lease store: throwing forever on a bad file is a
+ * denial of service on recovery and on every tool that lists runs, and a store
+ * written by an older build can now contain claims the stricter validation
+ * rejects. The bad file is moved aside as evidence and the system continues —
+ * runs are re-established from panes and session history by recovery.
+ */
 async function readRunStore(storePath: string): Promise<RunStoreDocument> {
+  let raw: string;
   try {
-    const value: unknown = JSON.parse(await readFile(storePath, "utf8"));
-    if (!isRunStoreDocument(value)) {
-      throw new Error(`Invalid task run store: ${storePath}`);
-    }
-    return value;
+    raw = await readFile(storePath, "utf8");
   } catch (error) {
     if (isNodeError(error) && error.code === "ENOENT") {
       return { version: RUN_STORE_VERSION, runs: [] };
     }
     throw error;
   }
+
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch (error) {
+    return quarantineRunStore(storePath, `unparseable JSON: ${(error as Error).message}`);
+  }
+  if (!isRunStoreDocument(value)) {
+    return quarantineRunStore(storePath, "store failed schema validation");
+  }
+  return value;
+}
+
+async function quarantineRunStore(
+  storePath: string,
+  reason: string,
+): Promise<RunStoreDocument> {
+  const quarantinePath = `${storePath}.corrupt-${Date.now()}-${randomUUID().slice(0, 8)}`;
+  try {
+    await rename(storePath, quarantinePath);
+  } catch {
+    // If it cannot be moved we still continue; the next write replaces it.
+  }
+  try {
+    reportRunStoreQuarantine({ storePath, quarantinePath, reason });
+  } catch {
+    // A reporter must never be able to break the store.
+  }
+  return { version: RUN_STORE_VERSION, runs: [] };
 }
 
 async function writeRunStore(

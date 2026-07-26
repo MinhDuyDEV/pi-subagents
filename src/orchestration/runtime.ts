@@ -60,6 +60,7 @@ import {
   listDurableRuns,
   patchDurableRun,
   putDurableRun,
+  setRunStoreQuarantineReporter,
   type DurableTaskRun,
 } from "./run-store.js";
 import { seedResumeRegistry } from "./task-state.js";
@@ -1630,6 +1631,27 @@ function registerStoreQuarantineReporter(
           `${quarantinePath}. Background tasks recorded there cannot be restored, so any ` +
           `panes, agent processes, or worktrees they owned are now orphaned and need to be ` +
           `closed by hand.`,
+        display: true,
+      },
+      { triggerTurn: false },
+    );
+  });
+
+  setRunStoreQuarantineReporter(({ storePath, quarantinePath, reason }) => {
+    pi.events.emit("pi-subagents:v1:run-store-quarantined", {
+      version: 1,
+      storePath,
+      quarantinePath,
+      reason,
+    });
+    pi.sendMessage(
+      {
+        customType: "orchestration-run-store-quarantined",
+        content:
+          `The task run store at ${storePath} was unreadable (${reason}) and has been moved ` +
+          `to ${quarantinePath}. Durable run state was reset; recovery will re-establish ` +
+          `running tasks from panes and session history, but review/ship state recorded ` +
+          `there is gone.`,
         display: true,
       },
       { triggerTurn: false },
