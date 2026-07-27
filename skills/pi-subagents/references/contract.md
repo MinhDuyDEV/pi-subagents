@@ -1,5 +1,23 @@
 # Runtime contract
 
+## Delegation prompt contract (governed outcome)
+
+A delegation prompt hands the agent an outcome to govern, not a recipe to execute:
+
+- Outcome: observable behavior wanted, not an implementation.
+- Frontier: the open questions the agent owns deciding.
+- Locked decisions: each with rationale and an unlock condition.
+- Acceptance: what evidence would convince a skeptic; the agent chooses how.
+- Non-goals and write/read policy.
+
+Verification recipes, chosen architectures, and pre-named acceptance criteria belong in the prompt only when genuinely locked, and then with rationale.
+
+## Result envelope
+
+Reported status: `success | failure | blocked | partial | reframed`. `reframed` is a valid outcome — the delegated framing was wrong and the agent delivered the corrected framing. Optional `<needs_decision>` carries a disputed premise or a parent-only decision with options and tradeoffs; it is parsed into result details.
+
+Child-visible context rendering never includes `context.claims` (they are enforced verifier-side by the proof gate), and `context.next_step` is rendered as a non-binding suggested entry point. `context.disclosure: "blind-first"` seals `known_facts`/`decisions` behind an open-after-your-own-read block.
+
 ## State model
 
 Each run has a runtime-generated `invocationId`; caller-provided `orchestration.id` is correlation only and grants no authority.
@@ -40,6 +58,10 @@ Under `.pi/artifacts/tasks/orchestration/`:
 Accepted references must resolve to a local project artifact or a captured `session:` JSONL. Raw `command:` and uncaptured `url:` references fail. Evidence timestamps must be present, parseable, non-future, and within the configured age. Claim linkage is deterministic plausibility checking, not semantic theorem proving; independent review remains required for high-risk acceptance.
 
 Worktree completions include `baseSha`, branch, changed paths, and a SHA-256 diff/content digest. Unchanged worktrees are removed; changed worktrees are retained for review/merge.
+
+## Learning claims
+
+Task outcomes may contribute learning only through explicit `orchestration.context.learning_claims` (max 32), each a versioned claim (`kind: pattern | discovery`, tagged-digest `claimId`, bounded `statement`/`applicability`) whose `support` names 1-16 bounded evidence refs (`mode: direct-artifact | task-outcome`). Task descriptions, free-form context claims, review prose, TODO text, and DCP summaries are never learning candidates by themselves. Do not invent claim IDs, evidence digests, usage receipts, or lower-trust outcome bindings; omit the learning claim when the producer cannot supply the canonical contract.
 
 ## Herdr behavior
 

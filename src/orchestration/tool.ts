@@ -713,6 +713,7 @@ async function executeHerdrAction(
       const released = await releaseResourceLease({
         storePath: paths.leaseStore,
         leaseId,
+        expectedOwner: run.lease.owner,
       });
       if (!released) {
         return {

@@ -104,14 +104,21 @@ async function safeDoctorCheck(
 }
 
 function validateDelegationContract(prompt: string): DoctorIssue[] {
+  // Two contract dialects are accepted: the governed-outcome contract
+  // (outcome/frontier/locked decisions/acceptance) and the legacy recipe
+  // contract (goal/expected output/stop condition/verification recipe).
+  // Acceptance subsumes the three legacy verification sections.
   const requiredSections = [
-    ["goal", /(?:^|\n)\s*goal\s*:/iu],
+    ["goal or outcome", /(?:^|\n)\s*(?:goal|outcome)\s*:/iu],
     ["complete context", /(?:^|\n)\s*(?:complete\s+)?context\s*:/iu],
     ["non-goals", /(?:^|\n)\s*non-goals?\s*:/iu],
-    ["read/write policy", /(?:^|\n)\s*read\/write\s+policy\s*:/iu],
-    ["expected output", /(?:^|\n)\s*expected\s+output\s*:/iu],
-    ["stop condition", /(?:^|\n)\s*stop\s+condition\s*:/iu],
-    ["verification recipe", /(?:^|\n)\s*verification\s+recipe\s*:/iu],
+    ["read/write policy", /(?:^|\n)\s*(?:read\/write|write\/read)\s+policy\s*:/iu],
+    ["expected output or acceptance", /(?:^|\n)\s*(?:expected\s+output|acceptance)\s*:/iu],
+    ["stop condition or acceptance", /(?:^|\n)\s*(?:stop\s+condition|acceptance)\s*:/iu],
+    [
+      "verification recipe or acceptance",
+      /(?:^|\n)\s*(?:verification\s+recipe|acceptance)\s*:/iu,
+    ],
   ] as const;
   const missing = requiredSections
     .filter(([, pattern]) => !pattern.test(prompt))

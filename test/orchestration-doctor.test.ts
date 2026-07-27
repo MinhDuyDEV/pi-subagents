@@ -67,6 +67,29 @@ describe("orchestration doctor", () => {
     });
   });
 
+  it("accepts a governed-outcome contract without a verification recipe", async () => {
+    const projectDirectory = await createTemporaryProject();
+    const governedDelegationPrompt = `
+Outcome: Callers observe a single lease owner per resource at all times.
+Complete context: Current disk is authoritative.
+Non-goals: Do not modify the store format.
+Write/read policy: Strictly read-only.
+Acceptance: Evidence that would convince a skeptic the invariant holds.
+`;
+    const result = await runOrchestrationDoctor({
+      projectDirectory,
+      delegationPrompt: governedDelegationPrompt,
+      now: new Date("2026-07-19T01:00:00.000Z"),
+    });
+
+    expect(result).toEqual({
+      ok: true,
+      status: "healthy",
+      exitCode: 0,
+      issues: [],
+    });
+  });
+
   it("reports vague delegation, stale tasks, unresolved sessions, and valueless ceremony", async () => {
     const projectDirectory = await createTemporaryProject();
     const eventPath = join(

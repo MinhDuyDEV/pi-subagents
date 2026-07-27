@@ -92,12 +92,12 @@ export interface ReleaseResourceLeaseInput {
   storePath: string;
   leaseId: string;
   /**
-   * The owner the caller believes holds the lease. Required in new code:
-   * `release` used to take only a lease id, so any caller could drop any other
-   * task's lease. Omitting it is still accepted for callers that legitimately
-   * reap on behalf of the system (see {@link releaseOrphanedLeases}).
+   * The owner the caller believes holds the lease. Required: `release` used to
+   * take only a lease id, so any caller could drop any other task's lease.
+   * System-side reaping of dead owners goes through
+   * {@link releaseOrphanedLeases}, which proves liveness instead of ownership.
    */
-  expectedOwner?: string;
+  expectedOwner: string;
   now?: Date;
 }
 
@@ -105,8 +105,8 @@ export interface TransferResourceLeaseOwnershipInput {
   storePath: string;
   leaseId: string;
   owner: string;
-  /** The owner the caller believes currently holds the lease. */
-  expectedOwner?: string;
+  /** The owner the caller believes currently holds the lease. Required. */
+  expectedOwner: string;
   now?: Date;
 }
 
@@ -248,6 +248,9 @@ export async function transferResourceLeaseOwnership(
   if (!input.owner.trim()) {
     throw new Error("Resource lease owner must not be empty");
   }
+  if (!input.expectedOwner.trim()) {
+    throw new Error("Resource lease transfer requires the expected current owner");
+  }
   const now = input.now ?? new Date();
   return withStoreLock(input.storePath, async () => {
     const store = await readStore(input.storePath);
@@ -259,7 +262,7 @@ export async function transferResourceLeaseOwnership(
     // Transfer used to prove nothing: any caller could reassign any lease to any
     // owner. `renewResourceLease` already checked ownership, so the asymmetry
     // was an oversight rather than a design.
-    if (input.expectedOwner !== undefined && lease.owner !== input.expectedOwner) {
+    if (lease.owner !== input.expectedOwner) {
       throw new Error(
         `Resource lease ${input.leaseId} is owned by ${lease.owner}, not ${input.expectedOwner}`,
       );
@@ -309,6 +312,9 @@ export async function renewResourceLease(
 export async function releaseResourceLease(
   input: ReleaseResourceLeaseInput,
 ): Promise<boolean> {
+  if (!input.expectedOwner.trim()) {
+    throw new Error("Resource lease release requires the expected owner");
+  }
   const now = input.now ?? new Date();
   return withStoreLock(input.storePath, async () => {
     const store = await readStore(input.storePath);
@@ -322,7 +328,7 @@ export async function releaseResourceLease(
       }
       return false;
     }
-    if (input.expectedOwner !== undefined && target.owner !== input.expectedOwner) {
+    if (target.owner !== input.expectedOwner) {
       throw new Error(
         `Resource lease ${input.leaseId} is owned by ${target.owner}, not ${input.expectedOwner}`,
       );

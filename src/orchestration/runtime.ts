@@ -376,16 +376,18 @@ function createOrchestratedTaskTool(
             },
           });
           launchLeaseHeartbeat = setInterval(() => {
-            if (!lease) return;
+            const heldLease = lease;
+            if (!heldLease) return;
             const launchedTaskId = state.launchedTaskIds.get(invocationId);
             const alignOwner =
-              launchedTaskId && lease.owner !== launchedTaskId
+              launchedTaskId && heldLease.owner !== launchedTaskId
                 ? transferResourceLeaseOwnership({
                     storePath: paths.leaseStore,
-                    leaseId: lease.id,
+                    leaseId: heldLease.id,
                     owner: launchedTaskId,
+                    expectedOwner: heldLease.owner,
                   })
-                : Promise.resolve(lease);
+                : Promise.resolve(heldLease);
             void alignOwner
               .then(async (aligned) => {
                 if (!aligned) return;
@@ -397,7 +399,32 @@ function createOrchestratedTaskTool(
                   owner: leaseOwner,
                   ttlMs: orchestration.leaseTtlMs,
                 });
-                if (!renewed) return;
+                // A failed renewal during launch is the same loss of mutual
+                // exclusion as one during execution. This used to `return`
+                // silently — the launch kept believing it held the lease — so
+                // it now goes through the same abandon path as the main
+                // heartbeat.
+                if (!renewed) {
+                  if (launchLeaseHeartbeat) clearInterval(launchLeaseHeartbeat);
+                  lease = undefined;
+                  await abandonLostLease(
+                    pi,
+                    state,
+                    {
+                      invocationId,
+                      orchestrationId,
+                      taskId: launchedTaskId ?? invocationId,
+                      agentType,
+                      startedAt,
+                      lease: aligned,
+                      leaseTtlMs: orchestration.leaseTtlMs,
+                      projectDirectory: ctx.cwd,
+                    },
+                    paths,
+                    "lease renewal failed or the lease expired during launch",
+                  );
+                  return;
+                }
                 lease = renewed;
                 await patchDurableRun(paths.runStore, invocationId, {
                   lease: renewed,
@@ -564,7 +591,12 @@ function createOrchestratedTaskTool(
         }
         if (contextPack) {
           const prompt = stringValue(upstreamParameters.prompt) ?? "";
-          upstreamParameters.prompt = `${prompt.trim()}\n\n${renderContextPackForPrompt(contextPack)}`;
+          const rendered = renderContextPackForPrompt(contextPack, {
+            ...(orchestration?.context?.disclosure
+              ? { disclosure: orchestration.context.disclosure }
+              : {}),
+          });
+          upstreamParameters.prompt = `${prompt.trim()}\n\n${rendered}`;
         }
 
         const upstreamResult = await upstreamTool.execute(
@@ -618,6 +650,7 @@ function createOrchestratedTaskTool(
               storePath: paths.leaseStore,
               leaseId: lease.id,
               owner: taskId,
+              expectedOwner: lease.owner,
             })) ?? lease;
           leaseOwner = taskId;
         }
@@ -1054,6 +1087,7 @@ async function recoverAllocatingRuns(
         storePath: paths.leaseStore,
         leaseId: lease.id,
         owner: entry.id,
+        expectedOwner: lease.owner,
       }).catch(() => undefined);
       if (!transferred) continue;
       lease = transferred;

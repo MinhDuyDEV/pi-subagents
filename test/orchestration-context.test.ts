@@ -116,7 +116,78 @@ describe("Context Pack and Handoff", () => {
     expect(rendered).toContain("Unknown: Whether the upstream registry is populated.");
     expect(rendered).toContain("Decision: Use a thin wrapper. — Avoid a fork.");
     expect(rendered).toContain("Evidence: Focused lifecycle test failed");
-    expect(rendered).toContain("Next step: Resolve the nested session.");
+    expect(rendered).toContain(
+      "Suggested entry point (optional, non-binding): Resolve the nested session.",
+    );
+  });
+
+  it("keeps acceptance claims out of the child-visible prompt (anti-Goodhart)", async () => {
+    const projectDirectory = await createTemporaryProject();
+    const pack = await buildContextPack({
+      projectDirectory,
+      input: {
+        goal: "Fix the auth race",
+        authorization: "write-approved",
+        claims: [
+          "The authentication race is fixed",
+          "The focused auth tests pass",
+        ],
+        nextStep: "Reproduce the failing test",
+      },
+    });
+
+    // The claims stay in the data model for the verifier-side proof gate…
+    expect(pack.claims).toEqual([
+      "The authentication race is fixed",
+      "The focused auth tests pass",
+    ]);
+
+    // …but the child never sees the strings it will be graded against.
+    const rendered = renderContextPackForPrompt(pack);
+    expect(rendered).not.toContain("Claims to prove");
+    expect(rendered).not.toContain("The authentication race is fixed");
+    expect(rendered).not.toContain("The focused auth tests pass");
+  });
+
+  it("seals facts and decisions behind the blind-first block, after goal and frontier", async () => {
+    const projectDirectory = await createTemporaryProject();
+    const pack = await buildContextPack({
+      projectDirectory,
+      input: {
+        goal: "Fix the auth race",
+        authorization: "write-approved",
+        knownFacts: [{ statement: "Current disk wins.", source: "repository" }],
+        unknowns: ["Which lock ordering is correct."],
+        decisions: [{ statement: "Keep the public API stable.", rationale: "Compatibility" }],
+        nextStep: "Reproduce the failing test",
+      },
+    });
+
+    const rendered = renderContextPackForPrompt(pack, { disclosure: "blind-first" });
+    const sealedHeading =
+      "### Sealed context — open AFTER you have written your own 5-line read of the problem";
+    expect(rendered).toContain(sealedHeading);
+
+    const sealedAt = rendered.indexOf(sealedHeading);
+    expect(rendered.indexOf("Goal: Fix the auth race")).toBeLessThan(sealedAt);
+    expect(rendered.indexOf("Authorization: write-approved")).toBeLessThan(sealedAt);
+    expect(rendered.indexOf("Unknown: Which lock ordering is correct.")).toBeLessThan(sealedAt);
+    expect(
+      rendered.indexOf("Suggested entry point (optional, non-binding):"),
+    ).toBeLessThan(sealedAt);
+
+    // Facts and decisions appear only inside the sealed block.
+    expect(rendered.indexOf("Fact: [repository] Current disk wins.")).toBeGreaterThan(sealedAt);
+    expect(
+      rendered.indexOf("Decision: Keep the public API stable. — Compatibility"),
+    ).toBeGreaterThan(sealedAt);
+
+    // Default disclosure keeps the existing inline behavior.
+    const open = renderContextPackForPrompt(pack);
+    expect(open).not.toContain(sealedHeading);
+    expect(open.indexOf("Fact: [repository] Current disk wins.")).toBeLessThan(
+      open.indexOf("Suggested entry point"),
+    );
   });
 
   it("serializes concurrent handoff updates without losing decisions", async () => {

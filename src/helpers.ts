@@ -69,6 +69,12 @@ export interface ParsedResult {
   caveats: string;
   next_steps: string;
   confidence: string;
+  /**
+   * Optional escalation channel: a disputed premise or a decision the parent
+   * must make (options with tradeoffs). Present only when the child emitted a
+   * `<needs_decision>` tag.
+   */
+  needs_decision?: string;
   raw: string;
 }
 
@@ -77,6 +83,11 @@ export type TaskReportedStatus =
   | "failure"
   | "blocked"
   | "partial"
+  /**
+   * The delegated framing was wrong and the agent delivered a corrected
+   * framing instead. A valid outcome, not a failure.
+   */
+  | "reframed"
   | "unknown";
 
 export interface TaskResultAssessment {
@@ -100,6 +111,7 @@ function isTaskReportedStatus(status: string): status is TaskReportedStatus {
     status === "failure" ||
     status === "blocked" ||
     status === "partial" ||
+    status === "reframed" ||
     status === "unknown"
   );
 }
@@ -133,7 +145,7 @@ When you are done, end with the XML envelope described below (or the <result> bl
  */
 export const TASK_RESULT_XML_INSTRUCTIONS = `When the task is complete, wrap the final result in this XML envelope (or the agent's <result> block with the same inner tags). Nothing after the closing tag:
 
-<status>success | failure | blocked | partial</status>
+<status>success | failure | blocked | partial | reframed</status>
 <summary>One-line summary of the outcome.</summary>
 <findings>Key findings. Plain text, multiple lines OK.</findings>
 <evidence>Citations, URLs, command snippets. <sources> is accepted as an alias for evidence.</evidence>
@@ -141,6 +153,10 @@ export const TASK_RESULT_XML_INSTRUCTIONS = `When the task is complete, wrap the
 <caveats>Risks, gaps, uncertainty. <blockers> is accepted as an alias.</caveats>
 <next_steps>Follow-up actions. <checks> is accepted as an alias.</next_steps>
 <confidence>high | medium | low</confidence>
+
+Use status "reframed" when the task's framing turned out to be wrong and you delivered the corrected framing instead — it is a valid outcome, not a failure. Explain the reframe in summary/findings.
+
+Optional tag, only when the parent must decide something you cannot: <needs_decision>The disputed premise or the decision needed — options with tradeoffs.</needs_decision>
 
 <decisions> is merged into findings. The parent parses these tags for the task UI.`;
 
@@ -157,11 +173,14 @@ When NOT to use:
 - If no available agent fits the task, use other tools directly
 
 Prompt contract:
-- Goal: the exact outcome wanted
+- Outcome: the governed outcome wanted, stated as observable behavior — not an implementation
+- Frontier: the open questions the agent OWNS deciding (approach, design within scope, test strategy)
+- Locked decisions: constraints that stand, each WITH rationale and an unlock condition ("locked because X; challenge it if you find evidence Y")
+- Acceptance: what evidence would convince a skeptic the outcome holds — the agent chooses HOW to produce it
 - Non-goals: what to avoid or leave untouched
 - Write/read policy: whether the agent may edit files or must stay read-only
-- Stop condition: what must be true before the task is considered complete
-- Verification recipe: the checks the agent must run or the evidence it must gather
+
+Do not hand the agent a verification recipe, a chosen architecture, or pre-named acceptance criteria unless they are genuinely locked; every locked item must carry its rationale.
 
 Usage notes:
 1. Provide complete context in the prompt — the subagent starts with a fresh context
@@ -203,6 +222,7 @@ const SOURCES_RE = /<sources>([\s\S]*?)<\/sources>/i;
 const BLOCKERS_RE = /<blockers>([\s\S]*?)<\/blockers>/i;
 const CHECKS_RE = /<checks>([\s\S]*?)<\/checks>/i;
 const DECISIONS_RE = /<decisions>([\s\S]*?)<\/decisions>/i;
+const NEEDS_DECISION_RE = /<needs_decision>([\s\S]*?)<\/needs_decision>/i;
 const PLAIN_SUMMARY_MAX_CHARS = 500;
 
 // ─── Result Parsing ──────────────────────────────────────────────────────────
@@ -229,6 +249,7 @@ function hasStructuredResultTags(raw: string): boolean {
     BLOCKERS_RE,
     CHECKS_RE,
     DECISIONS_RE,
+    NEEDS_DECISION_RE,
   ];
   return tags.some((re) => extractTag(raw, re).length > 0);
 }
@@ -271,6 +292,7 @@ export function parseResultXml(raw: string): ParsedResult {
     extractTag(raw, NEXT_STEPS_RE),
     extractTag(raw, CHECKS_RE),
   );
+  const needs_decision = extractTag(raw, NEEDS_DECISION_RE);
 
   return {
     status: status || "unknown",
@@ -281,6 +303,7 @@ export function parseResultXml(raw: string): ParsedResult {
     caveats,
     next_steps,
     confidence: confidence || "",
+    ...(needs_decision ? { needs_decision } : {}),
     raw,
   };
 }
@@ -312,6 +335,7 @@ export function buildTaskEnvelope(
       files: parsed.files,
       caveats: parsed.caveats,
       next_steps: parsed.next_steps,
+      ...(parsed.needs_decision ? { needs_decision: parsed.needs_decision } : {}),
       structured_result: assessment.valid,
     },
   };

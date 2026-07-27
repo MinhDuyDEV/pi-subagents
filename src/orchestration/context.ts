@@ -58,6 +58,8 @@ export interface ContextReference {
   digest: string;
 }
 
+export type ContextDisclosure = "open" | "blind-first";
+
 export interface ContextPackInput {
   goal: string;
   authorization: ContextAuthorization;
@@ -69,6 +71,12 @@ export interface ContextPackInput {
   claims?: readonly string[];
   learningClaims?: readonly LearningClaimV1[];
   nextStep: string;
+  /**
+   * Render-time option, not persisted in the Context Pack. "blind-first" seals
+   * the parent's facts and decisions behind a block the agent is told to open
+   * only after forming its own read of the problem. Default: "open".
+   */
+  disclosure?: ContextDisclosure;
 }
 
 export interface ContextPack {
@@ -126,24 +134,44 @@ export async function buildContextPack(input: {
   };
 }
 
-export function renderContextPackForPrompt(pack: ContextPack): string {
+export interface RenderContextPackOptions {
+  /** See {@link ContextPackInput.disclosure}. Default: "open". */
+  disclosure?: ContextDisclosure;
+}
+
+/**
+ * Render a Context Pack into the child prompt.
+ *
+ * `pack.claims` is deliberately NOT rendered: the acceptance claims stay in the
+ * data model and are enforced verifier-side by the proof gate. Handing the
+ * child the exact strings it will be graded against invites Goodharting —
+ * writing to the rubric instead of solving the problem.
+ */
+export function renderContextPackForPrompt(
+  pack: ContextPack,
+  options: RenderContextPackOptions = {},
+): string {
+  const blindFirst = options.disclosure === "blind-first";
   const lines = [
     "## Context Pack",
     `Goal: ${pack.goal}`,
     `Authorization: ${pack.authorization}`,
   ];
 
-  for (const fact of pack.knownFacts) {
+  const factLines = pack.knownFacts.map((fact) => {
     const reference = fact.reference ? ` (${fact.reference})` : "";
-    lines.push(`Fact: [${fact.source}] ${fact.statement}${reference}`);
-  }
+    return `Fact: [${fact.source}] ${fact.statement}${reference}`;
+  });
+  const decisionLines = pack.decisions.map((decision) => {
+    const rationale = decision.rationale ? ` — ${decision.rationale}` : "";
+    return `Decision: ${decision.statement}${rationale}`;
+  });
+
+  if (!blindFirst) lines.push(...factLines);
   for (const unknown of pack.unknowns) {
     lines.push(`Unknown: ${unknown}`);
   }
-  for (const decision of pack.decisions) {
-    const rationale = decision.rationale ? ` — ${decision.rationale}` : "";
-    lines.push(`Decision: ${decision.statement}${rationale}`);
-  }
+  if (!blindFirst) lines.push(...decisionLines);
   for (const reference of pack.references) {
     lines.push(`Reference: ${reference.path} (${reference.digest})`);
   }
@@ -154,19 +182,22 @@ export function renderContextPackForPrompt(pack: ContextPack): string {
       `Evidence: ${evidence.description} (${evidence.reference}${recordedAt})${claimTag}`,
     );
   }
-  if (pack.claims.length > 0) {
-    lines.push("Claims to prove:");
-    for (const claim of pack.claims) {
-      lines.push(`- ${claim}`);
-    }
-  }
   if (pack.learningClaims.length > 0) {
     lines.push("Explicit learning claims to prove:");
     for (const claim of pack.learningClaims) {
       lines.push(`- [${claim.claimId}] ${claim.statement}`);
     }
   }
-  lines.push(`Next step: ${pack.nextStep}`);
+  lines.push(`Suggested entry point (optional, non-binding): ${pack.nextStep}`);
+
+  if (blindFirst && (factLines.length > 0 || decisionLines.length > 0)) {
+    lines.push(
+      "",
+      "### Sealed context — open AFTER you have written your own 5-line read of the problem",
+      ...factLines,
+      ...decisionLines,
+    );
+  }
 
   return lines.join("\n");
 }

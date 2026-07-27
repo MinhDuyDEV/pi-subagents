@@ -114,6 +114,9 @@ export function completeTask(
           caveats: parsed.caveats,
           next_steps: parsed.next_steps,
           confidence: parsed.confidence,
+          ...(parsed.needs_decision
+            ? { needs_decision: parsed.needs_decision }
+            : {}),
           duration_ms: durationMs,
           tool_uses: task.toolUses,
           turn_count: task.turns,

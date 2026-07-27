@@ -46,7 +46,11 @@ export async function stopOwnedTask(
     (candidate) => candidate.taskId === taskId,
   );
   if (run?.lease) {
-    await releaseResourceLease({ storePath: paths.leaseStore, leaseId: run.lease.id });
+    await releaseResourceLease({
+      storePath: paths.leaseStore,
+      leaseId: run.lease.id,
+      expectedOwner: run.lease.owner,
+    });
   }
   if (run && !["completed", "failed", "cancelled", "timeout"].includes(run.executionPhase)) {
     await patchDurableRun(paths.runStore, run.invocationId, {

@@ -13,7 +13,11 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { Type, type TSchema } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { acquireResourceLease } from "../src/orchestration/claims.ts";
+import {
+  acquireResourceLease,
+  assertNoConflictingWrite,
+  transferResourceLeaseOwnership,
+} from "../src/orchestration/claims.ts";
 import {
   CHILD_CLAIM_GUARD_ENV,
   createTaskRuntime,
@@ -139,6 +143,51 @@ describe("child write-claim guard (S-A)", () => {
     await expect(
       guard(
         { toolName: "edit", input: { path: join(projectDirectory, "src/auth/token.ts") } },
+        { cwd: projectDirectory },
+      ),
+    ).resolves.toBeUndefined();
+  });
+
+  it("deliberately does not check fences — ownership against the live store is the property", async () => {
+    // The parent renews and transfers the lease on the child's behalf, so the
+    // child cannot know its current fence. The guard therefore allows a write
+    // under a lease generation the fence check would refuse, as long as the
+    // covering lease still belongs to one of the child's identities. This test
+    // locks that intentional behavior (see registerChildWriteClaimGuard).
+    const projectDirectory = await createProject();
+    const { guard, leaseStore } = await bootChild(projectDirectory, [
+      "task-child",
+      "invocation-child",
+    ]);
+
+    const issued = await acquireResourceLease({
+      storePath: leaseStore,
+      owner: "invocation-child",
+      claims: [{ kind: "write", resource: "src/auth/**", mode: "exclusive" }],
+    });
+    // Launch-time ownership alignment bumps the fence past the issued one.
+    await transferResourceLeaseOwnership({
+      storePath: leaseStore,
+      leaseId: issued.id,
+      owner: "task-child",
+      expectedOwner: "invocation-child",
+    });
+
+    // A fence-aware caller holding the issued generation is refused…
+    await expect(
+      assertNoConflictingWrite({
+        storePath: leaseStore,
+        ownerTaskId: "task-child",
+        path: "src/auth/token.ts",
+        fence: issued.fence,
+      }),
+    ).rejects.toThrow(/lease was superseded/u);
+
+    // …but the child guard, which owns the lease under its task identity,
+    // still allows the write.
+    await expect(
+      guard(
+        { toolName: "write", input: { path: join(projectDirectory, "src/auth/token.ts") } },
         { cwd: projectDirectory },
       ),
     ).resolves.toBeUndefined();

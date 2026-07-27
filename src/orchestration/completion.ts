@@ -278,7 +278,13 @@ export async function releaseLeaseAndRecord(
   orchestrationId: string,
   lease: ResourceLease,
 ): Promise<void> {
-  await releaseResourceLease({ storePath: paths.leaseStore, leaseId: lease.id });
+  await releaseResourceLease({
+    storePath: paths.leaseStore,
+    leaseId: lease.id,
+    // The owner recorded on the lease we are holding. A mismatch means the
+    // lease was re-issued to someone else and must NOT be dropped from here.
+    expectedOwner: lease.owner,
+  });
   await appendOrchestrationEvent({
     eventPath: paths.eventLog,
     event: {

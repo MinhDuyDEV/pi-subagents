@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Added
 - _Development cycle for 0.6.0._
 
+## [0.8.1] - 2026-07-27
+
+Redesign of the task-giving language layer: the subagent stays an independent problem-solver (anti pre-solve/worker-ization). The evidence/proof/review kernel (leases, fencing, proof gate, review binding) is semantically unchanged.
+
+### Added
+- `reframed` as a first-class reported status in the result envelope (`<status>reframed</status>`): the delegated framing was wrong and the agent delivered the corrected framing. Surfaced to the parent as a valid outcome, not a failure. All prior statuses parse unchanged.
+- Optional `<needs_decision>` result tag: a disputed premise or a parent-only decision with options and tradeoffs. Parsed into `ParsedResult.needs_decision`, exposed in completion details and the task result UI. No agent is required to use it.
+- Optional `orchestration.context.disclosure: "blind-first"`: seals `known_facts`/`decisions` behind a "Sealed context — open AFTER you have written your own 5-line read of the problem" block placed after the goal, frontier, and policy. Default keeps the previous inline rendering. The option is render-time only and is not persisted in the Context Pack.
+- Test locking the child write-claim guard's deliberate no-fence-check behavior: ownership against the live store is the enforced property, since the parent renews/transfers the lease on the child's behalf.
+
+### Changed
+- Governed-outcome prompt contract in the `task` tool description and prompt schema: Outcome (observable behavior, not an implementation), Frontier (what the agent owns deciding), Locked decisions (each with rationale and an unlock condition), Acceptance (what evidence would convince a skeptic; the agent chooses how), plus the existing non-goals and write/read policy. Parents are told not to hand the agent a verification recipe, a chosen architecture, or pre-named acceptance criteria unless genuinely locked.
+- Anti-Goodhart child rendering: `context.claims` are no longer rendered into the child prompt (they stay in the data model and are enforced verifier-side by the proof gate), and `next_step` renders as "Suggested entry point (optional, non-binding)".
+- `expectedOwner` is now REQUIRED on `releaseResourceLease` and `transferResourceLeaseOwnership`; all runtime call sites pass the owner recorded on the lease they hold. System-side reaping of dead owners remains `releaseOrphanedLeases`, which proves liveness instead of ownership.
+- The launch-time lease heartbeat routes a failed renewal through the same `abandonLostLease` path as the main heartbeat (durable `blocked` phase, `claim_lease_lost` event, lease-lost notification) instead of returning silently.
+- The doctor's delegation-contract check accepts the governed-outcome dialect (`Outcome`/`Acceptance`) alongside the legacy recipe dialect (`Goal`/`Expected output`/`Stop condition`/`Verification recipe`).
+- README and the packaged `pi-subagents` skill document the governed-outcome contract, `reframed`, `needs_decision`, and blind-first disclosure.
+
 ## [0.5.0] - 2026-07-23
 
 ### Added

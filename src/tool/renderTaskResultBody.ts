@@ -16,6 +16,7 @@ export type TaskResultDetails = {
   files?: string;
   caveats?: string;
   next_steps?: string;
+  needs_decision?: string;
   structured_result?: boolean;
   full_output?: string;
 };
@@ -70,6 +71,7 @@ export function renderTaskResultBody(
       appendBlock(container, theme, "Files", details.files, tight);
       appendBlock(container, theme, "Caveats", details.caveats, tight);
       appendBlock(container, theme, "Next steps", details.next_steps, tight);
+      appendBlock(container, theme, "Needs decision", details.needs_decision, tight);
     } else if (plainBody) {
       for (const line of plainBody.split("\n")) {
         container.addChild(new Text(prefixResultLine(line, tight), 0, 0));
@@ -128,7 +130,8 @@ function hasStructuredTaskDetails(details: TaskResultDetails): boolean {
       details.evidence ||
       details.files ||
       details.caveats ||
-      details.next_steps,
+      details.next_steps ||
+      details.needs_decision,
   );
 }
 

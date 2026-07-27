@@ -266,6 +266,36 @@ describe("lease ownership (S-B)", () => {
     expect(current?.owner).toBe("task-b");
   });
 
+  it("requires the expected owner on release and transfer — no anonymous drops", async () => {
+    const storePath = await createStorePath();
+    const now = new Date("2026-07-26T00:00:00.000Z");
+    const lease = await acquireResourceLease({
+      storePath,
+      owner: "task-owner",
+      claims: [{ kind: "write", resource: "src/**", mode: "exclusive" }],
+      now,
+    });
+
+    // The parameter is required at the type level; the runtime check backs it
+    // for JS callers. System-side reaping of dead owners goes through
+    // releaseOrphanedLeases, which proves liveness instead of ownership.
+    await expect(
+      releaseResourceLease({ storePath, leaseId: lease.id, expectedOwner: "", now }),
+    ).rejects.toThrow(/requires the expected owner/u);
+    await expect(
+      transferResourceLeaseOwnership({
+        storePath,
+        leaseId: lease.id,
+        owner: "task-next",
+        expectedOwner: "",
+        now,
+      }),
+    ).rejects.toThrow(/requires the expected current owner/u);
+
+    // The lease survived both refused attempts.
+    await expect(listActiveResourceLeases({ storePath, now })).resolves.toHaveLength(1);
+  });
+
   it("reaps orphans under a single lock, sparing a lease acquired under an invocation id", async () => {
     const storePath = await createStorePath();
     const now = new Date("2026-07-26T00:00:00.000Z");

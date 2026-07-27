@@ -37,7 +37,7 @@ Then delegate:
 {
   "agent_type": "general",
   "description": "Fix auth race",
-  "prompt": "Goal: fix the auth race. Non-goals: no API redesign. Stop when focused tests pass. Verification: run the auth test suite.",
+  "prompt": "Outcome: concurrent logins never mint two sessions for one user. Frontier: you own the fix approach and the test strategy. Locked: keep the public auth API stable — downstream consumers pin it; challenge this if you find evidence the API itself causes the race. Acceptance: evidence that would convince a skeptic the race is gone. Non-goals: no API redesign.",
   "background": true
 }
 ```
@@ -62,13 +62,31 @@ Core parameters:
 |---|---|
 | `agent_type` | consumer profile name |
 | `description` | short task title |
-| `prompt` | complete, self-contained brief |
+| `prompt` | governed-outcome brief: self-contained about context, not pre-solved about solution |
 | `background` | defaults to `true`; `false` waits foreground |
 | `task_id` | resume an existing task |
 | `conversation_id` | durable specialist conversation |
 | `workspace_group` | put related Herdr tasks in one owned workspace |
 | `isolation: "worktree"` | run in a dedicated Git worktree |
 | `orchestration` | optional durable coordination and verification |
+
+### Prompt contract (governed outcome)
+
+The prompt hands the agent an outcome to govern, not a recipe to execute:
+
+- **Outcome** — the governed outcome wanted, stated as observable behavior, not an implementation.
+- **Frontier** — the open questions the agent OWNS deciding (approach, design within scope, test strategy).
+- **Locked decisions** — constraints that stand, each WITH rationale and an unlock condition ("locked because X; challenge it if you find evidence Y").
+- **Acceptance** — what evidence would convince a skeptic the outcome holds; the agent chooses HOW to produce it.
+- **Non-goals** and **write/read policy** — scope and mutation boundaries.
+
+Do not hand the agent a verification recipe, a chosen architecture, or pre-named acceptance criteria unless they are genuinely locked; every locked item must carry its rationale. This keeps the subagent an independent problem-solver rather than a worker executing a pre-solved plan.
+
+### Result envelope: `reframed` and `needs_decision`
+
+The child's XML result envelope accepts `<status>success | failure | blocked | partial | reframed</status>`. `reframed` is a first-class, valid outcome — the delegated framing was wrong and the agent delivered the corrected framing instead (with summary/findings as usual). It is surfaced to the parent as a legitimate result, not a failure.
+
+A child may also emit an optional `<needs_decision>` tag: a disputed premise or a decision only the parent can make, with options and tradeoffs. It is parsed into the result details (`needs_decision`) and shown in the task UI. No agent is required to use it.
 
 ### Worktree isolation
 
@@ -161,7 +179,16 @@ Claims are acquired before launch and transferred to the canonical task ID. Acti
 
 ### Context Packs
 
-Context Packs are versioned, secret-redacted and project-scoped. File references include SHA-256 digests; out-of-project references are rejected. Stored context is reused on resume. Add a handoff with `task_control`:
+Context Packs are versioned, secret-redacted and project-scoped. File references include SHA-256 digests; out-of-project references are rejected. Stored context is reused on resume.
+
+Two anti-Goodhart properties of the child-visible rendering:
+
+- `context.claims` (acceptance claims) are **never rendered into the child prompt**. They stay in the data model and are enforced verifier-side by the proof gate, so the child cannot write to the rubric instead of solving the problem.
+- `context.next_step` renders as "Suggested entry point (optional, non-binding)" — a hint, not an instruction.
+
+Optional blind-first disclosure: pass `"disclosure": "blind-first"` in `orchestration.context` and the parent's `known_facts`/`decisions` are sealed behind a "Sealed context — open AFTER you have written your own 5-line read of the problem" block placed after the goal, frontier, and policy. Default (`"open"`) keeps the previous inline rendering.
+
+Add a handoff with `task_control`:
 
 ```json
 {

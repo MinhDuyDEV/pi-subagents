@@ -10,6 +10,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolveAgentToolAllowlist } from "../src/agent-tools.js";
 import {
+  assessTaskResult,
+  buildTaskEnvelope,
   parseResultXml,
   extractTag,
   formatMs,
@@ -138,6 +140,75 @@ import {
   const r = parseResultXml(raw);
   assert.ok(r.findings.includes("Need auth first"), t);
   assert.ok(r.findings.includes("Use session cookies"), t + " decisions");
+}
+
+{
+  const t = "reframed is a first-class, valid reported status — not a failure";
+  const r = parseResultXml(
+    [
+      "<status>reframed</status>",
+      "<summary>The bug was in the caller, not the parser; fixed there instead.</summary>",
+      "<findings>The parser already handled the case.</findings>",
+    ].join("\n"),
+  );
+  assert.equal(r.status, "reframed", t + " status");
+  const assessment = assessTaskResult(r);
+  assert.equal(assessment.reportedStatus, "reframed", t + " reported status");
+  assert.equal(assessment.valid, true, t + " valid");
+}
+
+{
+  const t = "legacy statuses still parse and assess unchanged";
+  for (const status of ["success", "failure", "blocked", "partial"]) {
+    const r = parseResultXml(`<status>${status}</status>\n<summary>s</summary>`);
+    const assessment = assessTaskResult(r);
+    assert.equal(assessment.reportedStatus, status, `${t}: ${status}`);
+    assert.equal(assessment.valid, true, `${t}: ${status} valid`);
+  }
+  const bogus = assessTaskResult(
+    parseResultXml("<status>bogus</status>\n<summary>s</summary>"),
+  );
+  assert.equal(bogus.reportedStatus, "unknown", t + " bogus maps to unknown");
+}
+
+{
+  const t = "parseResultXml exposes the optional needs_decision channel";
+  const r = parseResultXml(
+    [
+      "<status>blocked</status>",
+      "<summary>Two viable schema layouts.</summary>",
+      "<needs_decision>Premise in dispute: single-table vs split. Option A is simpler; Option B scales.</needs_decision>",
+    ].join("\n"),
+  );
+  assert.equal(
+    r.needs_decision,
+    "Premise in dispute: single-table vs split. Option A is simpler; Option B scales.",
+    t + " content",
+  );
+
+  const withoutTag = parseResultXml("<status>success</status>\n<summary>ok</summary>");
+  assert.equal(withoutTag.needs_decision, undefined, t + " absent when not emitted");
+
+  const envelope = buildTaskEnvelope(r, {
+    agent_type: "general",
+    description: "schema decision",
+    tool_uses: 1,
+    duration_ms: 10,
+    background: true,
+  });
+  assert.equal(
+    envelope.details.needs_decision,
+    r.needs_decision,
+    t + " exposed in envelope details",
+  );
+  const plainEnvelope = buildTaskEnvelope(withoutTag, {
+    agent_type: "general",
+    description: "no decision",
+    tool_uses: 1,
+    duration_ms: 10,
+    background: true,
+  });
+  assert.ok(!("needs_decision" in plainEnvelope.details), t + " omitted when absent");
 }
 
 {
@@ -1074,16 +1145,24 @@ import {
         t + " requires verification",
       );
       for (const required of [
-        "Goal: the exact outcome wanted",
+        "Outcome: the governed outcome wanted, stated as observable behavior — not an implementation",
+        "Frontier: the open questions the agent OWNS deciding",
+        "Locked decisions: constraints that stand, each WITH rationale and an unlock condition",
+        "Acceptance: what evidence would convince a skeptic the outcome holds",
         "Non-goals: what to avoid or leave untouched",
         "Write/read policy",
-        "Stop condition",
-        "Verification recipe",
+        "every locked item must carry its rationale",
         "Fan-out and synthesize",
         "Adversarial verification",
       ]) {
         assert.ok(TASK_TOOL_DESCRIPTION.includes(required), `${t}: includes ${required}`);
       }
+      // The governed-outcome contract does not ask the parent to hand the
+      // agent a verification recipe — it names it only to forbid it.
+      assert.ok(
+        !TASK_TOOL_DESCRIPTION.includes("Verification recipe:"),
+        `${t}: no verification-recipe bullet`,
+      );
     }
 
 

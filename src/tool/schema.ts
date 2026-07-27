@@ -7,7 +7,7 @@ export function taskParametersSchema() {
     }),
     prompt: Type.String({
       description:
-        "The complete task for the agent to perform. Be detailed and self-contained. Include goal, non-goals, write/read policy, stop condition, and verification recipe.",
+        "The complete task for the agent to perform. Self-contained about context, not pre-solved about solution. State the governed outcome (observable behavior, not an implementation), the frontier the agent owns deciding, locked decisions (each with rationale and an unlock condition), acceptance (what evidence would convince a skeptic), non-goals, and write/read policy.",
     }),
         description: Type.String({
           description: "A short (3-5 word) summary of the task",

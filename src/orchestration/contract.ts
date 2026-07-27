@@ -102,6 +102,9 @@ const ContextPackInputSchema = Type.Object(
     claims: Type.Optional(Type.Array(Type.String())),
     learning_claims: Type.Optional(Type.Array(LearningClaimSchema, { maxItems: 32 })),
     next_step: Type.String({ minLength: 1 }),
+    disclosure: Type.Optional(
+      Type.Union([Type.Literal("open"), Type.Literal("blind-first")]),
+    ),
   },
   { additionalProperties: false },
 );
@@ -296,6 +299,7 @@ function normalizeContext(
       ? { learningClaims: parseLearningClaims(context.learning_claims) }
       : {}),
     nextStep: context.next_step,
+    ...(context.disclosure ? { disclosure: context.disclosure } : {}),
   };
 }
 

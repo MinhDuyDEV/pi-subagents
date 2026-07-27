@@ -242,6 +242,7 @@ describe("resource claims", () => {
       storePath,
       leaseId: lease.id,
       owner: "task-canonical",
+      expectedOwner: "run-preflight",
     });
 
     expect(transferred?.owner).toBe("task-canonical");
@@ -258,7 +259,13 @@ describe("resource claims", () => {
       claims: [{ kind: "write", resource: "package/src", mode: "exclusive" }],
     });
 
-    expect(await releaseResourceLease({ storePath, leaseId: lease.id })).toBe(true);
+    expect(
+      await releaseResourceLease({
+        storePath,
+        leaseId: lease.id,
+        expectedOwner: "task-alpha",
+      }),
+    ).toBe(true);
     expect(await listActiveResourceLeases({ storePath })).toEqual([]);
 
     const persisted = JSON.parse(await readFile(storePath, "utf8")) as {

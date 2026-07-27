@@ -22,11 +22,21 @@ Use the `task` tool for delegation. Agent profiles belong to the consumer's `.pi
 
 ## Delegate
 
+Write the prompt as a governed outcome, not a recipe:
+
+- Outcome: the governed outcome, stated as observable behavior — not an implementation.
+- Frontier: the open questions the agent owns deciding (approach, design within scope, test strategy).
+- Locked decisions: each with rationale and an unlock condition ("locked because X; challenge it if you find evidence Y").
+- Acceptance: what evidence would convince a skeptic — the agent chooses how to produce it.
+- Non-goals and write/read policy.
+
+Do not hand the agent a verification recipe, a chosen architecture, or pre-named acceptance criteria unless they are genuinely locked; every locked item must carry its rationale.
+
 ```json
 {
   "agent_type": "general",
   "description": "Implement auth fix",
-  "prompt": "Goal: fix the auth race. Non-goals: no API redesign. Stop when focused tests pass. Return summary, files, evidence, caveats, and next steps.",
+  "prompt": "Outcome: concurrent logins never mint two sessions for one user. Frontier: you own the fix approach and the test strategy. Locked: keep the public auth API stable — downstream consumers pin it; challenge this if the API itself causes the race. Acceptance: evidence that would convince a skeptic the race is gone. Non-goals: no API redesign.",
   "background": true,
   "isolation": "worktree",
   "orchestration": {
@@ -50,7 +60,13 @@ Use the `task` tool for delegation. Agent profiles belong to the consumer's `.pi
 }
 ```
 
+`context.claims` are verifier-side acceptance claims for the proof gate; they are never rendered into the child prompt, so the child cannot write to the rubric. `context.next_step` renders as a non-binding suggested entry point. Add `"disclosure": "blind-first"` to `context` to seal `known_facts`/`decisions` behind a block the agent opens only after writing its own read of the problem.
+
 Write claims must be exclusive and project-relative. Claims coordinate ownership; worktrees provide write isolation. The source repository must be clean before worktree launch. After gates pass, use `task_control` `worktree_status` and `worktree_merge`; use `worktree_remove` only to explicitly discard retained changes.
+
+## Read the result
+
+The child reports `<status>success | failure | blocked | partial | reframed</status>`. Treat `reframed` as a valid outcome, not a failure: the delegated framing was wrong and the agent delivered the corrected framing — read summary/findings for the reframe. An optional `<needs_decision>` field carries a disputed premise or a decision only you can make (options with tradeoffs); resolve it before relaunching or steering.
 
 ## Parallel group
 
@@ -117,6 +133,7 @@ Human commands:
 /task-metrics
 /task-schedules
 /task-unschedule <schedule-id>
+/task-sessions
 ```
 
 Model-facing `task_control` actions provide status, result, handoff, `record_evidence`, verify, metrics, doctor, review, ship, release, reap, and explicit worktree status/merge/removal. Prefer human commands for destructive operations.
@@ -132,4 +149,4 @@ Do not use raw pane text as the final result. Do not close a pane unless its per
 
 ## More detail
 
-Read [references/contract.md](references/contract.md) for the state model, evidence rules, RPC protocol, artifacts, environment variables, and Herdr behavior.
+Read [references/contract.md](references/contract.md) for the state model, evidence rules, RPC protocol, artifacts, environment variables, and Herdr behavior. When running inside a Herdr-managed workspace, read [references/herdr-room.md](references/herdr-room.md) for pane placement by task shape, the claim-serialization pane-race fix, grouped-completion UX, and writer discipline defaults.

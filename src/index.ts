@@ -816,6 +816,9 @@ export default function (pi: ExtensionAPI) {
                           caveats: parsed.caveats,
                           next_steps: parsed.next_steps,
                           confidence: parsed.confidence,
+                          ...(parsed.needs_decision
+                            ? { needs_decision: parsed.needs_decision }
+                            : {}),
                           duration_ms: Date.now() - backgroundTask.startedAt,
                           tool_uses: backgroundTask.toolUses,
                           turn_count: backgroundTask.turns,
