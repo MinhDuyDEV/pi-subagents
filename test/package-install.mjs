@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 
 const repository = resolve(fileURLToPath(new URL("..", import.meta.url)));
+const localCore = resolve(repository, "..", "pi-core");
 const temporary = await mkdtemp(join(tmpdir(), "pi-subagents-install-"));
 let tarball;
 try {
@@ -21,7 +22,10 @@ try {
     join(temporary, "package.json"),
     JSON.stringify({ name: "pi-subagents-install-test", private: true, type: "module" }),
   );
-  execFileSync("npm", ["install", "--ignore-scripts", tarball], {
+  if (!existsSync(join(localCore, "package.json"))) {
+    throw new Error("package install test requires the sibling pi-core checkout");
+  }
+  execFileSync("npm", ["install", "--ignore-scripts", "--no-audit", "--no-fund", localCore, tarball], {
     cwd: temporary,
     encoding: "utf8",
     stdio: "inherit",

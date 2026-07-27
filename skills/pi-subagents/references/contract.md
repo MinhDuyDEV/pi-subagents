@@ -6,7 +6,9 @@ A delegation prompt hands the agent an outcome to govern, not a recipe to execut
 
 - Outcome: observable behavior wanted, not an implementation.
 - Frontier: the open questions the agent owns deciding.
-- Locked decisions: each with rationale and an unlock condition.
+- Locked decisions: each with rationale and an unlock condition. The public
+  `context.decisions` and `task_control.handoff.decisions` shapes use
+  `unlock_condition`; it is persisted as `unlockCondition` in the internal pack.
 - Acceptance: what evidence would convince a skeptic; the agent chooses how.
 - Non-goals and write/read policy.
 

@@ -47,6 +47,7 @@ const HandoffSchema = Type.Object(
           {
             statement: Type.String({ minLength: 1 }),
             rationale: Type.Optional(Type.String()),
+            unlock_condition: Type.Optional(Type.String()),
           },
           { additionalProperties: false },
         ),
@@ -968,7 +969,15 @@ function normalizeHandoff(
 ): ContextHandoffPatch {
   return {
     ...(handoff.decisions
-      ? { decisions: handoff.decisions.map((decision) => ({ ...decision })) }
+      ? {
+          decisions: handoff.decisions.map((decision) => ({
+            statement: decision.statement,
+            ...(decision.rationale ? { rationale: decision.rationale } : {}),
+            ...(decision.unlock_condition
+              ? { unlockCondition: decision.unlock_condition }
+              : {}),
+          })),
+        }
       : {}),
     ...(handoff.evidence
       ? {

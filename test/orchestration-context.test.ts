@@ -99,7 +99,11 @@ describe("Context Pack and Handoff", () => {
         authorization: "read-only",
         knownFacts: [{ statement: "Current disk wins.", source: "repository" }],
         unknowns: ["Whether the upstream registry is populated."],
-        decisions: [{ statement: "Use a thin wrapper.", rationale: "Avoid a fork." }],
+        decisions: [{
+          statement: "Use a thin wrapper.",
+          rationale: "Avoid a fork.",
+          unlockCondition: "A measured cold-start regression exceeds 10%.",
+        }],
         evidence: [
           {
             description: "Focused lifecycle test failed before implementation.",
@@ -114,7 +118,9 @@ describe("Context Pack and Handoff", () => {
     const rendered = renderContextPackForPrompt(pack);
     expect(rendered).toContain("[repository] Current disk wins.");
     expect(rendered).toContain("Unknown: Whether the upstream registry is populated.");
-    expect(rendered).toContain("Decision: Use a thin wrapper. — Avoid a fork.");
+    expect(rendered).toContain(
+      "Decision: Use a thin wrapper. — Avoid a fork. (unlock if: A measured cold-start regression exceeds 10%.)",
+    );
     expect(rendered).toContain("Evidence: Focused lifecycle test failed");
     expect(rendered).toContain(
       "Suggested entry point (optional, non-binding): Resolve the nested session.",

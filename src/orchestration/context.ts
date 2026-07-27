@@ -35,6 +35,8 @@ export interface ContextFact {
 export interface ContextDecision {
   statement: string;
   rationale?: string;
+  /** Observable evidence that would justify revisiting this locked decision. */
+  unlockCondition?: string;
 }
 
 export interface ContextEvidence {
@@ -164,7 +166,10 @@ export function renderContextPackForPrompt(
   });
   const decisionLines = pack.decisions.map((decision) => {
     const rationale = decision.rationale ? ` — ${decision.rationale}` : "";
-    return `Decision: ${decision.statement}${rationale}`;
+    const unlock = decision.unlockCondition
+      ? ` (unlock if: ${decision.unlockCondition})`
+      : "";
+    return `Decision: ${decision.statement}${rationale}${unlock}`;
   });
 
   if (!blindFirst) lines.push(...factLines);
@@ -352,6 +357,9 @@ function redactDecision(decision: ContextDecision): ContextDecision {
     ...(decision.rationale
       ? { rationale: redactSensitiveText(decision.rationale) }
       : {}),
+    ...(decision.unlockCondition
+      ? { unlockCondition: redactSensitiveText(decision.unlockCondition) }
+      : {}),
   };
 }
 
@@ -431,7 +439,8 @@ function isContextDecision(value: unknown): value is ContextDecision {
   return (
     isRecord(value) &&
     typeof value.statement === "string" &&
-    (value.rationale === undefined || typeof value.rationale === "string")
+    (value.rationale === undefined || typeof value.rationale === "string") &&
+    (value.unlockCondition === undefined || typeof value.unlockCondition === "string")
   );
 }
 

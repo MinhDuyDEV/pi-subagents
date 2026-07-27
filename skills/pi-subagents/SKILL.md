@@ -50,7 +50,13 @@ Do not hand the agent a verification recipe, a chosen architecture, or pre-named
       "authorization": "write-approved",
       "known_facts": [],
       "unknowns": [],
-      "decisions": [],
+      "decisions": [
+        {
+          "statement": "Keep the public auth API stable",
+          "rationale": "Downstream consumers pin it",
+          "unlock_condition": "A focused test proves the public API causes the race"
+        }
+      ],
       "references": [{ "path": "src/auth/index.ts" }],
       "evidence": [],
       "claims": ["Auth race is fixed", "Focused auth tests pass"],
