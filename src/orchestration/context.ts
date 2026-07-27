@@ -8,6 +8,10 @@ import {
 } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { parseLearningClaims, type LearningClaimV1 } from "../learning-contract.js";
+import {
+  parseWorkflowCheckpoint,
+  type HandoffPackV1,
+} from "@minhduydev/pi-core/workflow";
 import { withFileLock } from "./file-lock.js";
 
 const CONTEXT_PACK_VERSION = 1;
@@ -49,6 +53,11 @@ export interface ContextEvidence {
   source?: "declared" | "runtime-receipt" | "runtime-session";
   receiptKind?: "file" | "test" | "command-output" | "session" | "diff";
   exitCode?: number;
+  /** Runtime-observed command metadata. Never populated from child prose. */
+  command?: string;
+  cwd?: string;
+  toolCallId?: string;
+  sessionDigest?: string;
 }
 
 export interface ContextReferenceInput {
@@ -62,6 +71,26 @@ export interface ContextReference {
 
 export type ContextDisclosure = "open" | "blind-first";
 
+export interface BlindOrientationRecord {
+  text: string;
+  digest: string;
+  recordedAt: string;
+}
+
+export interface BlindDisclosureState {
+  phase:
+    | "awaiting-orientation"
+    | "orientation-recorded"
+    | "continuation-dispatching"
+    | "continuation-started";
+  orientation?: BlindOrientationRecord;
+  continuationAttemptId?: string;
+  continuationCorrelationId?: string;
+  continuationDispatchStartedAt?: string;
+  continuationStartedAt?: string;
+  continuedInvocationId?: string;
+}
+
 export interface ContextPackInput {
   goal: string;
   authorization: ContextAuthorization;
@@ -74,9 +103,8 @@ export interface ContextPackInput {
   learningClaims?: readonly LearningClaimV1[];
   nextStep: string;
   /**
-   * Render-time option, not persisted in the Context Pack. "blind-first" seals
-   * the parent's facts and decisions behind a block the agent is told to open
-   * only after forming its own read of the problem. Default: "open".
+   * Durable disclosure policy.  "blind-first" requires a separate orientation
+   * turn before any facts, decisions, evidence, or acceptance claims are sent.
    */
   disclosure?: ContextDisclosure;
 }
@@ -97,6 +125,10 @@ export interface ContextPack {
   claims: string[];
   learningClaims: LearningClaimV1[];
   nextStep: string;
+  disclosure: ContextDisclosure;
+  blindDisclosure?: BlindDisclosureState;
+  /** Canonical fourteen-section handoffs shared with the harness. */
+  workflowHandoffs: HandoffPackV1[];
 }
 
 export interface ContextHandoffPatch {
@@ -104,6 +136,7 @@ export interface ContextHandoffPatch {
   evidence?: readonly ContextEvidence[];
   unknowns?: readonly string[];
   nextStep?: string;
+  workflowHandoff?: HandoffPackV1;
 }
 
 export async function buildContextPack(input: {
@@ -133,11 +166,16 @@ export async function buildContextPack(input: {
     claims: (input.input.claims ?? []).map(redactSensitiveText),
     learningClaims: parseLearningClaims(input.input.learningClaims),
     nextStep: redactSensitiveText(input.input.nextStep),
+    disclosure: input.input.disclosure ?? "open",
+    ...(input.input.disclosure === "blind-first"
+      ? { blindDisclosure: { phase: "awaiting-orientation" as const } }
+      : {}),
+    workflowHandoffs: [],
   };
 }
 
 export interface RenderContextPackOptions {
-  /** See {@link ContextPackInput.disclosure}. Default: "open". */
+  /** @deprecated Disclosure is persisted on the Context Pack. */
   disclosure?: ContextDisclosure;
 }
 
@@ -153,7 +191,21 @@ export function renderContextPackForPrompt(
   pack: ContextPack,
   options: RenderContextPackOptions = {},
 ): string {
-  const blindFirst = options.disclosure === "blind-first";
+  const disclosure = options.disclosure ?? pack.disclosure;
+  const blindFirst = disclosure === "blind-first";
+  if (
+    blindFirst &&
+    (pack.blindDisclosure?.phase ?? "awaiting-orientation") ===
+      "awaiting-orientation"
+  ) {
+    return [
+      "## Blind-first orientation turn",
+      `Outcome: ${pack.goal}`,
+      `Authorization: ${pack.authorization}`,
+      "Parent context is intentionally withheld for this turn.",
+      "Return your independent problem read, uncertainties, and proposed frontier only; do not implement or verify yet.",
+    ].join("\n");
+  }
   const lines = [
     "## Context Pack",
     `Goal: ${pack.goal}`,
@@ -172,35 +224,48 @@ export function renderContextPackForPrompt(
     return `Decision: ${decision.statement}${rationale}${unlock}`;
   });
 
-  if (!blindFirst) lines.push(...factLines);
+  lines.push(...factLines);
   for (const unknown of pack.unknowns) {
     lines.push(`Unknown: ${unknown}`);
   }
-  if (!blindFirst) lines.push(...decisionLines);
+  lines.push(...decisionLines);
   for (const reference of pack.references) {
     lines.push(`Reference: ${reference.path} (${reference.digest})`);
   }
   for (const evidence of pack.evidence) {
     const recordedAt = evidence.recordedAt ? ` @ ${evidence.recordedAt}` : "";
-    const claimTag = evidence.claim ? ` [claim: ${evidence.claim}]` : "";
     lines.push(
-      `Evidence: ${evidence.description} (${evidence.reference}${recordedAt})${claimTag}`,
+      `Evidence receipt: ${evidence.description} (${evidence.reference}${recordedAt})`,
     );
-  }
-  if (pack.learningClaims.length > 0) {
-    lines.push("Explicit learning claims to prove:");
-    for (const claim of pack.learningClaims) {
-      lines.push(`- [${claim.claimId}] ${claim.statement}`);
-    }
   }
   lines.push(`Suggested entry point (optional, non-binding): ${pack.nextStep}`);
 
-  if (blindFirst && (factLines.length > 0 || decisionLines.length > 0)) {
+  if (blindFirst && pack.blindDisclosure?.orientation) {
     lines.push(
       "",
-      "### Sealed context — open AFTER you have written your own 5-line read of the problem",
-      ...factLines,
-      ...decisionLines,
+      "## Your independently recorded orientation",
+      pack.blindDisclosure.orientation.text,
+    );
+  }
+  for (const handoff of pack.workflowHandoffs) {
+    lines.push(
+      "",
+      `## Canonical handoff: ${handoff.title}`,
+      `Receiver: ${handoff.receiver}`,
+      `Goal: ${handoff.goal}`,
+      `Current state: ${handoff.currentState}`,
+      ...handoff.verified.map((item) => `Verified: ${item}`),
+      ...handoff.unknowns.map((item) => `Unknown: ${item}`),
+      ...handoff.realConstraints.map((item) => `Real constraint: ${item}`),
+      ...handoff.relevantFiles.map((item) => `Relevant file: ${item}`),
+      ...handoff.closedDecisions.map((item) => `Closed decision: ${item}`),
+      ...handoff.openDecisions.map((item) => `Open decision: ${item}`),
+      ...handoff.existingEvidence.map((item) => `Existing evidence: ${item}`),
+      `Expected deliverable: ${handoff.expectedDeliverable}`,
+      ...handoff.permissions.map((item) => `Permission: ${item}`),
+      ...handoff.antiPatterns.map((item) => `Anti-pattern: ${item}`),
+      `Next step: ${handoff.nextStep}`,
+      `Resume keys: task=${handoff.resumeKeys.taskId ?? "none"}, conversation=${handoff.resumeKeys.conversationId ?? "none"}`,
     );
   }
 
@@ -229,7 +294,7 @@ export async function loadContextPack(input: {
     if (!isContextPack(value)) {
       throw new Error(`Invalid Context Pack: ${path}`);
     }
-    return value;
+    return normalizeStoredContextPack(value);
   } catch (error) {
     if (isNodeError(error) && error.code === "ENOENT") {
       return undefined;
@@ -273,6 +338,155 @@ export async function updateContextHandoff(input: {
           input.patch.nextStep === undefined
             ? current.nextStep
             : redactSensitiveText(input.patch.nextStep),
+        workflowHandoffs: input.patch.workflowHandoff
+          ? [
+              ...current.workflowHandoffs.filter(
+                (handoff) =>
+                  handoff.recordId !== input.patch.workflowHandoff?.recordId,
+              ),
+              structuredClone(input.patch.workflowHandoff),
+            ]
+          : current.workflowHandoffs,
+      };
+      await writeContextPack(path, updated);
+      return updated;
+    },
+  });
+}
+
+/**
+ * Persist the independent first-turn read before the withheld context is made
+ * available.  Retrying the same turn is idempotent; a different orientation
+ * cannot overwrite the already recorded observation.
+ */
+export async function recordBlindOrientation(input: {
+  storeDirectory: string;
+  key: string;
+  text: string;
+  now?: Date;
+}): Promise<ContextPack> {
+  const path = contextPackPath(input.storeDirectory, input.key);
+  return withFileLock({
+    lockPath: `${path}.lock`,
+    operation: async () => {
+      const current = await loadContextPack(input);
+      if (!current) throw new Error(`Context Pack not found: ${input.key}`);
+      if (current.disclosure !== "blind-first") {
+        throw new Error(`Context Pack is not blind-first: ${input.key}`);
+      }
+      const text = redactSensitiveText(input.text.trim());
+      if (!text) throw new Error("Blind-first orientation cannot be empty");
+      const digest = `sha256:${createHash("sha256").update(text).digest("hex")}`;
+      const existing = current.blindDisclosure?.orientation;
+      if (existing) {
+        if (existing.digest !== digest) {
+          throw new Error("Blind-first orientation is immutable once recorded");
+        }
+        return current;
+      }
+      const recordedAt = (input.now ?? new Date()).toISOString();
+      const updated: ContextPack = {
+        ...current,
+        revision: current.revision + 1,
+        updatedAt: recordedAt,
+        blindDisclosure: {
+          phase: "orientation-recorded",
+          orientation: { text, digest, recordedAt },
+        },
+      };
+      await writeContextPack(path, updated);
+      return updated;
+    },
+  });
+}
+
+export async function beginBlindContinuation(input: {
+  storeDirectory: string;
+  key: string;
+  attemptId: string;
+  correlationId: string;
+  now?: Date;
+}): Promise<ContextPack> {
+  const path = contextPackPath(input.storeDirectory, input.key);
+  return withFileLock({
+    lockPath: `${path}.lock`,
+    operation: async () => {
+      const current = await loadContextPack(input);
+      if (!current) throw new Error(`Context Pack not found: ${input.key}`);
+      if (current.disclosure !== "blind-first") return current;
+      if (current.blindDisclosure?.phase === "continuation-started") return current;
+      if (!current.blindDisclosure?.orientation) {
+        throw new Error("Cannot dispatch blind-first continuation before orientation is recorded");
+      }
+      if (current.blindDisclosure.phase === "continuation-dispatching") {
+        if (
+          current.blindDisclosure.continuationAttemptId !== input.attemptId ||
+          current.blindDisclosure.continuationCorrelationId !== input.correlationId
+        ) {
+          throw new Error("Blind-first continuation already has a different dispatch attempt");
+        }
+        return current;
+      }
+      const dispatchStartedAt = (input.now ?? new Date()).toISOString();
+      const updated: ContextPack = {
+        ...current,
+        revision: current.revision + 1,
+        updatedAt: dispatchStartedAt,
+        blindDisclosure: {
+          ...current.blindDisclosure,
+          phase: "continuation-dispatching",
+          continuationAttemptId: input.attemptId,
+          continuationCorrelationId: input.correlationId,
+          continuationDispatchStartedAt: dispatchStartedAt,
+        },
+      };
+      await writeContextPack(path, updated);
+      return updated;
+    },
+  });
+}
+
+export async function markBlindContinuationStarted(input: {
+  storeDirectory: string;
+  key: string;
+  attemptId: string;
+  continuedInvocationId: string;
+  now?: Date;
+}): Promise<ContextPack> {
+  const path = contextPackPath(input.storeDirectory, input.key);
+  return withFileLock({
+    lockPath: `${path}.lock`,
+    operation: async () => {
+      const current = await loadContextPack(input);
+      if (!current) throw new Error(`Context Pack not found: ${input.key}`);
+      if (current.disclosure !== "blind-first") return current;
+      const disclosure = current.blindDisclosure;
+      if (disclosure?.phase === "continuation-started") {
+        if (
+          disclosure.continuationAttemptId !== input.attemptId ||
+          disclosure.continuedInvocationId !== input.continuedInvocationId
+        ) {
+          throw new Error("Blind-first continuation start is immutable");
+        }
+        return current;
+      }
+      if (
+        disclosure?.phase !== "continuation-dispatching" ||
+        disclosure.continuationAttemptId !== input.attemptId
+      ) {
+        throw new Error("Blind-first continuation did not own the durable dispatch");
+      }
+      const continuationStartedAt = (input.now ?? new Date()).toISOString();
+      const updated: ContextPack = {
+        ...current,
+        revision: current.revision + 1,
+        updatedAt: continuationStartedAt,
+        blindDisclosure: {
+          ...disclosure,
+          phase: "continuation-started",
+          continuationStartedAt,
+          continuedInvocationId: input.continuedInvocationId,
+        },
       };
       await writeContextPack(path, updated);
       return updated;
@@ -374,6 +588,10 @@ function redactEvidence(evidence: ContextEvidence): ContextEvidence {
     source: evidence.source ?? "declared",
     ...(evidence.receiptKind ? { receiptKind: evidence.receiptKind } : {}),
     ...(evidence.exitCode !== undefined ? { exitCode: evidence.exitCode } : {}),
+    ...(evidence.command ? { command: redactSensitiveText(evidence.command) } : {}),
+    ...(evidence.cwd ? { cwd: redactSensitiveText(evidence.cwd) } : {}),
+    ...(evidence.toolCallId ? { toolCallId: evidence.toolCallId } : {}),
+    ...(evidence.sessionDigest ? { sessionDigest: evidence.sessionDigest } : {}),
   };
 }
 
@@ -401,7 +619,81 @@ function isContextPack(value: unknown): value is ContextPack {
     value.claims.every((item) => typeof item === "string") &&
     (value.learningClaims === undefined ||
       (Array.isArray(value.learningClaims) && parseStoredLearningClaims(value.learningClaims))) &&
-    typeof value.nextStep === "string"
+    typeof value.nextStep === "string" &&
+    (value.disclosure === undefined ||
+      value.disclosure === "open" ||
+      value.disclosure === "blind-first") &&
+    (value.blindDisclosure === undefined ||
+      isBlindDisclosureState(value.blindDisclosure)) &&
+    (value.workflowHandoffs === undefined ||
+      (Array.isArray(value.workflowHandoffs) &&
+        value.workflowHandoffs.every(
+          (handoff) => parseWorkflowCheckpoint(handoff)?.kind === "handoff",
+        )))
+  );
+}
+
+function normalizeStoredContextPack(
+  value: ContextPack | (Omit<ContextPack, "disclosure"> & { disclosure?: ContextDisclosure }),
+): ContextPack {
+  const disclosure = value.disclosure ?? "open";
+  return {
+    ...structuredClone(value),
+    learningClaims: value.learningClaims ?? [],
+    workflowHandoffs: value.workflowHandoffs ?? [],
+    disclosure,
+    ...(disclosure === "blind-first" && !value.blindDisclosure
+      ? { blindDisclosure: { phase: "awaiting-orientation" as const } }
+      : {}),
+  };
+}
+
+function isBlindOrientation(value: unknown): value is BlindOrientationRecord {
+  return (
+    isRecord(value) &&
+    typeof value.text === "string" &&
+    typeof value.digest === "string" &&
+    typeof value.recordedAt === "string"
+  );
+}
+
+function isBlindDisclosureState(value: unknown): value is BlindDisclosureState {
+  if (!isRecord(value)) return false;
+  if (value.phase === "awaiting-orientation") {
+    return value.orientation === undefined;
+  }
+  if (!isBlindOrientation(value.orientation)) return false;
+  if (value.phase === "orientation-recorded") {
+    return (
+      value.continuationAttemptId === undefined &&
+      value.continuationCorrelationId === undefined &&
+      value.continuationDispatchStartedAt === undefined &&
+      value.continuationStartedAt === undefined &&
+      value.continuedInvocationId === undefined
+    );
+  }
+  if (
+    value.phase !== "continuation-dispatching" &&
+    value.phase !== "continuation-started"
+  ) {
+    return false;
+  }
+  if (
+    typeof value.continuationAttemptId !== "string" ||
+    typeof value.continuationCorrelationId !== "string" ||
+    typeof value.continuationDispatchStartedAt !== "string"
+  ) {
+    return false;
+  }
+  if (value.phase === "continuation-dispatching") {
+    return (
+      value.continuationStartedAt === undefined &&
+      value.continuedInvocationId === undefined
+    );
+  }
+  return (
+    typeof value.continuationStartedAt === "string" &&
+    typeof value.continuedInvocationId === "string"
   );
 }
 
@@ -463,7 +755,11 @@ function isContextEvidence(value: unknown): value is ContextEvidence {
       value.receiptKind === "command-output" ||
       value.receiptKind === "session" ||
       value.receiptKind === "diff") &&
-    (value.exitCode === undefined || typeof value.exitCode === "number")
+    (value.exitCode === undefined || typeof value.exitCode === "number") &&
+    (value.command === undefined || typeof value.command === "string") &&
+    (value.cwd === undefined || typeof value.cwd === "string") &&
+    (value.toolCallId === undefined || typeof value.toolCallId === "string") &&
+    (value.sessionDigest === undefined || typeof value.sessionDigest === "string")
   );
 }
 

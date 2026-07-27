@@ -1,8 +1,15 @@
-import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
 import { basename, dirname, isAbsolute, relative, resolve } from "node:path";
 import { Type, type Static } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+  makeTaskSettledEvent,
+  TASK_LIFECYCLE_EVENTS_V1,
+} from "@minhduydev/pi-core/task-lifecycle";
+import {
+  parseWorkflowCheckpoint,
+  workflowCheckpointDigest,
+} from "@minhduydev/pi-core/workflow";
 import {
   SUBAGENT_LEARNING_EVENTS_V1,
   makeProofVerifiedPayload,
@@ -19,18 +26,30 @@ import {
   loadContextPack,
   saveContextPack,
   updateContextHandoff,
-  type ContextHandoffPatch,
 } from "./context.js";
 import { runOrchestrationDoctor } from "./doctor.js";
-import { recordEvidenceReceipt } from "./evidence.js";
+import {
+  listEvidenceReceipts,
+  recordEvidenceReceipt,
+  verifyEvidenceReceipt,
+} from "./evidence.js";
 import { getOrchestrationPaths, type OrchestrationPaths } from "./paths.js";
 import { validateEvidenceOnlyProof } from "./proof.js";
+import {
+  isAcceptingReviewerVerdict,
+  isReviewerEventBound,
+  parseSemanticAttestations,
+  parseReviewerOwnedVerdict,
+  taskSubjectDigest,
+} from "./review.js";
 import { getFinalTaskResult, getTaskSnapshot } from "./task-query.js";
 import {
+  getDurableRunByDecisionId,
   getDurableRunByTaskId,
   isTerminalExecutionPhase,
   listDurableRuns,
   patchDurableRun,
+  type SemanticAttestationV1,
 } from "./run-store.js";
 import {
   appendOrchestrationEvent,
@@ -38,39 +57,6 @@ import {
   readOrchestrationEvents,
   type OrchestrationEvent,
 } from "./telemetry.js";
-
-const HandoffSchema = Type.Object(
-  {
-    decisions: Type.Optional(
-      Type.Array(
-        Type.Object(
-          {
-            statement: Type.String({ minLength: 1 }),
-            rationale: Type.Optional(Type.String()),
-            unlock_condition: Type.Optional(Type.String()),
-          },
-          { additionalProperties: false },
-        ),
-      ),
-    ),
-    evidence: Type.Optional(
-      Type.Array(
-        Type.Object(
-          {
-            description: Type.String({ minLength: 1 }),
-            reference: Type.String({ minLength: 1 }),
-            recorded_at: Type.Optional(Type.String()),
-            claim: Type.Optional(Type.String()),
-          },
-          { additionalProperties: false },
-        ),
-      ),
-    ),
-    unknowns: Type.Optional(Type.Array(Type.String())),
-    next_step: Type.Optional(Type.String({ minLength: 1 })),
-  },
-  { additionalProperties: false },
-);
 
 const TaskControlParameters = Type.Object(
   {
@@ -86,6 +72,7 @@ const TaskControlParameters = Type.Object(
       Type.Literal("release"),
       Type.Literal("reap"),
       Type.Literal("review"),
+      Type.Literal("respond"),
       Type.Literal("ship"),
       Type.Literal("worktree_status"),
       Type.Literal("worktree_merge"),
@@ -93,7 +80,9 @@ const TaskControlParameters = Type.Object(
     ]),
     task_id: Type.Optional(Type.String({ minLength: 1 })),
     lease_id: Type.Optional(Type.String({ minLength: 1 })),
-    handoff: Type.Optional(HandoffSchema),
+    // Runtime validation uses pi-core's single canonical fourteen-section
+    // parser; the tool schema intentionally does not duplicate that contract.
+    handoff: Type.Optional(Type.Unknown()),
     delegation_prompt: Type.Optional(Type.String()),
     ceremony_steps: Type.Optional(
       Type.Array(
@@ -110,7 +99,9 @@ const TaskControlParameters = Type.Object(
     review_findings: Type.Optional(Type.Integer({ minimum: 0 })),
     accepted_findings: Type.Optional(Type.Integer({ minimum: 0 })),
     reviewer_task_id: Type.Optional(Type.String({ minLength: 1 })),
-    verdict: Type.Optional(Type.String()),
+    decision_id: Type.Optional(Type.String({ minLength: 1 })),
+    decision_option_id: Type.Optional(Type.String({ minLength: 1 })),
+    decision_response: Type.Optional(Type.String({ minLength: 1 })),
     evidence_kind: Type.Optional(
       Type.Union([
         Type.Literal("file"),
@@ -162,11 +153,37 @@ async function executeHerdrAction(
       if (!input.handoff) {
         throw new Error("handoff is required for the handoff action");
       }
+      const checkpoint = parseWorkflowCheckpoint(input.handoff);
+      if (!checkpoint || checkpoint.kind !== "handoff") {
+        throw new Error(
+          "handoff must be a canonical fourteen-section HandoffPackV1",
+        );
+      }
+      if (
+        checkpoint.resumeKeys.taskId &&
+        checkpoint.resumeKeys.taskId !== taskId
+      ) {
+        throw new Error(
+          `Handoff resume task ${checkpoint.resumeKeys.taskId} does not match ${taskId}`,
+        );
+      }
       await ensureTaskContextPack(paths, projectDirectory, taskId);
       const pack = await updateContextHandoff({
         storeDirectory: paths.contextStore,
         key: taskId,
-        patch: normalizeHandoff(input.handoff),
+        patch: {
+          workflowHandoff: checkpoint,
+          unknowns: checkpoint.unknowns,
+          decisions: [
+            ...checkpoint.closedDecisions.map((statement) => ({ statement })),
+            ...checkpoint.openDecisions.map((statement) => ({ statement })),
+          ],
+          evidence: checkpoint.existingEvidence.map((description) => ({
+            description,
+            reference: `handoff:${checkpoint.recordId}`,
+          })),
+          nextStep: checkpoint.nextStep,
+        },
       });
       await appendOrchestrationEvent({
         eventPath: paths.eventLog,
@@ -174,6 +191,7 @@ async function executeHerdrAction(
           type: "handoff_updated",
           orchestrationId: `handoff-${taskId}`,
           taskId,
+          subjectDigest: workflowCheckpointDigest(checkpoint),
         },
       });
       return {
@@ -183,7 +201,13 @@ async function executeHerdrAction(
             text: `Updated Context Pack ${taskId} to revision ${pack.revision}.`,
           },
         ],
-        details: { taskId, revision: pack.revision, status: "updated" },
+        details: {
+          taskId,
+          revision: pack.revision,
+          status: "updated",
+          recordId: checkpoint.recordId,
+          digest: workflowCheckpointDigest(checkpoint),
+        },
       };
     }
     case "record_evidence": {
@@ -217,7 +241,10 @@ async function executeHerdrAction(
               claim: receipt.claim,
               receiptId: receipt.id,
               sha256: receipt.sha256,
-              source: "runtime-receipt",
+              // This action records an immutable manual artifact. It is useful
+              // for handoff/review, but it is not a runtime-observed command
+              // and therefore cannot satisfy the evidence-only proof gate.
+              source: "declared",
               receiptKind: receipt.kind,
               exitCode: receipt.exitCode,
             },
@@ -241,10 +268,16 @@ async function executeHerdrAction(
       if (run.executionPhase !== "completed") {
         throw new Error(`Task ${taskId} has not completed execution`);
       }
+      if (run.reportedOutcome !== "success") {
+        throw new Error(
+          `Task ${taskId} reported ${run.reportedOutcome}; only semantic success can be verified`,
+        );
+      }
       const pack = await loadContextPack({
         storeDirectory: paths.contextStore,
         key: taskId,
       });
+      const subjectDigest = await taskSubjectDigest(projectDirectory, taskId);
       const proof = await validateEvidenceOnlyProof({
         projectDirectory: run.executionDirectory,
         allowedProjectDirectories: [projectDirectory],
@@ -252,16 +285,22 @@ async function executeHerdrAction(
         claims: pack?.claims,
         learningClaims: pack?.learningClaims,
         maxEvidenceAgeMs: run.proof?.maxEvidenceAgeMs ?? 15 * 60 * 1_000,
+        semanticAttestations: run.semanticAttestations,
+        subjectDigest,
       });
       const currentWorktree =
         run.worktree && run.worktreeDisposition === "retained"
           ? inspectTaskWorktree(run.worktree)
           : undefined;
       await patchDurableRun(paths.runStore, run.invocationId, {
-        verificationPhase: proof.valid ? "passed" : "failed",
+        verificationPhase: proof.valid
+          ? "passed"
+          : proof.receiptIntegrityValid && run.verifier?.required
+            ? "receipt-passed"
+            : "failed",
         verificationIssues: proof.issues,
         reviewPhase:
-          proof.valid && run.verifier?.required
+          (proof.valid || proof.receiptIntegrityValid) && run.verifier?.required
             ? "awaiting"
             : run.verifier?.required
               ? run.reviewPhase
@@ -278,7 +317,7 @@ async function executeHerdrAction(
           ...(proof.issues.length ? { reason: proof.issues.join(" ") } : {}),
         },
       });
-      if (proof.valid && run.verifier?.required) {
+      if ((proof.valid || proof.receiptIntegrityValid) && run.verifier?.required) {
         await appendOrchestrationEvent({
           eventPath: paths.eventLog,
           event: {
@@ -398,7 +437,6 @@ async function executeHerdrAction(
         input.reviewer_task_id,
         "reviewer_task_id",
       );
-      const verdict = requireValue(input.verdict, "verdict");
       if (reviewerTaskId === taskId) {
         throw new Error("A task cannot independently review itself");
       }
@@ -410,14 +448,25 @@ async function executeHerdrAction(
       if (subject.executionPhase !== "completed") {
         throw new Error(`Subject task ${taskId} has not completed execution`);
       }
+      if (subject.reportedOutcome !== "success") {
+        throw new Error(
+          `Subject task ${taskId} reported ${subject.reportedOutcome}; non-success outcomes cannot be reviewed for shipment`,
+        );
+      }
       if (
         subject.verificationPhase !== "passed" &&
+        subject.verificationPhase !== "receipt-passed" &&
         subject.verificationPhase !== "not-required"
       ) {
         throw new Error(`Subject task ${taskId} has not passed verification`);
       }
       if (reviewer.executionPhase !== "completed") {
         throw new Error(`Reviewer task ${reviewerTaskId} has not completed execution`);
+      }
+      if (reviewer.reportedOutcome !== "success") {
+        throw new Error(
+          `Reviewer task ${reviewerTaskId} reported ${reviewer.reportedOutcome}`,
+        );
       }
       if (
         reviewer.verificationPhase !== "passed" &&
@@ -434,6 +483,53 @@ async function executeHerdrAction(
         );
       }
       const subjectDigest = await taskSubjectDigest(projectDirectory, taskId);
+      const reviewerSnapshot = await getTaskSnapshot(projectDirectory, reviewerTaskId);
+      const reviewerOutput = await getFinalTaskResult(reviewerSnapshot);
+      if (!reviewerOutput) {
+        throw new Error(`Reviewer task ${reviewerTaskId} has no canonical final output`);
+      }
+      const reviewerVerdict = parseReviewerOwnedVerdict(
+        reviewerOutput,
+        subjectDigest,
+      );
+      const verdict = reviewerVerdict.verdict;
+      const subjectPack = await loadContextPack({
+        storeDirectory: paths.contextStore,
+        key: taskId,
+      });
+      const requiredSemanticClaims =
+        verdict === "approved"
+          ? [
+              ...(subjectPack?.claims ?? []),
+              ...(subjectPack?.learningClaims ?? []).map((claim) => claim.statement),
+            ]
+          : [];
+      const semanticInputs = parseSemanticAttestations(
+        reviewerOutput,
+        requiredSemanticClaims,
+        subjectDigest,
+      );
+      const receipts = await listEvidenceReceipts(paths.evidenceStore, taskId);
+      const semanticAttestations: SemanticAttestationV1[] = semanticInputs.map((input) => {
+        const receipt = receipts.find((candidate) => candidate.id === input.receiptId);
+        if (
+          !receipt ||
+          receipt.authority !== "runtime-observation" ||
+          receipt.sha256 !== input.artifactDigest ||
+          !verifyEvidenceReceipt(receipt, projectDirectory)
+        ) {
+          throw new Error(
+            `Semantic attestation ${input.claim} does not reference a verified runtime receipt`,
+          );
+        }
+        return {
+          ...input,
+          reviewerTaskId,
+          reviewerInvocationId: reviewer.invocationId,
+          reviewerOutputDigest: reviewerVerdict.outputDigest,
+          attestedAt: new Date().toISOString(),
+        };
+      });
       const existingReviews = await readOrchestrationEvents(paths.eventLog);
       const existingReview = existingReviews.find(
         (event) =>
@@ -444,7 +540,8 @@ async function executeHerdrAction(
       );
       if (
         existingReview?.verdict !== undefined &&
-        existingReview.verdict.trim().toLowerCase() !== verdict.trim().toLowerCase()
+        (existingReview.verdict !== verdict ||
+          existingReview.reviewerOutputDigest !== reviewerVerdict.outputDigest)
       ) {
         throw new Error(
           `Reviewer ${reviewerTaskId} already recorded an immutable verdict for this subject digest`,
@@ -460,12 +557,48 @@ async function executeHerdrAction(
           reviewerInvocationId: reviewer.invocationId,
           subjectDigest,
           verdict,
+          reviewerOutputDigest: reviewerVerdict.outputDigest,
           idempotencyKey: `${reviewer.invocationId}:review:${subject.invocationId}:${subjectDigest}`,
         },
       });
-      if (!isAcceptingVerdict(verdict)) {
+      if (!isAcceptingReviewerVerdict(verdict)) {
         await patchDurableRun(paths.runStore, subject.invocationId, {
           reviewPhase: "rejected",
+        });
+      } else {
+        await patchDurableRun(paths.runStore, subject.invocationId, (current) => {
+          const existing = current.semanticAttestations ?? [];
+          for (const attestation of semanticAttestations) {
+            const conflict = existing.find(
+              (candidate) =>
+                candidate.claim === attestation.claim &&
+                (candidate.subjectDigest !== attestation.subjectDigest ||
+                  candidate.artifactDigest !== attestation.artifactDigest),
+            );
+            if (conflict) {
+              throw new Error(
+                `Semantic attestation for claim ${attestation.claim} is immutable`,
+              );
+            }
+          }
+          const merged = [
+            ...existing.filter(
+              (candidate) =>
+                !semanticAttestations.some(
+                  (attestation) =>
+                    attestation.claim === candidate.claim &&
+                    attestation.subjectDigest === candidate.subjectDigest,
+                ),
+            ),
+            ...semanticAttestations,
+          ];
+          return {
+            semanticAttestations: merged,
+            ...(current.verificationPhase === "receipt-passed"
+              ? { verificationPhase: "passed" as const }
+              : {}),
+            reviewPhase: "accepted" as const,
+          };
         });
       }
       // Emit learning event after durable recording (fail-open)
@@ -497,7 +630,215 @@ async function executeHerdrAction(
           verdict,
           reviewerInvocationId: reviewer.invocationId,
           subjectDigest,
+          reviewerOutputDigest: reviewerVerdict.outputDigest,
         },
+      };
+    }
+    case "respond": {
+      const taskId = requireValue(input.task_id, "task_id");
+      const decisionId = requireValue(input.decision_id, "decision_id");
+      const response = requireValue(input.decision_response, "decision_response").trim();
+      const run = await getDurableRunByDecisionId(
+        paths.runStore,
+        taskId,
+        decisionId,
+      );
+      if (!run) throw new Error(`Task not found: ${taskId}`);
+      const decision = run.decisionRequest;
+      if (!decision || decision.id !== decisionId) {
+        throw new Error(`Pending decision ${decisionId} was not found for task ${taskId}`);
+      }
+      const optionId = input.decision_option_id;
+      if (optionId && !decision.options.some((option) => option.id === optionId)) {
+        throw new Error(`Unknown option ${optionId} for decision ${decisionId}`);
+      }
+      const responseDigest = `sha256:v1:${createHash("sha256")
+        .update(JSON.stringify({ decisionId, optionId: optionId ?? null, response }))
+        .digest("hex")}` as const;
+      const respondedAt = new Date().toISOString();
+      const resumeCorrelationId =
+        decision.response?.resumeCorrelationId ??
+        `decision-resume:${run.invocationId}:${decisionId}`;
+      const resumeAttemptId = randomUUID();
+      // The read above is deliberately not the authority for this transition:
+      // two parent turns can both observe `pending` and both emit a resume. Do
+      // the compare-and-set inside the run-store lock, so exactly one caller
+      // owns the transition and its corresponding resume event.
+      let alreadyResolved = false;
+      let shouldDispatch = false;
+      const transitioned = await patchDurableRun(
+        paths.runStore,
+        run.invocationId,
+        (current) => {
+          const currentDecision = current.decisionRequest;
+          if (!currentDecision || currentDecision.id !== decisionId) {
+            throw new Error(`Pending decision ${decisionId} was not found for task ${taskId}`);
+          }
+          if (currentDecision.status === "resolved") {
+            if (currentDecision.response?.responseDigest !== responseDigest) {
+              throw new Error(
+                `Decision ${decisionId} was already resolved with a different response`,
+              );
+            }
+            const recorded = currentDecision.response;
+            if (
+              recorded?.resumedInvocationId ||
+              recorded?.resumeState === "started" ||
+              recorded?.resumeState === "dispatching"
+            ) {
+              alreadyResolved = true;
+              return {};
+            }
+            // A listener failure, a legacy response without outbox state, or a
+            // process crash before dispatch is retriable. The stable
+            // correlation id lets the runtime detect a launch that crossed
+            // the process boundary before the crash.
+            shouldDispatch = true;
+            return {
+              decisionRequest: {
+                ...currentDecision,
+                response: {
+                  ...recorded,
+                  resumeCorrelationId,
+                  resumeState: "dispatching",
+                  resumeAttemptId,
+                  resumeDispatcherId: undefined,
+                  resumeDispatchStartedAt: respondedAt,
+                  resumeError: undefined,
+                },
+              },
+            };
+          }
+          shouldDispatch = true;
+          return {
+            decisionRequest: {
+              ...currentDecision,
+              status: "resolved",
+              response: {
+                ...(optionId ? { optionId } : {}),
+                response,
+                respondedAt,
+                responseDigest,
+                resumeCorrelationId,
+                resumeState: "dispatching",
+                resumeAttemptId,
+                resumeDispatcherId: undefined,
+                resumeDispatchStartedAt: respondedAt,
+              },
+            },
+          };
+        },
+      );
+      if (!transitioned) throw new Error(`Task ${taskId} disappeared while recording decision ${decisionId}`);
+      if (alreadyResolved) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Decision ${decisionId} was already resolved; no duplicate resume was started.`,
+            },
+          ],
+          details: {
+            taskId,
+            decisionId,
+            status: "already-resolved",
+            resumedInvocationId: transitioned.decisionRequest?.response?.resumedInvocationId,
+          },
+        };
+      }
+      if (!shouldDispatch) {
+        throw new Error(`Decision ${decisionId} did not acquire a resume dispatch`);
+      }
+      try {
+        await appendOrchestrationEvent({
+          eventPath: paths.eventLog,
+          event: {
+            type: "decision_responded",
+            orchestrationId: run.correlationId ?? run.invocationId,
+            taskId,
+            decisionId,
+            idempotencyKey: `${run.invocationId}:decision-response:${responseDigest}`,
+          },
+        });
+        await pi?.events.emit("herdr:blocked", {
+          active: false,
+          blockerId: decisionId,
+          taskId,
+          label: decision.question,
+        });
+      } catch {
+        // The durable decision response is authoritative; Herdr state is a
+        // best-effort UI/wake-up projection and cannot roll it back.
+      }
+      let resume: unknown;
+      try {
+        if (pi?.events) {
+          resume = await pi.events.emit("pi-subagents:decision-response", {
+            protocolVersion: 1,
+            projectDirectory,
+            taskId,
+            decisionId,
+            optionId,
+            response,
+            responseDigest,
+            resumeCorrelationId,
+            resumeAttemptId,
+            timestamp: respondedAt,
+          });
+        }
+      } catch (error) {
+        const resumeError =
+          error instanceof Error ? error.message : String(error);
+        const afterFailure = await patchDurableRun(
+          paths.runStore,
+          run.invocationId,
+          (current) => {
+            const currentDecision = current.decisionRequest;
+            const currentResponse = currentDecision?.response;
+            if (
+              !currentDecision ||
+              currentDecision.id !== decisionId ||
+              currentResponse?.resumeAttemptId !== resumeAttemptId ||
+              currentResponse.resumeState === "started"
+            ) {
+              return {};
+            }
+            return {
+              decisionRequest: {
+                ...currentDecision,
+                response: {
+                  ...currentResponse,
+                  resumeState: "failed",
+                  resumeError: resumeError.slice(0, 1_000),
+                },
+              },
+            };
+          },
+        );
+        const durableResponse = afterFailure?.decisionRequest?.response;
+        if (durableResponse?.resumeState === "started") {
+          // Another event listener may throw after the runtime listener has
+          // durably launched the continuation. Preserve the authoritative
+          // success instead of telling the caller to retry a launch that
+          // already happened.
+          resume = {
+            resumedInvocationId: durableResponse.resumedInvocationId,
+            recoveredFromListenerError: true,
+          };
+        } else {
+          throw new Error(
+            `Decision ${decisionId} was recorded, but its task resume failed: ${resumeError}`,
+          );
+        }
+      }
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Recorded response for ${decisionId}; the same task conversation will resume.`,
+          },
+        ],
+        details: { taskId, decisionId, status: "resolved", resume },
       };
     }
     case "ship": {
@@ -507,6 +848,11 @@ async function executeHerdrAction(
       if (subject.executionPhase !== "completed") {
         throw new Error(`Task ${taskId} has not completed execution`);
       }
+      if (subject.reportedOutcome !== "success") {
+        throw new Error(
+          `Task ${taskId} reported ${subject.reportedOutcome} and cannot ship`,
+        );
+      }
       assertWorktreeMatchesVerifiedSnapshot(subject, taskId);
       if (subject.verificationPhase === "failed") {
         throw new Error(`Task ${taskId} failed verification and cannot ship`);
@@ -514,23 +860,36 @@ async function executeHerdrAction(
       if (subject.verificationPhase === "pending") {
         throw new Error(`Task ${taskId} has not completed verification`);
       }
+      if (
+        subject.verificationPhase === "receipt-passed" &&
+        (subject.verifier?.required || (subject.semanticAttestations?.length ?? 0) === 0)
+      ) {
+        throw new Error(
+          `Task ${taskId} has runtime receipt integrity but no reviewer-owned semantic proof`,
+        );
+      }
       const minReviews = subject.verifier?.required
         ? subject.verifier.minReviews ?? 1
         : 0;
       const subjectDigest = await taskSubjectDigest(projectDirectory, taskId);
       const events = await readOrchestrationEvents(paths.eventLog);
+      const runs = await listDurableRuns(paths.runStore);
+      const boundReviews = await Promise.all(
+        events.map(async (event) =>
+          isAcceptingReviewerVerdict(event.verdict) &&
+          (await isReviewerEventBound({
+            event,
+            subject,
+            subjectDigest,
+            projectDirectory,
+            runs,
+          }))
+            ? event.reviewerTaskId
+            : undefined,
+        ),
+      );
       const reviewers = new Set(
-        events
-          .filter(
-            (event) =>
-              event.type === "task_reviewed" &&
-              event.taskId === taskId &&
-              event.reviewerTaskId &&
-              event.reviewerTaskId !== taskId &&
-              event.subjectDigest === subjectDigest &&
-              isAcceptingVerdict(event.verdict),
-          )
-          .map((event) => event.reviewerTaskId as string),
+        boundReviews.filter((value): value is string => value !== undefined),
       );
       if (reviewers.size >= minReviews) {
         await appendOrchestrationEvent({
@@ -545,6 +904,9 @@ async function executeHerdrAction(
         });
         await patchDurableRun(paths.runStore, subject.invocationId, {
           reviewPhase: minReviews > 0 ? "accepted" : "not-required",
+          ...(subject.verificationPhase === "receipt-passed"
+            ? { verificationPhase: "passed" as const }
+            : {}),
         });
         if (
           !events.some(
@@ -561,6 +923,25 @@ async function executeHerdrAction(
               idempotencyKey: `${subject.invocationId}:execution:verified`,
             },
           });
+        }
+        if (pi?.events) {
+          await pi.events.emit(
+            TASK_LIFECYCLE_EVENTS_V1.SETTLED,
+            makeTaskSettledEvent({
+              protocolVersion: 1,
+              taskId,
+              terminalOutcome: "success",
+              reportedOutcome: "success",
+              executionPhase: "completed",
+              verificationPassed:
+                subject.verificationPhase === "passed" ||
+                subject.verificationPhase === "receipt-passed" ||
+                subject.verificationPhase === "not-required",
+              awaitingReview: false,
+              issues: [],
+              timestamp: new Date().toISOString(),
+            }),
+          );
         }
         return {
           content: [
@@ -715,6 +1096,7 @@ async function executeHerdrAction(
         storePath: paths.leaseStore,
         leaseId,
         expectedOwner: run.lease.owner,
+        expectedFence: run.lease.fence,
       });
       if (!released) {
         return {
@@ -788,6 +1170,10 @@ async function taskStatusResult(projectDirectory: string, taskId: string) {
   const snapshot = await getTaskSnapshot(projectDirectory, taskId);
   const paths = getOrchestrationPaths(projectDirectory);
   const run = await getDurableRunByTaskId(paths.runStore, taskId);
+  const subjectDigest =
+    run?.executionPhase === "completed"
+      ? await taskSubjectDigest(projectDirectory, taskId).catch(() => undefined)
+      : undefined;
 
   const lines = [
     `Task ID: ${taskId}`,
@@ -795,6 +1181,7 @@ async function taskStatusResult(projectDirectory: string, taskId: string) {
     ...(run
       ? [
           `Execution: ${run.executionPhase}`,
+          `Reported outcome: ${run.reportedOutcome}`,
           `Verification: ${run.verificationPhase}`,
           `Review: ${run.reviewPhase}`,
         ]
@@ -807,9 +1194,12 @@ async function taskStatusResult(projectDirectory: string, taskId: string) {
   if (snapshot.description) {
     lines.push(`Description: ${snapshot.description}`);
   }
+  if (subjectDigest) {
+    lines.push(`Review subject digest: ${subjectDigest}`);
+  }
   return {
     content: [{ type: "text" as const, text: lines.join("\n") }],
-    details: { ...snapshot, run },
+    details: { ...snapshot, run, ...(subjectDigest ? { subjectDigest } : {}) },
   };
 }
 
@@ -964,38 +1354,6 @@ function renderDoctorResult(
   ].join("\n");
 }
 
-function normalizeHandoff(
-  handoff: NonNullable<TaskControlInput["handoff"]>,
-): ContextHandoffPatch {
-  return {
-    ...(handoff.decisions
-      ? {
-          decisions: handoff.decisions.map((decision) => ({
-            statement: decision.statement,
-            ...(decision.rationale ? { rationale: decision.rationale } : {}),
-            ...(decision.unlock_condition
-              ? { unlockCondition: decision.unlock_condition }
-              : {}),
-          })),
-        }
-      : {}),
-    ...(handoff.evidence
-      ? {
-          evidence: handoff.evidence.map((evidence) => ({
-            description: evidence.description,
-            reference: evidence.reference,
-            ...(evidence.recorded_at
-              ? { recordedAt: evidence.recorded_at }
-              : {}),
-            ...(evidence.claim ? { claim: evidence.claim } : {}),
-          })),
-        }
-      : {}),
-    ...(handoff.unknowns ? { unknowns: [...handoff.unknowns] } : {}),
-    ...(handoff.next_step ? { nextStep: handoff.next_step } : {}),
-  };
-}
-
 async function requireRunWithOwnedWorktree(
   paths: OrchestrationPaths,
   taskId: string,
@@ -1042,8 +1400,12 @@ function assertRunReadyToMerge(
   if (run.executionPhase !== "completed") {
     throw new Error(`Task ${taskId} has not completed execution`);
   }
+  if (run.reportedOutcome !== "success") {
+    throw new Error(`Task ${taskId} reported ${run.reportedOutcome} and cannot merge`);
+  }
   if (
     run.verificationPhase !== "passed" &&
+    run.verificationPhase !== "receipt-passed" &&
     run.verificationPhase !== "not-required"
   ) {
     throw new Error(`Task ${taskId} has not passed verification`);
@@ -1081,43 +1443,6 @@ async function ensureTaskContextPack(
     key: taskId,
     pack: created,
   });
-}
-
-async function taskSubjectDigest(
-  projectDirectory: string,
-  taskId: string,
-): Promise<string> {
-  const snapshot = await getTaskSnapshot(projectDirectory, taskId);
-  if (!snapshot.sessionReference) {
-    throw new Error(`Task ${taskId} has no canonical session to review`);
-  }
-  const hash = createHash("sha256");
-  hash.update(await readFile(snapshot.sessionReference));
-  const paths = getOrchestrationPaths(projectDirectory);
-  const run = await getDurableRunByTaskId(paths.runStore, taskId);
-  if (run?.worktree) {
-    const worktreeResult =
-      run.worktreeDisposition === "retained"
-        ? inspectTaskWorktree(run.worktree)
-        : run.worktreeResult;
-    if (worktreeResult) {
-      hash.update("\0worktree\0");
-      hash.update(worktreeResult.diffDigest);
-    }
-  }
-  const pack = await loadContextPack({
-    storeDirectory: paths.contextStore,
-    key: taskId,
-  });
-  if (pack) {
-    hash.update("\0context\0");
-    hash.update(JSON.stringify(pack.evidence));
-  }
-  return `sha256:${hash.digest("hex")}`;
-}
-
-function isAcceptingVerdict(verdict: string | undefined): boolean {
-  return verdict !== undefined && /^(approve|approved|accept|accepted|pass|passed)$/iu.test(verdict.trim());
 }
 
 function requireValue<T extends string>(value: T | undefined, name: string): T {

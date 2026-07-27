@@ -98,6 +98,8 @@ export interface ReleaseResourceLeaseInput {
    * {@link releaseOrphanedLeases}, which proves liveness instead of ownership.
    */
   expectedOwner: string;
+  /** Exact lease generation held by the caller. */
+  expectedFence: number;
   now?: Date;
 }
 
@@ -107,6 +109,8 @@ export interface TransferResourceLeaseOwnershipInput {
   owner: string;
   /** The owner the caller believes currently holds the lease. Required. */
   expectedOwner: string;
+  /** Exact lease generation held by the caller. */
+  expectedFence: number;
   now?: Date;
 }
 
@@ -114,6 +118,8 @@ export interface RenewResourceLeaseInput {
   storePath: string;
   leaseId: string;
   owner: string;
+  /** Exact lease generation held by the caller. */
+  expectedFence: number;
   ttlMs?: number;
   now?: Date;
 }
@@ -170,12 +176,12 @@ export async function acquireResourceLease(
   return withStoreLock(input.storePath, async () => {
     const store = await readStore(input.storePath);
     store.leases = activeLeases(store.leases, now);
+    if (!hasAvailableFence(store.nextFence)) {
+      throw new Error("Resource lease fence space is exhausted");
+    }
     const claims = input.claims.map(normalizeClaim);
 
     for (const lease of store.leases) {
-      if (lease.owner === input.owner) {
-        continue;
-      }
       for (const requested of claims) {
         for (const existing of lease.claims) {
           if (claimsConflict(requested, existing)) {
@@ -251,6 +257,9 @@ export async function transferResourceLeaseOwnership(
   if (!input.expectedOwner.trim()) {
     throw new Error("Resource lease transfer requires the expected current owner");
   }
+  if (!isPositiveSafeInteger(input.expectedFence)) {
+    throw new Error("Resource lease transfer requires a positive expected fence");
+  }
   const now = input.now ?? new Date();
   return withStoreLock(input.storePath, async () => {
     const store = await readStore(input.storePath);
@@ -266,6 +275,14 @@ export async function transferResourceLeaseOwnership(
       throw new Error(
         `Resource lease ${input.leaseId} is owned by ${lease.owner}, not ${input.expectedOwner}`,
       );
+    }
+    if (lease.fence !== input.expectedFence) {
+      throw new Error(
+        `Resource lease ${input.leaseId} has fence ${lease.fence}, not ${input.expectedFence}`,
+      );
+    }
+    if (!hasAvailableFence(store.nextFence)) {
+      throw new Error("Resource lease fence space is exhausted");
     }
     lease.owner = input.owner;
     lease.heartbeatAt = now.toISOString();
@@ -283,6 +300,9 @@ export async function renewResourceLease(
 ): Promise<ResourceLease | undefined> {
   if (!input.owner.trim()) {
     throw new Error("Resource lease owner must not be empty");
+  }
+  if (!isPositiveSafeInteger(input.expectedFence)) {
+    throw new Error("Resource lease renewal requires a positive expected fence");
   }
   const now = input.now ?? new Date();
   const ttlMs = input.ttlMs ?? DEFAULT_LEASE_TTL_MS;
@@ -302,6 +322,11 @@ export async function renewResourceLease(
         `Resource lease ${input.leaseId} is owned by ${lease.owner}, not ${input.owner}`,
       );
     }
+    if (lease.fence !== input.expectedFence) {
+      throw new Error(
+        `Resource lease ${input.leaseId} has fence ${lease.fence}, not ${input.expectedFence}`,
+      );
+    }
     lease.heartbeatAt = now.toISOString();
     lease.expiresAt = new Date(now.getTime() + ttlMs).toISOString();
     await writeStore(input.storePath, store);
@@ -314,6 +339,9 @@ export async function releaseResourceLease(
 ): Promise<boolean> {
   if (!input.expectedOwner.trim()) {
     throw new Error("Resource lease release requires the expected owner");
+  }
+  if (!isPositiveSafeInteger(input.expectedFence)) {
+    throw new Error("Resource lease release requires a positive expected fence");
   }
   const now = input.now ?? new Date();
   return withStoreLock(input.storePath, async () => {
@@ -331,6 +359,11 @@ export async function releaseResourceLease(
     if (target.owner !== input.expectedOwner) {
       throw new Error(
         `Resource lease ${input.leaseId} is owned by ${target.owner}, not ${input.expectedOwner}`,
+      );
+    }
+    if (target.fence !== input.expectedFence) {
+      throw new Error(
+        `Resource lease ${input.leaseId} has fence ${target.fence}, not ${input.expectedFence}`,
       );
     }
     store.leases = current.filter((lease) => lease.id !== input.leaseId);
@@ -398,7 +431,9 @@ export async function findClaimCoveringPath(
     storePath: input.storePath,
     now,
   });
-  return leases.find((lease) => leaseCoversPath(lease, input.path));
+  return leases
+    .filter((lease) => leaseCoversPath(lease, input.path))
+    .sort((left, right) => right.fence - left.fence)[0];
 }
 
 export interface AssertNoConflictingWriteInput {
@@ -418,6 +453,9 @@ export interface AssertNoConflictingWriteInput {
 export async function assertNoConflictingWrite(
   input: AssertNoConflictingWriteInput,
 ): Promise<void> {
+  if (input.fence !== undefined && !isPositiveSafeInteger(input.fence)) {
+    throw new Error("Resource lease fence must be a positive safe integer");
+  }
   const lease = await findClaimCoveringPath({
     storePath: input.storePath,
     path: input.path,
@@ -427,10 +465,10 @@ export async function assertNoConflictingWrite(
     return;
   }
   if (lease.owner === input.ownerTaskId) {
-    if (input.fence !== undefined && lease.fence > input.fence) {
+    if (input.fence !== undefined && lease.fence !== input.fence) {
       throw new Error(
-        `Write blocked: ${input.path} is covered by a newer lease generation ` +
-          `(fence ${lease.fence} > ${input.fence}); this task's lease was superseded`,
+        `Write blocked: ${input.path} is covered by a different lease generation ` +
+          `(fence ${lease.fence} != ${input.fence}); this task's lease was superseded`,
       );
     }
     return;
@@ -595,19 +633,42 @@ function migrateStore(value: unknown): ResourceLeaseStore | undefined {
 
   // v1 had no fences. Assign them in persisted order so existing leases keep a
   // stable relative generation, and start `nextFence` above all of them.
-  let nextFence =
-    typeof value.nextFence === "number" && Number.isSafeInteger(value.nextFence) && value.nextFence >= 1
-      ? value.nextFence
-      : 1;
-  const leases: ResourceLease[] = value.leases.map((lease) => {
-    if (typeof lease.fence === "number" && Number.isSafeInteger(lease.fence)) {
-      nextFence = Math.max(nextFence, lease.fence + 1);
-      return lease as ResourceLease;
-    }
-    const assigned = nextFence;
-    nextFence += 1;
-    return { ...(lease as ResourceLease), fence: assigned };
-  });
+  if (value.version === 1) {
+    if (value.leases.length >= Number.MAX_SAFE_INTEGER) return undefined;
+    const leases = value.leases.map((lease, index) => ({
+      ...lease,
+      fence: index + 1,
+    })) as ResourceLease[];
+    return {
+      version: STORE_VERSION,
+      nextFence: leases.length + 1,
+      leases,
+    };
+  }
+
+  // A v2 fence is an authority token, not an advisory counter. Accepting zero,
+  // negative, duplicate, or rewound values can make a stale writer current
+  // again. Unlike v1, there is no safe migration because released generations
+  // are no longer present in `leases`; quarantine instead of guessing.
+  if (
+    !isPositiveSafeInteger(value.nextFence) ||
+    !value.leases.every(isResourceLease)
+  ) {
+    return undefined;
+  }
+  const leases = value.leases as ResourceLease[];
+  const fences = new Set(leases.map((lease) => lease.fence));
+  const maxFence = leases.reduce(
+    (maximum, lease) => Math.max(maximum, lease.fence),
+    0,
+  );
+  if (
+    fences.size !== leases.length ||
+    value.nextFence <= maxFence
+  ) {
+    return undefined;
+  }
+  const nextFence = value.nextFence;
   return { version: STORE_VERSION, nextFence, leases };
 }
 
@@ -644,21 +705,32 @@ async function withStoreLock<T>(
   return withFileLock({ lockPath: `${storePath}.lock`, operation });
 }
 
-/** A lease as persisted — `fence` may be absent in a v1 store. */
-function isPersistedLease(value: unknown): value is Omit<ResourceLease, "fence"> & { fence?: number } {
-  return isResourceLease(value);
-}
-
-export function isResourceLease(value: unknown): value is ResourceLease {
+/** A lease as persisted — `fence` may be absent only while reading a v1 store. */
+function isPersistedLease(
+  value: unknown,
+): value is Omit<ResourceLease, "fence"> & { fence?: number } {
   return (
     isRecord(value) &&
     typeof value.id === "string" &&
+    value.id.trim().length > 0 &&
     typeof value.owner === "string" &&
+    value.owner.trim().length > 0 &&
     typeof value.acquiredAt === "string" &&
+    Number.isFinite(Date.parse(value.acquiredAt)) &&
+    (value.heartbeatAt === undefined ||
+      (typeof value.heartbeatAt === "string" &&
+        Number.isFinite(Date.parse(value.heartbeatAt)))) &&
     typeof value.expiresAt === "string" &&
+    Number.isFinite(Date.parse(value.expiresAt)) &&
     Array.isArray(value.claims) &&
-    value.claims.every(isResourceClaim)
+    value.claims.length > 0 &&
+    value.claims.every(isPersistedClaim) &&
+    (value.fence === undefined || isPositiveSafeInteger(value.fence))
   );
+}
+
+export function isResourceLease(value: unknown): value is ResourceLease {
+  return isPersistedLease(value) && isPositiveSafeInteger(value.fence);
 }
 
 export function isResourceClaim(value: unknown): value is ResourceClaim {
@@ -670,8 +742,35 @@ export function isResourceClaim(value: unknown): value is ResourceClaim {
   );
 }
 
+function isPersistedClaim(value: unknown): value is ResourceClaim {
+  if (!isResourceClaim(value) || !normalizeResource(value.resource)) return false;
+  if (value.kind !== "write") return true;
+  if (value.mode !== "exclusive") return false;
+  const resource = normalizeResource(value.resource);
+  return !(
+    resource === ".." ||
+    resource.startsWith("../") ||
+    resource.includes("/../") ||
+    isAbsolute(resource) ||
+    /^[A-Za-z]:\//u.test(resource) ||
+    resource.startsWith("//")
+  );
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+function isPositiveSafeInteger(value: unknown): value is number {
+  return (
+    typeof value === "number" &&
+    Number.isSafeInteger(value) &&
+    value >= 1
+  );
+}
+
+function hasAvailableFence(value: unknown): value is number {
+  return isPositiveSafeInteger(value) && value < Number.MAX_SAFE_INTEGER;
 }
 
 function isNodeError(error: unknown): error is NodeJS.ErrnoException {

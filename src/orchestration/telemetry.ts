@@ -33,6 +33,10 @@ export const ORCHESTRATION_EVENT_TYPES = [
   "task_failed",
   "task_cancelled",
   "task_timed_out",
+  "task_outcome_reported",
+  "task_awaiting_decision",
+  "decision_requested",
+  "decision_responded",
   "task_awaiting_review",
   "claim_acquired",
   "claim_released",
@@ -92,7 +96,10 @@ export interface NewOrchestrationEvent {
   verdict?: string;
   reviewerTaskId?: string;
   reviewerInvocationId?: string;
+  reviewerOutputDigest?: string;
   subjectDigest?: string;
+  reportedOutcome?: string;
+  decisionId?: string;
   idempotencyKey?: string;
 }
 

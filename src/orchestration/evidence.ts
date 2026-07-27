@@ -30,6 +30,13 @@ export interface EvidenceReceipt {
   sha256: string;
   observedAt: string;
   exitCode?: number;
+  /** Only runtime-observation receipts may satisfy the proof gate. */
+  authority?: "manual-artifact" | "runtime-observation";
+  command?: string;
+  commandDigest?: string;
+  cwd?: string;
+  toolCallId?: string;
+  sessionDigest?: string;
 }
 
 interface EvidenceDocument {
@@ -85,6 +92,7 @@ export async function recordEvidenceReceipt(input: {
     sha256: `sha256:${createHash("sha256").update(readFileSync(absolutePath)).digest("hex")}`,
     observedAt: (input.now ?? new Date()).toISOString(),
     ...(input.exitCode === undefined ? {} : { exitCode: input.exitCode }),
+    authority: "manual-artifact",
   };
   const path = evidencePath(input.storeDirectory, input.taskId);
   await withFileLock({
@@ -96,6 +104,166 @@ export async function recordEvidenceReceipt(input: {
     },
   });
   return receipt;
+}
+
+/**
+ * Capture shell observations from the runtime-owned session transcript.  The
+ * child cannot choose the receipt fields: command, cwd, exit status, output,
+ * timestamp and transcript digest are taken from matched toolCall/toolResult
+ * entries and written as one immutable canonical artifact.
+ */
+export async function captureSessionCommandReceipts(input: {
+  storeDirectory: string;
+  projectDirectory: string;
+  taskId: string;
+  producerTaskId: string;
+  sessionPath: string;
+  notBefore?: string;
+}): Promise<EvidenceReceipt[]> {
+  const sessionBytes = await readFile(input.sessionPath);
+  const sessionDigest = taggedDigest(sessionBytes);
+  const calls = new Map<
+    string,
+    { name: string; command: string; cwd: string; callTimestamp?: string }
+  >();
+  const observations: Array<{
+    toolCallId: string;
+    command: string;
+    cwd: string;
+    output: string;
+    exitCode: number;
+    observedAt: string;
+  }> = [];
+  const notBefore = input.notBefore ? Date.parse(input.notBefore) : undefined;
+
+  for (const line of sessionBytes.toString("utf8").split("\n")) {
+    if (!line.trim()) continue;
+    let entry: unknown;
+    try {
+      entry = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (!isRecord(entry)) continue;
+    const message = isRecord(entry.message) ? entry.message : entry;
+    const timestamp = stringField(entry.timestamp) ?? stringField(message.timestamp);
+    if (message.role === "assistant" && Array.isArray(message.content)) {
+      for (const block of message.content) {
+        if (!isRecord(block) || block.type !== "toolCall") continue;
+        const name = stringField(block.name) ?? "";
+        if (!isShellToolName(name)) continue;
+        const args = isRecord(block.arguments)
+          ? block.arguments
+          : isRecord(block.input)
+            ? block.input
+            : undefined;
+        const command =
+          stringField(args?.command) ?? stringField(args?.cmd) ?? "";
+        const id = stringField(block.id);
+        if (!id || !command.trim()) continue;
+        calls.set(id, {
+          name,
+          command,
+          cwd: stringField(args?.cwd) ?? input.projectDirectory,
+          ...(timestamp ? { callTimestamp: timestamp } : {}),
+        });
+      }
+      continue;
+    }
+    if (message.role !== "toolResult") continue;
+    const toolCallId = stringField(message.toolCallId);
+    if (!toolCallId) continue;
+    const call = calls.get(toolCallId);
+    if (!call) continue;
+    const observedAt = timestamp ?? call.callTimestamp ?? new Date().toISOString();
+    if (
+      notBefore !== undefined &&
+      Number.isFinite(notBefore) &&
+      Date.parse(observedAt) < notBefore
+    ) {
+      continue;
+    }
+    const details = isRecord(message.details) ? message.details : undefined;
+    const explicitExitCode = numberField(details?.exitCode) ?? numberField(details?.exit_code);
+    const exitCode = explicitExitCode ?? (message.isError === true ? 1 : 0);
+    observations.push({
+      toolCallId,
+      command: call.command,
+      cwd: call.cwd,
+      output: contentText(message.content),
+      exitCode,
+      observedAt,
+    });
+    calls.delete(toolCallId);
+  }
+
+  const outputDirectory = resolve(
+    input.storeDirectory,
+    "runtime",
+    safeKey(input.taskId),
+  );
+  await mkdir(outputDirectory, { recursive: true });
+  const receipts: EvidenceReceipt[] = [];
+  for (const observation of observations) {
+    const observationKey = createHash("sha256")
+      .update(sessionDigest)
+      .update("\0")
+      .update(observation.toolCallId)
+      .digest("hex");
+    const artifactPath = resolve(outputDirectory, `${observationKey}.json`);
+    const artifact = {
+      version: 1,
+      taskId: input.taskId,
+      producerTaskId: input.producerTaskId,
+      sessionDigest,
+      toolCallId: observation.toolCallId,
+      command: observation.command,
+      commandDigest: taggedDigest(observation.command),
+      cwd: observation.cwd,
+      exitCode: observation.exitCode,
+      observedAt: observation.observedAt,
+      output: observation.output,
+    };
+    await writeCanonicalArtifact(artifactPath, artifact);
+    const artifactRelative = projectRelativeFile(
+      input.projectDirectory,
+      artifactPath,
+    );
+    const receipt: EvidenceReceipt = {
+      version: EVIDENCE_STORE_VERSION,
+      id: `observation-${observationKey}`,
+      taskId: input.taskId,
+      producerTaskId: input.producerTaskId,
+      kind: looksLikeTestCommand(observation.command) ? "test" : "command-output",
+      description: `Runtime-observed command: ${observation.command}`,
+      artifactPath: artifactRelative,
+      sha256: taggedDigest(await readFile(artifactPath)),
+      observedAt: observation.observedAt,
+      exitCode: observation.exitCode,
+      authority: "runtime-observation",
+      command: observation.command,
+      commandDigest: taggedDigest(observation.command),
+      cwd: observation.cwd,
+      toolCallId: observation.toolCallId,
+      sessionDigest,
+    };
+    receipts.push(receipt);
+  }
+
+  if (receipts.length > 0) {
+    const path = evidencePath(input.storeDirectory, input.taskId);
+    await withFileLock({
+      lockPath: `${path}.lock`,
+      operation: async () => {
+        const document = await readEvidenceDocument(path);
+        const byId = new Map(document.receipts.map((receipt) => [receipt.id, receipt]));
+        for (const receipt of receipts) byId.set(receipt.id, receipt);
+        document.receipts = [...byId.values()];
+        await writeEvidenceDocument(path, document);
+      },
+    });
+  }
+  return receipts;
 }
 
 export async function listEvidenceReceipts(
@@ -136,6 +304,70 @@ function evidencePath(storeDirectory: string, taskId: string): string {
     throw new Error(`Invalid evidence task key: ${taskId}`);
   }
   return resolve(storeDirectory, `${taskId}.json`);
+}
+
+function safeKey(value: string): string {
+  if (!/^[A-Za-z0-9._-]+$/u.test(value)) {
+    throw new Error(`Invalid evidence task key: ${value}`);
+  }
+  return value;
+}
+
+function projectRelativeFile(projectDirectory: string, filePath: string): string {
+  const projectRoot = realpathSync(resolve(projectDirectory));
+  const realPath = realpathSync(filePath);
+  const relativePath = relative(projectRoot, realPath);
+  if (
+    relativePath === ".." ||
+    relativePath.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`) ||
+    isAbsolute(relativePath)
+  ) {
+    throw new Error(`Runtime evidence artifact is outside the project: ${filePath}`);
+  }
+  return relativePath.replaceAll("\\", "/");
+}
+
+async function writeCanonicalArtifact(
+  path: string,
+  value: Record<string, unknown>,
+): Promise<void> {
+  const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  await rename(temporary, path);
+}
+
+function taggedDigest(value: string | Uint8Array): string {
+  return `sha256:${createHash("sha256").update(value).digest("hex")}`;
+}
+
+function isShellToolName(name: string): boolean {
+  return ["bash", "shell", "exec_command"].includes(name);
+}
+
+function looksLikeTestCommand(command: string): boolean {
+  return /(?:^|\s)(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?test\b|(?:^|\s)(?:pytest|vitest|jest|cargo\s+test|go\s+test)\b/u.test(
+    command,
+  );
+}
+
+function stringField(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function numberField(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function contentText(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (!Array.isArray(value)) return "";
+  return value
+    .flatMap((item) => {
+      if (typeof item === "string") return [item];
+      if (isRecord(item) && typeof item.text === "string") return [item.text];
+      return [];
+    })
+    .join("\n");
 }
 
 async function readEvidenceDocument(path: string): Promise<EvidenceDocument> {

@@ -4,6 +4,14 @@ A Herdr-native delegation runtime for [Pi](https://pi.dev): durable foreground/b
 
 **Runtime-only.** The package ships no agent profiles. Profiles remain owned by the consumer in `.pi/agents/*.md` or `~/.pi/agent/agents/*.md`. The runtime is additive and does not inject package policy into the consumer's parent system prompt. Its packaged skill is loaded only on demand through Pi's normal skill mechanism.
 
+## What's new in 0.9.0
+
+- Independent **review** gate bound to a settled run, with its own durable verdict.
+- **Semantic attestation** evidence module; the proof gate now binds evidence to the run's `resultDigest`.
+- The run store is **CAS-fenced** on terminal results and **unique-constrained** on decision-resume correlations; leases carry an `expectedFence` on acquire/release/transfer.
+- New **multi-process contention fixtures** prove lease mutual exclusion, the terminal-result CAS, and the durable-invocation unique constraint under real inter-process concurrency.
+- Peer `@minhduydev/pi-core` moved to `^0.2.0`. See `CHANGELOG.md`.
+
 ## Requirements
 
 - Node.js 20+

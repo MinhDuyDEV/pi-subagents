@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Added
 - _Development cycle for 0.6.0._
 
+## [0.9.0] - 2026-07-27
+
+Hardening of the durable orchestration kernel: the run store is now
+compare-and-set fenced on terminal results and unique-constrained on
+decision-resume correlations, resource leases carry an `expectedFence` on
+acquire/release/transfer, and the proof gate binds evidence to a
+`resultDigest`. A new independent review gate and a semantic-attestation
+evidence module join the kernel. The contract change consumes the new
+`@minhduydev/pi-core` 0.2.0 workflow and task-lifecycle modules, so the
+peer range moves to `^0.2.0`.
+
+### Added
+- `review` orchestration: an independent review gate bound to a settled run, with its own durable state and verdict.
+- `evidence` module: `SemanticAttestationV1` evidence and proof substantiation bound to the run's `resultDigest`.
+- Multi-process contention fixtures (`test/orchestration-store-contention.test.ts` + `test/fixtures/store-contention-worker.ts`) that spawn real child processes racing the same lease, run, and decision-resume stores — proving mutual exclusion, the terminal-result CAS fence, and the durable-invocation unique constraint under genuine inter-process concurrency, not just `Promise.all` serialization.
+
+### Changed
+- `run-store`: terminal execution results are compare-and-set fenced on `resultDigest` (a second completion with a different digest throws `Conflicting terminal result`), and a durable invocation is unique-constrained by decision-resume correlation (a second resume for the same correlation throws `already has a durable invocation`).
+- `claims`: lease acquire/release/transfer now carry an `expectedFence` so a stale lease ID is rejected before it mutates the store.
+- `proof`: the proof gate attests against the run's `resultDigest` so evidence cannot be replayed against a different terminal result.
+- Peer dependency `@minhduydev/pi-core` moved from `^0.1.0` to `^0.2.0` to consume the workflow and task-lifecycle contracts.
+
 ## [0.8.1] - 2026-07-27
 
 Redesign of the task-giving language layer: the subagent stays an independent problem-solver (anti pre-solve/worker-ization). The evidence/proof/review kernel (leases, fencing, proof gate, review binding) is semantically unchanged.

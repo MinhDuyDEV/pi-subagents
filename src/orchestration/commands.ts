@@ -50,6 +50,7 @@ export async function stopOwnedTask(
       storePath: paths.leaseStore,
       leaseId: run.lease.id,
       expectedOwner: run.lease.owner,
+      expectedFence: run.lease.fence,
     });
   }
   if (run && !["completed", "failed", "cancelled", "timeout"].includes(run.executionPhase)) {

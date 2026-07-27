@@ -117,6 +117,9 @@ export function completeTask(
           ...(parsed.needs_decision
             ? { needs_decision: parsed.needs_decision }
             : {}),
+          ...(parsed.decision_request
+            ? { decision_request: structuredClone(parsed.decision_request) }
+            : {}),
           duration_ms: durationMs,
           tool_uses: task.toolUses,
           turn_count: task.turns,

@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -81,7 +82,7 @@ describe("evidence-only review", () => {
     );
   });
 
-  it("rejects self-declared evidence without a runtime receipt or session binding", async () => {
+  it("rejects self-declared evidence even when the artifact exists", async () => {
     const projectDirectory = await createTemporaryProject();
     const artifact = join(projectDirectory, "declared.txt");
     await writeFile(artifact, "claimed pass", "utf8");
@@ -100,15 +101,18 @@ describe("evidence-only review", () => {
     });
     expect(result.valid).toBe(false);
     expect(result.issues).toContain(
-      "Evidence lacks a runtime-generated receipt or session binding: declared.txt.",
+      "Evidence lacks a runtime-generated receipt: declared.txt.",
     );
   });
 
-  it("accepts fresh project-local evidence", async () => {
+  it("accepts a fresh runtime-observed zero-exit command receipt", async () => {
     const projectDirectory = await createTemporaryProject();
     const evidencePath = join(projectDirectory, "artifacts", "focused-test.txt");
     await mkdir(join(projectDirectory, "artifacts"), { recursive: true });
     await writeFile(evidencePath, "4 tests passed\n", "utf8");
+    const digest = `sha256:${createHash("sha256")
+      .update("4 tests passed\n")
+      .digest("hex")}`;
 
     const result = await validateEvidenceOnlyProof({
       projectDirectory,
@@ -117,13 +121,53 @@ describe("evidence-only review", () => {
           description: "Focused test passed",
           reference: "artifacts/focused-test.txt",
           recordedAt: "2026-07-19T00:09:00.000Z",
-          source: "runtime-session",
+          source: "runtime-receipt",
+          receiptId: "observation-tool-1",
+          sha256: digest,
+          receiptKind: "test",
+          exitCode: 0,
+          command: "npm test",
+          cwd: projectDirectory,
+          toolCallId: "tool-1",
+          sessionDigest: `sha256:${"a".repeat(64)}`,
         },
       ],
       now: new Date("2026-07-19T00:10:00.000Z"),
       maxEvidenceAgeMs: 10 * 60 * 1_000,
     });
 
-    expect(result).toEqual({ valid: true, issues: [], supportedClaims: [] });
+    expect(result).toEqual({
+      valid: true,
+      receiptIntegrityValid: true,
+      semanticProofValid: true,
+      issues: [],
+      supportedClaims: [],
+    });
+  });
+
+  it("rejects a forged receipt whose artifact changed", async () => {
+    const projectDirectory = await createTemporaryProject();
+    await writeFile(join(projectDirectory, "receipt.json"), "tampered\n");
+    const result = await validateEvidenceOnlyProof({
+      projectDirectory,
+      evidence: [{
+        description: "Forged command receipt",
+        reference: "receipt.json",
+        recordedAt: "2026-07-19T00:09:00.000Z",
+        source: "runtime-receipt",
+        receiptId: "observation-forged",
+        sha256: `sha256:${"b".repeat(64)}`,
+        receiptKind: "test",
+        exitCode: 0,
+        command: "npm test",
+        cwd: projectDirectory,
+        toolCallId: "tool-forged",
+        sessionDigest: `sha256:${"c".repeat(64)}`,
+      }],
+      now: new Date("2026-07-19T00:10:00.000Z"),
+      maxEvidenceAgeMs: 10 * 60_000,
+    });
+    expect(result.receiptIntegrityValid).toBe(false);
+    expect(result.issues.join(" ")).toMatch(/changed after receipt/u);
   });
 });

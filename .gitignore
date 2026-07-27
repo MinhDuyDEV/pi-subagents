@@ -5,3 +5,6 @@ dist/
 .env
 .pi/
 artifacts/
+
+# Local agent harness state
+.omc/

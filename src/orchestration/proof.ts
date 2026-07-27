@@ -12,9 +12,14 @@ import type {
   TaggedSha256V1,
 } from "../learning-contract.js";
 import type { ContextEvidence } from "./context.js";
+import type { SemanticAttestationV1 } from "./run-store.js";
 
 export interface EvidenceProofResult {
   valid: boolean;
+  /** Integrity (fresh, runtime-owned, digest-bound receipt) is separate from
+   * semantic substantiation of the requested claims. */
+  receiptIntegrityValid: boolean;
+  semanticProofValid: boolean;
   issues: string[];
   supportedClaims: SupportedLearningClaimV1[];
 }
@@ -27,11 +32,19 @@ export async function validateEvidenceOnlyProof(input: {
   maxEvidenceAgeMs: number;
   claims?: readonly string[];
   learningClaims?: readonly LearningClaimV1[];
+  /** Reviewer-owned, canonical semantic attestations. */
+  semanticAttestations?: readonly SemanticAttestationV1[];
+  /** Current subject digest to which each attestation must bind. */
+  subjectDigest?: string;
 }): Promise<EvidenceProofResult> {
-  const issues: string[] = [];
+  const integrityIssues: string[] = [];
+  const semanticIssues: string[] = [];
   if (input.evidence.length === 0) {
     return {
       valid: false,
+      receiptIntegrityValid: false,
+      semanticProofValid: (input.claims?.length ?? 0) === 0 &&
+        (input.learningClaims?.length ?? 0) === 0,
       issues: ["No completion evidence was provided."],
       supportedClaims: unsupportedLearningClaims(input.learningClaims),
     };
@@ -43,20 +56,36 @@ export async function validateEvidenceOnlyProof(input: {
   ];
   const now = input.now ?? new Date();
   for (const evidence of input.evidence) {
-    validateEvidenceAuthority(evidence, issues);
-    validateFreshness(evidence, now, input.maxEvidenceAgeMs, issues);
-    validateReference(evidence, projectDirectories, issues);
+    validateEvidenceAuthority(evidence, integrityIssues);
+    validateFreshness(evidence, now, input.maxEvidenceAgeMs, integrityIssues);
+    validateReference(evidence, projectDirectories, integrityIssues);
   }
-  validateSubstantiation(input.claims, input.evidence, projectDirectories, issues);
+  validateSubstantiation(
+    input.claims,
+    input.evidence,
+    input.semanticAttestations,
+    input.subjectDigest,
+    semanticIssues,
+  );
   const supportedClaims = validateLearningClaims(
     input.learningClaims,
     input.evidence,
     projectDirectories,
     now,
     input.maxEvidenceAgeMs,
+    input.semanticAttestations,
+    input.subjectDigest,
+    semanticIssues,
   );
 
-  return { valid: issues.length === 0, issues, supportedClaims };
+  const issues = [...integrityIssues, ...semanticIssues];
+  return {
+    valid: issues.length === 0,
+    receiptIntegrityValid: integrityIssues.length === 0,
+    semanticProofValid: semanticIssues.length === 0,
+    issues,
+    supportedClaims,
+  };
 }
 
 function unsupportedLearningClaims(
@@ -75,6 +104,9 @@ function validateLearningClaims(
   projectDirectories: readonly string[],
   now: Date,
   maxEvidenceAgeMs: number,
+  semanticAttestations: readonly SemanticAttestationV1[] | undefined,
+  subjectDigest: string | undefined,
+  issues: string[],
 ): SupportedLearningClaimV1[] {
   return (claims ?? []).map((claim): SupportedLearningClaimV1 => {
     const boundEvidence = claim.support.evidenceRefs.map((reference) => ({
@@ -107,7 +139,18 @@ function validateLearningClaims(
         return { claimId: claim.claimId, supported: false, evidenceDigests: [] };
       }
       verifiedDigests.push(digest);
-      substantiated ||= fileContainsClaimToken(filePath, claim.statement);
+      const attestation = findSemanticAttestation(
+        semanticAttestations,
+        claim.statement,
+        item.receiptId ?? item.reference,
+        item.sha256 ?? "",
+        subjectDigest,
+      );
+      substantiated ||= attestation !== undefined;
+    }
+
+    if (!substantiated) {
+      issues.push(`Learning claim has no verifier-bound semantic proof: ${claim.claimId}`);
     }
 
     return {
@@ -122,26 +165,37 @@ function validateEvidenceAuthority(
   evidence: ContextEvidence,
   issues: string[],
 ): void {
-  if (
-    evidence.source !== "runtime-receipt" &&
-    evidence.source !== "runtime-session"
-  ) {
+  if (evidence.source !== "runtime-receipt") {
     issues.push(
-      `Evidence lacks a runtime-generated receipt or session binding: ${evidence.reference}.`,
+      `Evidence lacks a runtime-generated receipt: ${evidence.reference}.`,
     );
   }
   if (evidence.source === "runtime-receipt") {
-    if (!evidence.receiptId || !evidence.sha256 || !evidence.receiptKind) {
+    if (
+      !evidence.receiptId ||
+      !evidence.sha256 ||
+      !evidence.receiptKind ||
+      evidence.source !== "runtime-receipt"
+    ) {
       issues.push(`Runtime receipt metadata is incomplete: ${evidence.reference}.`);
     }
-    if (
-      (evidence.receiptKind === "test" ||
-        evidence.receiptKind === "command-output") &&
-      evidence.exitCode !== 0
-    ) {
-      issues.push(
-        `Evidence command did not exit successfully: ${evidence.reference} (exit ${evidence.exitCode ?? "unknown"}).`,
-      );
+    if (evidence.receiptKind === "session") {
+      issues.push(`A session transcript is not a command receipt: ${evidence.reference}.`);
+    }
+    if (evidence.receiptKind === "test" || evidence.receiptKind === "command-output") {
+      if (
+        !evidence.command ||
+        !evidence.cwd ||
+        !evidence.toolCallId ||
+        !evidence.sessionDigest
+      ) {
+        issues.push(`Runtime command receipt is not bound to an observed tool call: ${evidence.reference}.`);
+      }
+      if (evidence.exitCode !== 0) {
+        issues.push(
+          `Evidence command did not exit successfully: ${evidence.reference} (exit ${evidence.exitCode ?? "unknown"}).`,
+        );
+      }
     }
   }
 }
@@ -262,26 +316,6 @@ function isWithinRoot(root: string, candidate: string): boolean {
   );
 }
 
-const SUBSTANTIATION_STOPWORDS = new Set([
-  "the",
-  "and",
-  "with",
-  "that",
-  "this",
-  "from",
-  "have",
-  "been",
-  "will",
-  "was",
-  "were",
-  "are",
-  "for",
-  "not",
-  "but",
-  "your",
-  "their",
-]);
-
 function resolveEvidenceFilePath(
   evidence: ContextEvidence,
   projectDirectories: readonly string[],
@@ -301,64 +335,50 @@ function resolveEvidenceFilePath(
   }
 }
 
-function extractSignificantTokens(text: string): string[] {
-  const tokens = text
-    .toLowerCase()
-    .split(/[^a-z0-9]+/)
-    .filter(Boolean);
-  return tokens.filter(
-    (token) => token.length > 3 && !SUBSTANTIATION_STOPWORDS.has(token),
-  );
-}
-
-function fileContainsClaimToken(filePath: string, claim: string): boolean {
-  const claimTokens = extractSignificantTokens(claim);
-  if (claimTokens.length === 0) {
-    return true;
-  }
-  let contents: string;
-  try {
-    contents = readFileSync(filePath, "utf8").toLowerCase();
-  } catch {
-    return false;
-  }
-  const matching = claimTokens.filter((token) => contents.includes(token));
-  const required = Math.min(2, claimTokens.length);
-  return matching.length >= required;
-}
-
 function validateSubstantiation(
   claims: readonly string[] | undefined,
   evidence: readonly ContextEvidence[],
-  projectDirectories: readonly string[],
+  semanticAttestations: readonly SemanticAttestationV1[] | undefined,
+  subjectDigest: string | undefined,
   issues: string[],
 ): void {
   if (!claims || claims.length === 0) {
     return;
   }
   for (const claim of claims) {
-    let bound = evidence.filter((item) => item.claim === claim);
-    if (bound.length === 0) {
-      bound = evidence.filter(
-        (item) =>
-          item.claim !== undefined &&
-          item.claim.toLowerCase().includes(claim.toLowerCase()),
-      );
-    }
+    const bound = evidence.filter((item) => item.claim === claim);
     if (bound.length === 0) {
       issues.push(`Claim has no bound evidence: ${claim}`);
       continue;
     }
-    for (const item of bound) {
-      const filePath = resolveEvidenceFilePath(item, projectDirectories);
-      if (filePath === undefined) {
-        continue;
-      }
-      if (!fileContainsClaimToken(filePath, claim)) {
-        issues.push(
-          `Evidence does not substantiate claim: ${claim} (no overlap in ${item.reference})`,
-        );
-      }
+    const validBinding = bound.some((item) =>
+      findSemanticAttestation(
+        semanticAttestations,
+        claim,
+        item.receiptId ?? item.reference,
+        item.sha256 ?? "",
+        subjectDigest,
+      ),
+    );
+    if (!validBinding) {
+      issues.push(`Claim has no verifier-bound semantic proof: ${claim}`);
     }
   }
+}
+
+function findSemanticAttestation(
+  attestations: readonly SemanticAttestationV1[] | undefined,
+  claim: string,
+  receiptId: string,
+  artifactDigest: string,
+  subjectDigest: string | undefined,
+): SemanticAttestationV1 | undefined {
+  if (!subjectDigest) return undefined;
+  return (attestations ?? []).find(
+    (attestation) =>
+      attestation.claim === claim &&
+      attestation.receiptId === receiptId &&
+      attestation.artifactDigest === artifactDigest &&
+      attestation.subjectDigest === subjectDigest,
+  );
 }

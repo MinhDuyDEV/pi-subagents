@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -16,9 +17,13 @@ import {
 } from "../src/orchestration/context.ts";
 import { getOrchestrationPaths } from "../src/orchestration/paths.ts";
 import { registerTaskControlTool } from "../src/orchestration/tool.ts";
-import { appendOrchestrationEvent } from "../src/orchestration/telemetry.ts";
+import {
+  appendOrchestrationEvent,
+  readOrchestrationEvents,
+} from "../src/orchestration/telemetry.ts";
 import {
   createDurableRun,
+  getDurableRunByTaskId,
   putDurableRun,
 } from "../src/orchestration/run-store.ts";
 
@@ -52,12 +57,21 @@ afterEach(async () => {
   );
 });
 
-function createTaskControlTool(): ToolDefinition<TSchema, unknown> {
+function createTaskControlTool(
+  emit?: (event: string, payload: unknown) => unknown,
+): ToolDefinition<TSchema, unknown> {
   let tool: ToolDefinition<TSchema, unknown> | undefined;
   const pi = {
     registerTool(definition: ToolDefinition<TSchema, unknown>) {
       tool = definition;
     },
+    ...(emit
+      ? {
+          events: {
+            emit,
+          },
+        }
+      : {}),
   } as unknown as ExtensionAPI;
   registerTaskControlTool(pi);
   if (!tool) {
@@ -109,7 +123,186 @@ async function createSessionWithFinalText(
 }
 
 describe("task_control orchestration tool", () => {
-  it("binds evidence to a runtime-generated typed receipt", async () => {
+  it("atomically resolves a decision so duplicate responses cannot resume twice", async () => {
+    const projectDirectory = await createTemporaryProject();
+    const paths = getOrchestrationPaths(projectDirectory);
+    const run = createDurableRun({
+      invocationId: "decision-invocation",
+      projectDirectory,
+      description: "Wait for a parent decision",
+    });
+    run.taskId = "task-decision";
+    run.executionPhase = "completed";
+    run.reportedOutcome = "awaiting-decision";
+    run.decisionRequest = {
+      id: "decision-1",
+      question: "Which path?",
+      options: [
+        { id: "a", label: "Path A" },
+        { id: "b", label: "Path B" },
+      ],
+      requestedAt: "2026-07-27T00:00:00.000Z",
+      requestDigest: `sha256:v1:${"a".repeat(64)}`,
+      status: "pending",
+    };
+    await putDurableRun(paths.runStore, run);
+
+    const emitted: string[] = [];
+    const tool = createTaskControlTool((event) => {
+      emitted.push(event);
+    });
+    const input = {
+      action: "respond" as const,
+      task_id: "task-decision",
+      decision_id: "decision-1",
+      decision_option_id: "a",
+      decision_response: "Choose path A.",
+    };
+    const [first, duplicate] = await Promise.all([
+      tool.execute("respond-1", input, new AbortController().signal, undefined, createContext(projectDirectory)),
+      tool.execute("respond-2", input, new AbortController().signal, undefined, createContext(projectDirectory)),
+    ]);
+
+    expect([first.details?.status, duplicate.details?.status].sort()).toEqual([
+      "already-resolved",
+      "resolved",
+    ]);
+    const events = await readOrchestrationEvents(paths.eventLog);
+    expect(events.filter((event) => event.type === "decision_responded")).toHaveLength(1);
+    expect(
+      emitted.filter((event) => event === "pi-subagents:decision-response"),
+    ).toHaveLength(1);
+    const stored = await getDurableRunByTaskId(paths.runStore, "task-decision");
+    expect(stored?.decisionRequest).toMatchObject({
+      status: "resolved",
+      response: { optionId: "a", response: "Choose path A." },
+    });
+  });
+
+  it("retries the durable decision outbox after a resume listener failure", async () => {
+    const projectDirectory = await createTemporaryProject();
+    const paths = getOrchestrationPaths(projectDirectory);
+    const run = createDurableRun({
+      invocationId: "decision-retry-invocation",
+      projectDirectory,
+    });
+    run.taskId = "task-decision-retry";
+    run.executionPhase = "completed";
+    run.reportedOutcome = "awaiting-decision";
+    run.decisionRequest = {
+      id: "decision-retry",
+      question: "Retry dispatch?",
+      options: [{ id: "yes", label: "Yes" }],
+      requestedAt: "2026-07-27T00:00:00.000Z",
+      requestDigest: `sha256:v1:${"c".repeat(64)}`,
+      status: "pending",
+    };
+    await putDurableRun(paths.runStore, run);
+
+    let resumeAttempts = 0;
+    const tool = createTaskControlTool((event) => {
+      if (event !== "pi-subagents:decision-response") return;
+      resumeAttempts += 1;
+      if (resumeAttempts === 1) {
+        throw new Error("injected listener failure");
+      }
+    });
+    const input = {
+      action: "respond" as const,
+      task_id: "task-decision-retry",
+      decision_id: "decision-retry",
+      decision_option_id: "yes",
+      decision_response: "Retry safely.",
+    };
+
+    await expect(
+      tool.execute(
+        "respond-failing",
+        input,
+        new AbortController().signal,
+        undefined,
+        createContext(projectDirectory),
+      ),
+    ).rejects.toThrow(/recorded, but its task resume failed/u);
+    expect(
+      (
+        await getDurableRunByTaskId(
+          paths.runStore,
+          "task-decision-retry",
+        )
+      )?.decisionRequest?.response,
+    ).toMatchObject({
+      resumeState: "failed",
+      resumeError: "injected listener failure",
+    });
+
+    const retried = await tool.execute(
+      "respond-retry",
+      input,
+      new AbortController().signal,
+      undefined,
+      createContext(projectDirectory),
+    );
+    expect(retried.details?.status).toBe("resolved");
+    expect(resumeAttempts).toBe(2);
+    const events = await readOrchestrationEvents(paths.eventLog);
+    expect(
+      events.filter((event) => event.type === "decision_responded"),
+    ).toHaveLength(1);
+  });
+
+  it("never takes over an in-flight dispatch merely because thirty seconds elapsed", async () => {
+    const projectDirectory = await createTemporaryProject();
+    const paths = getOrchestrationPaths(projectDirectory);
+    const decisionId = "decision-still-dispatching";
+    const response = "Continue exactly once.";
+    const responseDigest = `sha256:v1:${createHash("sha256")
+      .update(JSON.stringify({ decisionId, optionId: null, response }))
+      .digest("hex")}` as const;
+    const run = createDurableRun({
+      invocationId: "decision-stale-window",
+      projectDirectory,
+    });
+    run.taskId = "task-stale-window";
+    run.executionPhase = "completed";
+    run.reportedOutcome = "awaiting-decision";
+    run.decisionRequest = {
+      id: decisionId,
+      question: "Continue?",
+      options: [],
+      requestedAt: "2026-07-27T00:00:00.000Z",
+      requestDigest: `sha256:v1:${"d".repeat(64)}`,
+      status: "resolved",
+      response: {
+        response,
+        respondedAt: "2026-07-27T00:01:00.000Z",
+        responseDigest,
+        resumeCorrelationId: `decision-resume:${run.invocationId}:${decisionId}`,
+        resumeState: "dispatching",
+        resumeAttemptId: "still-owned",
+        resumeDispatchStartedAt: "2026-07-27T00:01:00.000Z",
+      },
+    };
+    await putDurableRun(paths.runStore, run);
+    const emitted: string[] = [];
+    const tool = createTaskControlTool((event) => emitted.push(event));
+    const result = await tool.execute(
+      "respond-stale-window",
+      {
+        action: "respond",
+        task_id: run.taskId,
+        decision_id: decisionId,
+        decision_response: response,
+      },
+      new AbortController().signal,
+      undefined,
+      createContext(projectDirectory),
+    );
+    expect(result.details?.status).toBe("already-resolved");
+    expect(emitted).not.toContain("pi-subagents:decision-response");
+  });
+
+  it("keeps caller-recorded evidence distinct from runtime receipts", async () => {
     const projectDirectory = await createTemporaryProject();
     const paths = getOrchestrationPaths(projectDirectory);
     const run = createDurableRun({
@@ -148,7 +341,7 @@ describe("task_control orchestration tool", () => {
     });
     expect(pack?.evidence[0]).toMatchObject({
       reference: "test.log",
-      source: "runtime-receipt",
+      source: "declared",
       receiptKind: "test",
       exitCode: 0,
       receiptId: expect.any(String),
@@ -288,7 +481,7 @@ describe("task_control orchestration tool", () => {
     });
   });
 
-  it("returns the raw result for write-approved tasks when evidence-only proof passes", async () => {
+  it("does not accept a session-authored artifact as runtime proof", async () => {
     const projectDirectory = await createTemporaryProject();
     const taskId = "task-write-claim-proven";
     const sessionName = `task-${taskId}`;
@@ -349,9 +542,13 @@ describe("task_control orchestration tool", () => {
       createContext(projectDirectory),
     );
 
-    expect(result.content[0]).toEqual({
+    expect(result.isError).toBe(true);
+    expect(result.content[0]).toMatchObject({
       type: "text",
-      text: "verified final result",
+      text: expect.stringContaining("Claim not proven by evidence"),
+    });
+    expect(result.content[0]).toMatchObject({
+      text: expect.stringContaining("runtime-generated receipt"),
     });
   });
 
@@ -396,8 +593,26 @@ describe("task_control orchestration tool", () => {
         action: "handoff",
         task_id: "task-handoff",
         handoff: {
-          decisions: [{ statement: "Keep one canonical runtime." }],
-          next_step: "Run parity tests.",
+          version: 1,
+          kind: "handoff",
+          recordId: "handoff-runtime-1",
+          title: "Runtime handoff",
+          receiver: "agent",
+          goal: "Finish the runtime",
+          currentState: "The canonical runtime is wired.",
+          verified: ["The orchestration context is durable."],
+          unknowns: ["Whether parity tests expose another edge case."],
+          realConstraints: ["Keep one canonical runtime."],
+          relevantFiles: ["src/orchestration/runtime.ts"],
+          closedDecisions: ["Use the canonical runtime."],
+          openDecisions: ["None."],
+          existingEvidence: ["Typecheck passes."],
+          expectedDeliverable: "A verified runtime.",
+          permissions: ["May edit pi-subagents."],
+          antiPatterns: ["Do not fork another runtime."],
+          nextStep: "Run parity tests.",
+          resumeKeys: { taskId: "task-handoff" },
+          recordedAt: "2026-07-27T00:00:00.000Z",
         },
       },
       new AbortController().signal,

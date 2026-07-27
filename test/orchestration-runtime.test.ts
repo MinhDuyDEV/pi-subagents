@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -13,9 +14,11 @@ import {
   resolveUpstreamTaskExtension,
 } from "../src/orchestration/runtime.ts";
 import { acquireResourceLease } from "../src/orchestration/claims.ts";
+import { loadContextPack } from "../src/orchestration/context.ts";
 import { getOrchestrationPaths } from "../src/orchestration/paths.ts";
 import {
   createDurableRun,
+  getDurableRunByDecisionId,
   patchDurableRun,
   putDurableRun,
 } from "../src/orchestration/run-store.ts";
@@ -48,12 +51,14 @@ interface FakePi {
   tools: Map<string, ToolDefinition<TSchema, unknown>>;
   messages: unknown[];
   handlers: Map<string, Array<(...args: unknown[]) => unknown>>;
+  eventHandlers: Map<string, Array<(payload: unknown) => unknown>>;
 }
 
 function createFakePi(): FakePi {
   const tools = new Map<string, ToolDefinition<TSchema, unknown>>();
   const messages: unknown[] = [];
   const handlers = new Map<string, Array<(...args: unknown[]) => unknown>>();
+  const eventHandlers = new Map<string, Array<(payload: unknown) => unknown>>();
   const api = {
     registerTool(tool: ToolDefinition<TSchema, unknown>) {
       tools.set(tool.name, tool);
@@ -67,10 +72,31 @@ function createFakePi(): FakePi {
     sendMessage(message: unknown) {
       messages.push(message);
     },
-    events: { on() { return () => undefined; }, emit() {} },
+    events: {
+      on(event: string, handler: (payload: unknown) => unknown) {
+        const values = eventHandlers.get(event) ?? [];
+        values.push(handler);
+        eventHandlers.set(event, values);
+        return () => {
+          eventHandlers.set(
+            event,
+            (eventHandlers.get(event) ?? []).filter(
+              (candidate) => candidate !== handler,
+            ),
+          );
+        };
+      },
+      async emit(event: string, payload: unknown) {
+        const results = [];
+        for (const handler of eventHandlers.get(event) ?? []) {
+          results.push(await handler(payload));
+        }
+        return results;
+      },
+    },
     ui: { notify() {} },
   } as unknown as ExtensionAPI;
-  return { api, tools, messages, handlers };
+  return { api, tools, messages, handlers, eventHandlers };
 }
 
 function createContext(projectDirectory: string): ExtensionContext {
@@ -264,7 +290,11 @@ describe("orchestrated task runtime", () => {
         async execute() {
           return {
             content: [{ type: "text" as const, text: "Claimed completion." }],
-            details: { taskId: "task-foreground-proof", phase: "completed" },
+            details: {
+              taskId: "task-foreground-proof",
+              phase: "completed",
+              reported_status: "success",
+            },
           };
         },
       });
@@ -290,6 +320,134 @@ describe("orchestrated task runtime", () => {
     ).rejects.toThrow(/Evidence-only review failed/u);
   });
 
+  it("emits a canonical settlement for foreground tasks", async () => {
+    const projectDirectory = await createTemporaryProject();
+    const fakePi = createFakePi();
+    const settled: unknown[] = [];
+    fakePi.api.events.on("pi-subagents:task-settled", (payload) => {
+      settled.push(payload);
+    });
+    createTaskRuntime((pi) => {
+      pi.registerTool({
+        name: "task",
+        label: "Task",
+        description: "Foreground lifecycle upstream",
+        parameters: Type.Object({
+          agent_type: Type.String(),
+          prompt: Type.String(),
+          description: Type.String(),
+          background: Type.Optional(Type.Boolean()),
+        }),
+        async execute() {
+          return {
+            content: [{ type: "text" as const, text: "Completed." }],
+            details: {
+              taskId: "task-foreground-lifecycle",
+              phase: "completed",
+              reported_status: "success",
+            },
+          };
+        },
+      });
+    })(fakePi.api);
+
+    await fakePi.tools.get("task")?.execute(
+      "foreground-lifecycle",
+      {
+        agent_type: "general",
+        prompt: "Complete now.",
+        description: "Foreground lifecycle",
+        background: false,
+      },
+      new AbortController().signal,
+      undefined,
+      createContext(projectDirectory),
+    );
+
+    expect(settled).toEqual([
+      expect.objectContaining({
+        protocolVersion: 1,
+        taskId: "task-foreground-lifecycle",
+        terminalOutcome: "success",
+        reportedOutcome: "success",
+        executionPhase: "completed",
+        awaitingReview: false,
+      }),
+    ]);
+  });
+
+  it("emits review-pending background settlement without claiming verification failure", async () => {
+    const projectDirectory = await createTemporaryProject();
+    const fakePi = createFakePi();
+    const settled: Array<Record<string, unknown>> = [];
+    fakePi.api.events.on("pi-subagents:task-settled", (payload) => {
+      settled.push(payload as Record<string, unknown>);
+    });
+    let upstreamPi: ExtensionAPI | undefined;
+    createTaskRuntime((pi) => {
+      upstreamPi = pi;
+      pi.registerTool({
+        name: "task",
+        label: "Task",
+        description: "Review-pending lifecycle upstream",
+        parameters: Type.Object({
+          agent_type: Type.String(),
+          prompt: Type.String(),
+          description: Type.String(),
+          background: Type.Optional(Type.Boolean()),
+        }),
+        async execute() {
+          return {
+            content: [{ type: "text" as const, text: "Started." }],
+            details: { taskId: "task-review-pending", phase: "running" },
+          };
+        },
+      });
+    })(fakePi.api);
+    await fakePi.tools.get("task")?.execute(
+      "review-pending-lifecycle",
+      {
+        agent_type: "general",
+        prompt: "Complete for review.",
+        description: "Review pending lifecycle",
+        background: true,
+        orchestration: {
+          verifier: { required: true, reviewer_agent: "reviewer" },
+        },
+      },
+      new AbortController().signal,
+      undefined,
+      createContext(projectDirectory),
+    );
+    upstreamPi?.sendMessage(
+      {
+        customType: "task-complete",
+        content: "Completed and awaiting review.",
+        display: true,
+        details: {
+          task_id: "task-review-pending",
+          phase: "done",
+          execution_phase: "done",
+          reported_status: "success",
+        },
+      },
+      { triggerTurn: false },
+    );
+
+    await vi.waitFor(() => {
+      expect(settled).toEqual([
+        expect.objectContaining({
+          taskId: "task-review-pending",
+          terminalOutcome: "unknown",
+          reportedOutcome: "success",
+          executionPhase: "completed",
+          awaitingReview: true,
+        }),
+      ]);
+    });
+    expect(settled[0]).not.toHaveProperty("verificationPassed");
+  });
+
   it("defaults write-approved tasks to evidence-only proof when no proof is passed", async () => {
     const projectDirectory = await createTemporaryProject();
     const fakePi = createFakePi();
@@ -307,7 +465,11 @@ describe("orchestrated task runtime", () => {
         async execute() {
           return {
             content: [{ type: "text" as const, text: "Claimed completion." }],
-            details: { taskId: "task-write-default-proof", phase: "completed" },
+            details: {
+              taskId: "task-write-default-proof",
+              phase: "completed",
+              reported_status: "success",
+            },
           };
         },
       });
@@ -356,7 +518,11 @@ describe("orchestrated task runtime", () => {
         async execute() {
           return {
             content: [{ type: "text" as const, text: "Read-only findings." }],
-            details: { taskId: "task-read-only-no-proof", phase: "completed" },
+            details: {
+              taskId: "task-read-only-no-proof",
+              phase: "completed",
+              reported_status: "success",
+            },
           };
         },
       });
@@ -405,7 +571,11 @@ describe("orchestrated task runtime", () => {
         async execute() {
           return {
             content: [{ type: "text" as const, text: "Claimed completion." }],
-            details: { taskId: "task-write-env-proof", phase: "completed" },
+            details: {
+              taskId: "task-write-env-proof",
+              phase: "completed",
+              reported_status: "success",
+            },
           };
         },
       });
@@ -467,7 +637,13 @@ describe("orchestrated task runtime", () => {
               customType: "task-complete",
               content: "Finished immediately",
               display: true,
-              details: { task_id: "task-race", duration_ms: 1 },
+              details: {
+                task_id: "task-race",
+                duration_ms: 1,
+                phase: "done",
+                execution_phase: "done",
+                reported_status: "success",
+              },
             },
             { triggerTurn: false },
           );
@@ -560,6 +736,9 @@ describe("orchestrated task runtime", () => {
           task_id: "task-proof-fail",
           duration_ms: 1_000,
           evidence: "claimed command",
+          phase: "done",
+          execution_phase: "done",
+          reported_status: "success",
         },
       },
       { triggerTurn: false },
@@ -660,6 +839,34 @@ describe("orchestrated task runtime", () => {
           type: "message",
           message: {
             role: "assistant",
+            content: [
+              {
+                type: "toolCall",
+                id: "proof-command",
+                name: "bash",
+                arguments: {
+                  command: "npm test",
+                  cwd: projectDirectory,
+                },
+              },
+            ],
+          },
+        }),
+        JSON.stringify({
+          type: "message",
+          message: {
+            role: "toolResult",
+            toolCallId: "proof-command",
+            toolName: "bash",
+            isError: false,
+            details: { exitCode: 0 },
+            content: [{ type: "text", text: "all tests passed" }],
+          },
+        }),
+        JSON.stringify({
+          type: "message",
+          message: {
+            role: "assistant",
             provider: "provider-a",
             model: "model-a",
             content: [{ type: "text", text: "proof result" }],
@@ -685,6 +892,9 @@ describe("orchestrated task runtime", () => {
           task_id: "task-proof",
           duration_ms: 2_000,
           evidence: "npm test passed",
+          phase: "done",
+          execution_phase: "done",
+          reported_status: "success",
         },
       },
       { triggerTurn: false },
@@ -944,7 +1154,21 @@ describe("orchestrated task runtime", () => {
           message: {
             role: "assistant",
             stopReason: "stop",
-            content: [{ type: "text", text: "Recovered final result" }],
+            content: [
+              {
+                type: "text",
+                text: [
+                  "<status>success</status>",
+                  "<summary>Recovered final result</summary>",
+                  "<findings>Recovered after restart.</findings>",
+                  "<evidence></evidence>",
+                  "<files></files>",
+                  "<caveats></caveats>",
+                  "<next_steps></next_steps>",
+                  "<confidence>high</confidence>",
+                ].join("\n"),
+              },
+            ],
           },
         }),
       ].join("\n"),
@@ -1083,6 +1307,320 @@ describe("orchestrated task runtime", () => {
     expect(repairedHistory.find((entry) => entry.id === taskId)?.sessionRef).toBe(
       sessionPath,
     );
+  });
+
+  it("resumes a durable decision once and clears the matching Herdr blocker", async () => {
+    const projectDirectory = await createTemporaryProject();
+    const paths = getOrchestrationPaths(projectDirectory);
+    const original = createDurableRun({
+      invocationId: "decision-original",
+      projectDirectory,
+      agentType: "general",
+      description: "Continue after a choice",
+      startedAt: "2026-07-27T00:00:00.000Z",
+    });
+    original.taskId = "task-decision";
+    original.executionPhase = "completed";
+    original.reportedOutcome = "awaiting-decision";
+    original.decisionRequest = {
+      id: "decision-runtime-1",
+      question: "Which implementation?",
+      options: [{ id: "safe", label: "Safe path" }],
+      requestedAt: "2026-07-27T00:01:00.000Z",
+      requestDigest: `sha256:v1:${"a".repeat(64)}`,
+      status: "pending",
+    };
+    await putDurableRun(paths.runStore, original);
+
+    const fakePi = createFakePi();
+    let upstreamCalls = 0;
+    createTaskRuntime((pi) => {
+      pi.registerTool({
+        name: "task",
+        label: "Task",
+        description: "Decision resume upstream",
+        parameters: Type.Object({
+          agent_type: Type.String(),
+          prompt: Type.String(),
+          description: Type.String(),
+          task_id: Type.Optional(Type.String()),
+          background: Type.Optional(Type.Boolean()),
+        }),
+        async execute(_id, parameters) {
+          upstreamCalls += 1;
+          expect((parameters as Record<string, unknown>).task_id).toBe(
+            "task-decision",
+          );
+          return {
+            content: [{ type: "text" as const, text: "Resumed." }],
+            details: { taskId: "task-decision", phase: "working" },
+          };
+        },
+      });
+    })(fakePi.api);
+    const blockers: unknown[] = [];
+    fakePi.api.events.on("herdr:blocked", (payload) => {
+      blockers.push(payload);
+    });
+    await fakePi.handlers
+      .get("session_start")?.[0]
+      ?.({}, createContext(projectDirectory));
+
+    const control = fakePi.tools.get("task_control");
+    const input = {
+      action: "respond" as const,
+      task_id: "task-decision",
+      decision_id: "decision-runtime-1",
+      decision_option_id: "safe",
+      decision_response: "Use the safe path.",
+    };
+    const first = await control?.execute(
+      "respond-runtime-1",
+      input,
+      new AbortController().signal,
+      undefined,
+      createContext(projectDirectory),
+    );
+    const duplicate = await control?.execute(
+      "respond-runtime-2",
+      input,
+      new AbortController().signal,
+      undefined,
+      createContext(projectDirectory),
+    );
+
+    expect(first?.details?.status).toBe("resolved");
+    expect(duplicate?.details?.status).toBe("already-resolved");
+    expect(upstreamCalls).toBe(1);
+    const decisionRun = await getDurableRunByDecisionId(
+      paths.runStore,
+      "task-decision",
+      "decision-runtime-1",
+    );
+    expect(decisionRun?.decisionRequest?.response).toMatchObject({
+      resumeState: "started",
+      resumedInvocationId: expect.any(String),
+    });
+    expect(blockers).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          active: true,
+          blockerId: "decision-runtime-1",
+        }),
+        expect.objectContaining({
+          active: false,
+          blockerId: "decision-runtime-1",
+        }),
+      ]),
+    );
+    await fakePi.handlers.get("session_shutdown")?.[0]?.();
+  });
+
+  it("recovers a decision dispatch from its correlated durable resume without relaunching", async () => {
+    const projectDirectory = await createTemporaryProject();
+    const paths = getOrchestrationPaths(projectDirectory);
+    const decisionId = "decision-crash-1";
+    const response = "Keep the existing implementation.";
+    const responseDigest = `sha256:v1:${createHash("sha256")
+      .update(
+        JSON.stringify({
+          decisionId,
+          optionId: null,
+          response,
+        }),
+      )
+      .digest("hex")}` as const;
+    const resumeCorrelationId =
+      "decision-resume:decision-crash-original:decision-crash-1";
+    const original = createDurableRun({
+      invocationId: "decision-crash-original",
+      projectDirectory,
+      agentType: "general",
+      startedAt: "2026-07-27T00:00:00.000Z",
+    });
+    original.taskId = "task-crash-resume";
+    original.executionPhase = "completed";
+    original.reportedOutcome = "awaiting-decision";
+    original.decisionRequest = {
+      id: decisionId,
+      question: "Proceed?",
+      options: [],
+      requestedAt: "2026-07-27T00:01:00.000Z",
+      requestDigest: `sha256:v1:${"b".repeat(64)}`,
+      status: "resolved",
+      response: {
+        response,
+        respondedAt: "2026-07-27T00:02:00.000Z",
+        responseDigest,
+        resumeCorrelationId,
+        resumeState: "dispatching",
+        resumeAttemptId: "attempt-before-crash",
+        resumeDispatchStartedAt: "2026-07-27T00:02:00.000Z",
+      },
+    };
+    await putDurableRun(paths.runStore, original);
+    const correlated = createDurableRun({
+      invocationId: "resume-already-durable",
+      correlationId: resumeCorrelationId,
+      projectDirectory,
+      startedAt: "2026-07-27T00:03:00.000Z",
+    });
+    correlated.taskId = "task-crash-resume";
+    correlated.executionPhase = "working";
+    await putDurableRun(paths.runStore, correlated);
+
+    const fakePi = createFakePi();
+    let upstreamCalls = 0;
+    createTaskRuntime((pi) => {
+      pi.registerTool({
+        name: "task",
+        label: "Task",
+        description: "Must not relaunch",
+        parameters: Type.Object({}),
+        async execute() {
+          upstreamCalls += 1;
+          return { content: [], details: {} };
+        },
+      });
+    })(fakePi.api);
+    await fakePi.handlers
+      .get("session_start")?.[0]
+      ?.({}, createContext(projectDirectory));
+
+    expect(upstreamCalls).toBe(0);
+    const recovered = await getDurableRunByDecisionId(
+      paths.runStore,
+      "task-crash-resume",
+      decisionId,
+    );
+    expect(recovered?.decisionRequest?.response).toMatchObject({
+      resumeState: "started",
+      resumedInvocationId: "resume-already-durable",
+    });
+    await fakePi.handlers.get("session_shutdown")?.[0]?.();
+  });
+
+  it("resumes blind-first disclosure after a restart between orientation and continuation", async () => {
+    const projectDirectory = await createTemporaryProject();
+    const taskId = "task-blind-restart";
+    const firstPi = createFakePi();
+    let firstRuntimeCalls = 0;
+    createTaskRuntime((pi) => {
+      pi.registerTool({
+        name: "task",
+        label: "Task",
+        description: "Blind restart fixture",
+        parameters: Type.Object({
+          agent_type: Type.String(),
+          prompt: Type.String(),
+          description: Type.String(),
+          task_id: Type.Optional(Type.String()),
+          background: Type.Optional(Type.Boolean()),
+        }),
+        async execute(_id, parameters) {
+          firstRuntimeCalls += 1;
+          const prompt = String((parameters as Record<string, unknown>).prompt);
+          if (firstRuntimeCalls === 1) {
+            expect(prompt).toContain("Blind-first orientation turn");
+            expect(prompt).not.toContain("Sealed repository fact");
+            return {
+              content: [{ type: "text" as const, text: "Independent orientation" }],
+              details: { taskId, phase: "completed" },
+            };
+          }
+          expect(prompt).toContain("Sealed repository fact");
+          throw new Error("simulated process exit before continuation launch");
+        },
+      });
+    })(firstPi.api);
+    await firstPi.handlers
+      .get("session_start")?.[0]
+      ?.({}, createContext(projectDirectory));
+    await expect(
+      firstPi.tools.get("task")?.execute(
+        "blind-first",
+        {
+          agent_type: "general",
+          prompt: "Investigate independently.",
+          description: "Blind task",
+          background: true,
+          orchestration: {
+            context: {
+              goal: "Resolve the hidden issue",
+              authorization: "read-only",
+              known_facts: [{ statement: "Sealed repository fact", source: "repository" }],
+              next_step: "Inspect the boundary",
+              disclosure: "blind-first",
+            },
+          },
+        },
+        new AbortController().signal,
+        undefined,
+        createContext(projectDirectory),
+      ),
+    ).rejects.toThrow(/simulated process exit/u);
+    await firstPi.handlers.get("session_shutdown")?.[0]?.();
+
+    const paths = getOrchestrationPaths(projectDirectory);
+    const interrupted = await loadContextPack({
+      storeDirectory: paths.contextStore,
+      key: taskId,
+    });
+    expect(interrupted?.blindDisclosure?.phase).toBe("continuation-dispatching");
+
+    const secondPi = createFakePi();
+    let resumedCalls = 0;
+    createTaskRuntime((pi) => {
+      pi.registerTool({
+        name: "task",
+        label: "Task",
+        description: "Blind restart recovery",
+        parameters: Type.Object({
+          agent_type: Type.String(),
+          prompt: Type.String(),
+          description: Type.String(),
+          task_id: Type.Optional(Type.String()),
+          background: Type.Optional(Type.Boolean()),
+        }),
+        async execute(_id, parameters) {
+          resumedCalls += 1;
+          expect((parameters as Record<string, unknown>).task_id).toBe(taskId);
+          expect(String((parameters as Record<string, unknown>).prompt)).toContain(
+            "Sealed repository fact",
+          );
+          return {
+            content: [{ type: "text" as const, text: "Continuation launched" }],
+            details: { taskId, phase: "working" },
+          };
+        },
+      });
+    })(secondPi.api);
+    await secondPi.handlers
+      .get("session_start")?.[0]
+      ?.({}, createContext(projectDirectory));
+    await secondPi.tools.get("task")?.execute(
+      "blind-resume",
+      {
+        agent_type: "general",
+        task_id: taskId,
+        prompt: "Resume.",
+        description: "Blind task",
+        background: true,
+      },
+      new AbortController().signal,
+      undefined,
+      createContext(projectDirectory),
+    );
+    expect(resumedCalls).toBe(1);
+    const recovered = await loadContextPack({
+      storeDirectory: paths.contextStore,
+      key: taskId,
+    });
+    expect(recovered?.blindDisclosure).toMatchObject({
+      phase: "continuation-started",
+      continuedInvocationId: expect.any(String),
+    });
+    await secondPi.handlers.get("session_shutdown")?.[0]?.();
   });
 
   it("does not register the parent control plane inside child Pi processes", () => {

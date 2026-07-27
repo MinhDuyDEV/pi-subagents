@@ -1,14 +1,16 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
+  completeDurableRun,
   createDurableRun,
   getDurableRunByTaskId,
   listDurableRuns,
   patchDurableRun,
   putDurableRun,
 } from "../src/orchestration/run-store.ts";
+import { taggedDigest } from "../src/learning-contract.ts";
 
 const directories: string[] = [];
 afterEach(async () => {
@@ -71,5 +73,73 @@ describe("durable task run store", () => {
     const [loaded] = await listDurableRuns(path);
     expect(loaded?.invocationId).toBe("owner");
     expect(loaded?.verificationIssues).toEqual(["bad evidence"]);
+  });
+
+  it("claims terminal completion once and permits only an identical replay", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "pi-runs-"));
+    directories.push(directory);
+    const path = join(directory, "runs.json");
+    const run = createDurableRun({ invocationId: "completion-cas", projectDirectory: directory });
+    await putDurableRun(path, run);
+    await patchDurableRun(path, run.invocationId, { executionPhase: "working" });
+    const digest = taggedDigest({ outcome: "success" });
+    const first = await completeDurableRun(path, run.invocationId, digest, {
+      executionPhase: "completed",
+      reportedOutcome: "success",
+    });
+    const replay = await completeDurableRun(path, run.invocationId, digest, {
+      executionPhase: "completed",
+      reportedOutcome: "success",
+    });
+    expect(replay).toEqual(first);
+    await expect(
+      completeDurableRun(path, run.invocationId, taggedDigest({ outcome: "failure" }), {
+        executionPhase: "failed",
+        reportedOutcome: "failure",
+      }),
+    ).rejects.toThrow(/Conflicting terminal result/u);
+    await expect(putDurableRun(path, run)).rejects.toThrow(/Cannot overwrite terminal/u);
+  });
+
+  it("allows only one durable invocation for a decision-resume correlation", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "pi-runs-"));
+    directories.push(directory);
+    const path = join(directory, "runs.json");
+    const first = createDurableRun({
+      invocationId: "resume-1",
+      correlationId: "decision-resume:subject:decision",
+      projectDirectory: directory,
+    });
+    const second = createDurableRun({
+      invocationId: "resume-2",
+      correlationId: first.correlationId,
+      projectDirectory: directory,
+    });
+    await putDurableRun(path, first);
+    await expect(putDurableRun(path, second)).rejects.toThrow(
+      /already has a durable invocation/u,
+    );
+  });
+
+  it("does not create or re-expose the legacy persisted semantic secret", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "pi-runs-"));
+    directories.push(directory);
+    const path = join(directory, "runs.json");
+    const run = createDurableRun({
+      invocationId: "legacy-secret",
+      projectDirectory: directory,
+    });
+    expect("semanticBindingKey" in run).toBe(false);
+    await writeFile(
+      path,
+      JSON.stringify({
+        version: 1,
+        runs: [{ ...run, semanticBindingKey: "must-not-leak" }],
+      }),
+      "utf8",
+    );
+    const [loaded] = await listDurableRuns(path);
+    expect(loaded).toBeDefined();
+    expect("semanticBindingKey" in (loaded as object)).toBe(false);
   });
 });

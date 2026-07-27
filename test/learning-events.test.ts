@@ -372,37 +372,22 @@ describe("mergeLearningFacts", () => {
 
 describe("ContextRequestPayloadV1", () => {
   it("can be constructed with required fields", () => {
-    const payload: ContextRequestPayloadV1 = {
-      protocolVersion: 1,
-      taskId: "task-123",
-      correlationId: "corr-123",
-      agentType: "general",
-      description: "Implement feature X",
-    };
+    const payload: ContextRequestPayloadV1 = makeContextRequestPayload(
+      "task-123",
+      "general",
+      "Implement feature X",
+      "corr-123",
+    );
     expect(payload.protocolVersion).toBe(1);
     expect(payload.taskId).toBe("task-123");
     expect(payload.agentType).toBe("general");
     expect(payload.description).toBe("Implement feature X");
-    expect(payload.response).toBeUndefined();
+    expect("response" in payload).toBe(false);
   });
 
-  it("accepts optional response field", () => {
-    const ctx: LearningContextV1 = {
-      version: 1,
-      facts: [
-        { domain: "test", summary: "test fact", confidence: "high" },
-      ],
-    };
-    const payload: ContextRequestPayloadV1 = {
-      protocolVersion: 1,
-      taskId: "task-123",
-      correlationId: "corr-123",
-      agentType: "general",
-      description: "test",
-      response: ctx,
-    };
-    expect(payload.response).toBeDefined();
-    expect(payload.response!.facts).toHaveLength(1);
+  it("does not carry a mutable response slot", () => {
+    const payload = makeContextRequestPayload("task-123", "general", "test");
+    expect("response" in payload).toBe(false);
   });
 });
 
@@ -620,6 +605,15 @@ describe("validateEvidenceDigests", () => {
 // ───────────────────────────────────────────────────────────────────────────
 
 describe("makeContextRequestPayload", () => {
+  it("bounds redaction markers and rejects invalid clamp limits", () => {
+    const token = "A".repeat(150);
+    expect(clampString(token, 500)).toBe("[redacted:150chars]");
+    expect(clampString(token, 5)).toBe("[reda");
+    expect(clampString(token, 0)).toBe("");
+    expect(() => clampString("value", -1)).toThrow(/non-negative safe integer/u);
+    expect(() => clampString("value", 1.5)).toThrow(/non-negative safe integer/u);
+  });
+
   it("clamps taskId to MAX_TASK_ID", () => {
     const payload = makeContextRequestPayload(
       "x y ".repeat(100).trim(),
@@ -672,7 +666,7 @@ describe("makeContextRequestPayload", () => {
 
   it("does not set response field", () => {
     const payload = makeContextRequestPayload("task-1", "general", "desc");
-    expect(payload.response).toBeUndefined();
+    expect("response" in payload).toBe(false);
   });
 });
 

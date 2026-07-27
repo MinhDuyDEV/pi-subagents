@@ -8,7 +8,7 @@
  * guard config env the parent now passes — and drive `tool_call` events at it.
  */
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { Type, type TSchema } from "typebox";
@@ -17,6 +17,7 @@ import {
   acquireResourceLease,
   assertNoConflictingWrite,
   transferResourceLeaseOwnership,
+  type ResourceLease,
 } from "../src/orchestration/claims.ts";
 import {
   CHILD_CLAIM_GUARD_ENV,
@@ -66,11 +67,8 @@ afterEach(async () => {
   );
 });
 
-async function bootChild(projectDirectory: string, ownerIds: string[]): Promise<{
-  guard: ToolCallHandler;
-  leaseStore: string;
-}> {
-  const leaseStore = join(
+function leaseStoreFor(projectDirectory: string): string {
+  return join(
     projectDirectory,
     ".pi",
     "artifacts",
@@ -78,12 +76,60 @@ async function bootChild(projectDirectory: string, ownerIds: string[]): Promise<
     "orchestration",
     "leases.json",
   );
+}
+
+function guardStateFor(projectDirectory: string): string {
+  return join(
+    projectDirectory,
+    ".pi",
+    "artifacts",
+    "tasks",
+    "orchestration",
+    "claim-guards",
+    "invocation-child.json",
+  );
+}
+
+async function writeGuardState(
+  projectDirectory: string,
+  lease: ResourceLease,
+): Promise<void> {
+  const path = guardStateFor(projectDirectory);
+  await mkdir(join(path, ".."), { recursive: true });
+  await writeFile(
+    path,
+    `${JSON.stringify(
+      {
+        version: 1,
+        invocationId: "invocation-child",
+        leaseId: lease.id,
+        owner: lease.owner,
+        fence: lease.fence,
+        claims: lease.claims,
+        updatedAt: new Date().toISOString(),
+      },
+      null,
+      2,
+    )}\n`,
+    "utf8",
+  );
+}
+
+async function bootChild(
+  projectDirectory: string,
+  guardStateRequired = false,
+): Promise<{
+  guard: ToolCallHandler;
+  leaseStore: string;
+}> {
+  const leaseStore = leaseStoreFor(projectDirectory);
   process.env.PI_TASK_TOOL_DISABLED = "1";
   process.env[CHILD_CLAIM_GUARD_ENV] = JSON.stringify({
-    version: 1,
+    version: 2,
     projectDirectory,
     leaseStore,
-    ownerIds,
+    guardStatePath: guardStateFor(projectDirectory),
+    guardStateRequired,
   });
 
   const { api, toolCallHandlers } = createChildPi();
@@ -108,38 +154,34 @@ async function bootChild(projectDirectory: string, ownerIds: string[]): Promise<
 describe("child write-claim guard (S-A)", () => {
   it("blocks a child writing a path another task holds exclusively", async () => {
     const projectDirectory = await createProject();
-    const { guard, leaseStore } = await bootChild(projectDirectory, [
-      "task-child",
-      "invocation-child",
-    ]);
+    const leaseStore = leaseStoreFor(projectDirectory);
 
     await acquireResourceLease({
       storePath: leaseStore,
       owner: "task-other",
       claims: [{ kind: "write", resource: "src/auth/**", mode: "exclusive" }],
     });
+    const { guard } = await bootChild(projectDirectory);
 
     const verdict = await guard(
       { toolName: "write", input: { path: join(projectDirectory, "src/auth/token.ts") } },
       { cwd: projectDirectory },
     );
     expect(verdict).toMatchObject({ block: true });
-    expect((verdict as { reason: string }).reason).toMatch(/claimed by task task-other/u);
+    expect((verdict as { reason: string }).reason).toMatch(/owned by task-other/u);
   });
 
-  it("allows the child to write paths covered by its own lease — under either identity", async () => {
+  it("allows a child only under the exact live lease generation", async () => {
     const projectDirectory = await createProject();
-    const { guard, leaseStore } = await bootChild(projectDirectory, [
-      "task-child",
-      "invocation-child",
-    ]);
+    const leaseStore = leaseStoreFor(projectDirectory);
 
-    // Acquired under the invocation id at launch…
-    await acquireResourceLease({
+    const lease = await acquireResourceLease({
       storePath: leaseStore,
       owner: "invocation-child",
       claims: [{ kind: "write", resource: "src/auth/**", mode: "exclusive" }],
     });
+    await writeGuardState(projectDirectory, lease);
+    const { guard } = await bootChild(projectDirectory, true);
     await expect(
       guard(
         { toolName: "edit", input: { path: join(projectDirectory, "src/auth/token.ts") } },
@@ -148,29 +190,23 @@ describe("child write-claim guard (S-A)", () => {
     ).resolves.toBeUndefined();
   });
 
-  it("deliberately does not check fences — ownership against the live store is the property", async () => {
-    // The parent renews and transfers the lease on the child's behalf, so the
-    // child cannot know its current fence. The guard therefore allows a write
-    // under a lease generation the fence check would refuse, as long as the
-    // covering lease still belongs to one of the child's identities. This test
-    // locks that intentional behavior (see registerChildWriteClaimGuard).
+  it("blocks a stale child after ownership transfer or fence advancement", async () => {
     const projectDirectory = await createProject();
-    const { guard, leaseStore } = await bootChild(projectDirectory, [
-      "task-child",
-      "invocation-child",
-    ]);
+    const leaseStore = leaseStoreFor(projectDirectory);
 
     const issued = await acquireResourceLease({
       storePath: leaseStore,
       owner: "invocation-child",
       claims: [{ kind: "write", resource: "src/auth/**", mode: "exclusive" }],
     });
-    // Launch-time ownership alignment bumps the fence past the issued one.
-    await transferResourceLeaseOwnership({
+    await writeGuardState(projectDirectory, issued);
+    const { guard } = await bootChild(projectDirectory, true);
+    const transferred = await transferResourceLeaseOwnership({
       storePath: leaseStore,
       leaseId: issued.id,
       owner: "task-child",
       expectedOwner: "invocation-child",
+      expectedFence: issued.fence,
     });
 
     // A fence-aware caller holding the issued generation is refused…
@@ -183,8 +219,14 @@ describe("child write-claim guard (S-A)", () => {
       }),
     ).rejects.toThrow(/lease was superseded/u);
 
-    // …but the child guard, which owns the lease under its task identity,
-    // still allows the write.
+    const staleVerdict = await guard(
+      { toolName: "write", input: { path: join(projectDirectory, "src/auth/token.ts") } },
+      { cwd: projectDirectory },
+    );
+    expect(staleVerdict).toMatchObject({ block: true });
+    expect((staleVerdict as { reason: string }).reason).toMatch(/fence/u);
+
+    await writeGuardState(projectDirectory, transferred);
     await expect(
       guard(
         { toolName: "write", input: { path: join(projectDirectory, "src/auth/token.ts") } },
@@ -193,10 +235,21 @@ describe("child write-claim guard (S-A)", () => {
     ).resolves.toBeUndefined();
   });
 
+  it("fails closed when a claimed launch has no runtime guard state", async () => {
+    const projectDirectory = await createProject();
+    const { guard } = await bootChild(projectDirectory, true);
+    const verdict = await guard(
+      { toolName: "write", input: { path: join(projectDirectory, "src/auth/token.ts") } },
+      { cwd: projectDirectory },
+    );
+    expect(verdict).toMatchObject({ block: true });
+    expect((verdict as { reason: string }).reason).toMatch(/generation is unavailable/u);
+  });
+
   it("allows unclaimed paths and ignores writes outside the parent project", async () => {
     const projectDirectory = await createProject();
     const elsewhere = await createProject();
-    const { guard } = await bootChild(projectDirectory, ["task-child"]);
+    const { guard } = await bootChild(projectDirectory);
 
     await expect(
       guard(
@@ -238,22 +291,34 @@ describe("guard config parsing", () => {
     expect(
       parseChildClaimGuardConfig(
         JSON.stringify({
-          version: 1,
+          version: 2,
           projectDirectory: "/p",
           leaseStore: "/p/leases.json",
-          ownerIds: ["a", "b"],
+          guardStatePath: "/p/guard.json",
+          guardStateRequired: true,
         }),
       ),
-    ).toMatchObject({ ownerIds: ["a", "b"] });
+    ).toMatchObject({
+      version: 2,
+      projectDirectory: "/p",
+      guardStatePath: "/p/guard.json",
+      guardStateRequired: true,
+    });
 
     expect(parseChildClaimGuardConfig(undefined)).toBeUndefined();
     expect(parseChildClaimGuardConfig("not json")).toBeUndefined();
     expect(
-      parseChildClaimGuardConfig(JSON.stringify({ version: 2, ownerIds: [] })),
+      parseChildClaimGuardConfig(JSON.stringify({ version: 1, ownerIds: [] })),
     ).toBeUndefined();
     expect(
       parseChildClaimGuardConfig(
-        JSON.stringify({ version: 1, projectDirectory: "/p", leaseStore: "/l", ownerIds: [1] }),
+        JSON.stringify({
+          version: 2,
+          projectDirectory: "/p",
+          leaseStore: "/l",
+          guardStatePath: "/p/g",
+          guardStateRequired: "yes",
+        }),
       ),
     ).toBeUndefined();
   });

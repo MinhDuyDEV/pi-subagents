@@ -169,6 +169,7 @@ describe("write-claims audit in foreground completion", () => {
     const result = await recordForegroundCompletion(run, paths, {
       details: {
         phase: "done",
+        reported_status: "success",
         worktree: { changedPaths: ["unclaimed/b.ts"] },
       },
     });
@@ -213,6 +214,7 @@ describe("write-claims audit in foreground completion", () => {
     const result = await recordForegroundCompletion(run, paths, {
       details: {
         phase: "done",
+        reported_status: "success",
         worktree: { changedPaths: ["claimed/a.ts"] },
       },
     });

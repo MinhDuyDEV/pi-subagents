@@ -594,16 +594,36 @@ export default function (pi: ExtensionAPI) {
       // Without this, the child — the process doing the delegated writing —
       // was the one process whose writes were never checked (audit S-A).
       const claimGuardConfig: ChildClaimGuardConfig = {
-        version: 1,
+        version: 2,
         projectDirectory: ctx.cwd,
         leaseStore: getOrchestrationPaths(ctx.cwd).leaseStore,
-        ownerIds: [
-          id,
-          ...(params.__pi_subagents_invocation_id
-            ? [params.__pi_subagents_invocation_id]
-            : []),
-        ],
+        guardStatePath: join(
+          getOrchestrationPaths(ctx.cwd).root,
+          "claim-guards",
+          `${params.__pi_subagents_invocation_id ?? id}.json`,
+        ),
+        guardStateRequired: false,
       };
+      const claimOwnerIds = [
+        id,
+        ...(params.__pi_subagents_invocation_id
+          ? [params.__pi_subagents_invocation_id]
+          : []),
+      ];
+      try {
+        const leases = await listActiveResourceLeases({
+          storePath: claimGuardConfig.leaseStore,
+        });
+        claimGuardConfig.guardStateRequired = leases.some(
+          (lease) =>
+            claimOwnerIds.includes(lease.owner) &&
+            lease.claims.some(
+              (claim) => claim.kind === "write" || claim.kind === "test",
+            ),
+        );
+      } catch {
+        claimGuardConfig.guardStateRequired = true;
+      }
       const claimGuardEnvValue = JSON.stringify(claimGuardConfig);
 
       /**
@@ -619,7 +639,7 @@ export default function (pi: ExtensionAPI) {
           });
           return leases.some(
             (lease) =>
-              claimGuardConfig.ownerIds.includes(lease.owner) &&
+              claimOwnerIds.includes(lease.owner) &&
               lease.claims.some((claim) => claim.kind === "write"),
           );
         } catch {
@@ -818,6 +838,9 @@ export default function (pi: ExtensionAPI) {
                           confidence: parsed.confidence,
                           ...(parsed.needs_decision
                             ? { needs_decision: parsed.needs_decision }
+                            : {}),
+                          ...(parsed.decision_request
+                            ? { decision_request: structuredClone(parsed.decision_request) }
                             : {}),
                           duration_ms: Date.now() - backgroundTask.startedAt,
                           tool_uses: backgroundTask.toolUses,

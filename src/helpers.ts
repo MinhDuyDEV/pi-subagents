@@ -75,7 +75,21 @@ export interface ParsedResult {
    * `<needs_decision>` tag.
    */
   needs_decision?: string;
+  /** Parsed, typed decision request. Untyped prose remains display-only. */
+  decision_request?: TaskDecisionRequest;
   raw: string;
+}
+
+export interface TaskDecisionOption {
+  id: string;
+  label: string;
+  tradeoff?: string;
+}
+
+export interface TaskDecisionRequest {
+  question: string;
+  options: TaskDecisionOption[];
+  context?: string;
 }
 
 export type TaskReportedStatus =
@@ -156,7 +170,10 @@ export const TASK_RESULT_XML_INSTRUCTIONS = `When the task is complete, wrap the
 
 Use status "reframed" when the task's framing turned out to be wrong and you delivered the corrected framing instead — it is a valid outcome, not a failure. Explain the reframe in summary/findings.
 
-Optional tag, only when the parent must decide something you cannot: <needs_decision>The disputed premise or the decision needed — options with tradeoffs.</needs_decision>
+Optional tag, only when the parent must decide something you cannot. Its body MUST be one JSON object with a stable question and 2-8 options:
+<needs_decision>{"question":"Which direction should I take?","options":[{"id":"a","label":"Direction A","tradeoff":"Faster, less flexible"},{"id":"b","label":"Direction B","tradeoff":"Slower, more flexible"}],"context":"Why the choice is required now"}</needs_decision>
+
+Do not put free-form prose in <needs_decision>; an unparseable request cannot pause and resume the task safely.
 
 <decisions> is merged into findings. The parent parses these tags for the task UI.`;
 
@@ -293,6 +310,9 @@ export function parseResultXml(raw: string): ParsedResult {
     extractTag(raw, CHECKS_RE),
   );
   const needs_decision = extractTag(raw, NEEDS_DECISION_RE);
+  const decision_request = needs_decision
+    ? parseTaskDecisionRequest(needs_decision)
+    : undefined;
 
   return {
     status: status || "unknown",
@@ -304,7 +324,81 @@ export function parseResultXml(raw: string): ParsedResult {
     next_steps,
     confidence: confidence || "",
     ...(needs_decision ? { needs_decision } : {}),
+    ...(decision_request ? { decision_request } : {}),
     raw,
+  };
+}
+
+export function parseTaskDecisionRequest(
+  raw: string,
+): TaskDecisionRequest | undefined {
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    typeof (value as Record<string, unknown>).question !== "string" ||
+    !Array.isArray((value as Record<string, unknown>).options)
+  ) {
+    return undefined;
+  }
+  const object = value as Record<string, unknown> & {
+    question: string;
+    options: unknown[];
+  };
+  const question = object.question.trim();
+  const options = object.options as unknown[];
+  if (
+    question.length === 0 ||
+    question.length > 2_000 ||
+    options.length < 2 ||
+    options.length > 8
+  ) {
+    return undefined;
+  }
+  const parsedOptions: TaskDecisionOption[] = [];
+  const seen = new Set<string>();
+  for (const option of options) {
+    if (typeof option !== "object" || option === null) return undefined;
+    const record = option as Record<string, unknown>;
+    if (typeof record.id !== "string" || typeof record.label !== "string") {
+      return undefined;
+    }
+    const id = record.id.trim();
+    const label = record.label.trim();
+    if (
+      !/^[A-Za-z0-9._-]{1,64}$/u.test(id) ||
+      label.length === 0 ||
+      label.length > 500 ||
+      seen.has(id)
+    ) {
+      return undefined;
+    }
+    if (record.tradeoff !== undefined && typeof record.tradeoff !== "string") {
+      return undefined;
+    }
+    seen.add(id);
+    parsedOptions.push({
+      id,
+      label,
+      ...(typeof record.tradeoff === "string" && record.tradeoff.trim()
+        ? { tradeoff: record.tradeoff.trim().slice(0, 1_000) }
+        : {}),
+    });
+  }
+  if (object.context !== undefined && typeof object.context !== "string") {
+    return undefined;
+  }
+  return {
+    question,
+    options: parsedOptions,
+    ...(typeof object.context === "string" && object.context.trim()
+      ? { context: object.context.trim().slice(0, 2_000) }
+      : {}),
   };
 }
 
@@ -336,6 +430,9 @@ export function buildTaskEnvelope(
       caveats: parsed.caveats,
       next_steps: parsed.next_steps,
       ...(parsed.needs_decision ? { needs_decision: parsed.needs_decision } : {}),
+      ...(parsed.decision_request
+        ? { decision_request: structuredClone(parsed.decision_request) }
+        : {}),
       structured_result: assessment.valid,
     },
   };

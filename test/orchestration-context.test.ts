@@ -4,8 +4,11 @@ import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
+  beginBlindContinuation,
   buildContextPack,
   loadContextPack,
+  markBlindContinuationStarted,
+  recordBlindOrientation,
   renderContextPackForPrompt,
   saveContextPack,
   updateContextHandoff,
@@ -121,7 +124,7 @@ describe("Context Pack and Handoff", () => {
     expect(rendered).toContain(
       "Decision: Use a thin wrapper. — Avoid a fork. (unlock if: A measured cold-start regression exceeds 10%.)",
     );
-    expect(rendered).toContain("Evidence: Focused lifecycle test failed");
+    expect(rendered).toContain("Evidence receipt: Focused lifecycle test failed");
     expect(rendered).toContain(
       "Suggested entry point (optional, non-binding): Resolve the nested session.",
     );
@@ -155,8 +158,15 @@ describe("Context Pack and Handoff", () => {
     expect(rendered).not.toContain("The focused auth tests pass");
   });
 
-  it("seals facts and decisions behind the blind-first block, after goal and frontier", async () => {
+  it("uses two durable turns for blind-first disclosure", async () => {
     const projectDirectory = await createTemporaryProject();
+    const storeDirectory = join(
+      projectDirectory,
+      ".pi",
+      "artifacts",
+      "tasks",
+      "contexts",
+    );
     const pack = await buildContextPack({
       projectDirectory,
       input: {
@@ -166,34 +176,62 @@ describe("Context Pack and Handoff", () => {
         unknowns: ["Which lock ordering is correct."],
         decisions: [{ statement: "Keep the public API stable.", rationale: "Compatibility" }],
         nextStep: "Reproduce the failing test",
+        disclosure: "blind-first",
       },
     });
 
-    const rendered = renderContextPackForPrompt(pack, { disclosure: "blind-first" });
-    const sealedHeading =
-      "### Sealed context — open AFTER you have written your own 5-line read of the problem";
-    expect(rendered).toContain(sealedHeading);
+    const firstTurn = renderContextPackForPrompt(pack);
+    expect(firstTurn).toContain("## Blind-first orientation turn");
+    expect(firstTurn).toContain("Outcome: Fix the auth race");
+    expect(firstTurn).not.toContain("Current disk wins");
+    expect(firstTurn).not.toContain("Which lock ordering is correct");
+    expect(firstTurn).not.toContain("Keep the public API stable");
 
-    const sealedAt = rendered.indexOf(sealedHeading);
-    expect(rendered.indexOf("Goal: Fix the auth race")).toBeLessThan(sealedAt);
-    expect(rendered.indexOf("Authorization: write-approved")).toBeLessThan(sealedAt);
-    expect(rendered.indexOf("Unknown: Which lock ordering is correct.")).toBeLessThan(sealedAt);
-    expect(
-      rendered.indexOf("Suggested entry point (optional, non-binding):"),
-    ).toBeLessThan(sealedAt);
+    await saveContextPack({ storeDirectory, key: "task-blind", pack });
+    const oriented = await recordBlindOrientation({
+      storeDirectory,
+      key: "task-blind",
+      text: "The likely race is lock ordering; first reproduce without assuming the parent diagnosis.",
+      now: new Date("2026-07-19T00:01:00.000Z"),
+    });
+    const repeated = await recordBlindOrientation({
+      storeDirectory,
+      key: "task-blind",
+      text: "The likely race is lock ordering; first reproduce without assuming the parent diagnosis.",
+      now: new Date("2026-07-19T00:02:00.000Z"),
+    });
+    expect(repeated.revision).toBe(oriented.revision);
+    await expect(
+      recordBlindOrientation({
+        storeDirectory,
+        key: "task-blind",
+        text: "A different orientation",
+      }),
+    ).rejects.toThrow(/immutable/u);
 
-    // Facts and decisions appear only inside the sealed block.
-    expect(rendered.indexOf("Fact: [repository] Current disk wins.")).toBeGreaterThan(sealedAt);
-    expect(
-      rendered.indexOf("Decision: Keep the public API stable. — Compatibility"),
-    ).toBeGreaterThan(sealedAt);
-
-    // Default disclosure keeps the existing inline behavior.
-    const open = renderContextPackForPrompt(pack);
-    expect(open).not.toContain(sealedHeading);
-    expect(open.indexOf("Fact: [repository] Current disk wins.")).toBeLessThan(
-      open.indexOf("Suggested entry point"),
+    const dispatching = await beginBlindContinuation({
+      storeDirectory,
+      key: "task-blind",
+      attemptId: "attempt-1",
+      correlationId: "blind:task-blind",
+      now: new Date("2026-07-19T00:03:00.000Z"),
+    });
+    expect(dispatching.blindDisclosure?.phase).toBe("continuation-dispatching");
+    const started = await markBlindContinuationStarted({
+      storeDirectory,
+      key: "task-blind",
+      attemptId: "attempt-1",
+      continuedInvocationId: "invocation-2",
+      now: new Date("2026-07-19T00:04:00.000Z"),
+    });
+    const secondTurn = renderContextPackForPrompt(started);
+    expect(secondTurn).toContain("Fact: [repository] Current disk wins.");
+    expect(secondTurn).toContain("Unknown: Which lock ordering is correct.");
+    expect(secondTurn).toContain(
+      "Decision: Keep the public API stable. — Compatibility",
     );
+    expect(secondTurn).toContain("## Your independently recorded orientation");
+    expect(secondTurn).toContain("The likely race is lock ordering");
   });
 
   it("serializes concurrent handoff updates without losing decisions", async () => {

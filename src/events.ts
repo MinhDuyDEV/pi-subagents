@@ -11,8 +11,8 @@
  * 3. No field carries raw agent output, session transcripts, or secrets.
  * 4. Event emission is fail-open: a missing or throwing listener never
  *    blocks the task lifecycle.
- * 5. The context request uses a mutable container pattern so listeners
- *    can synchronously populate a response during event propagation.
+ * 5. Context responses use the correlated, bounded pi-learning v2 event;
+ *    the request payload is immutable.
  * ───────────────────────────────────────────────────────────────────────────
  */
 
@@ -38,6 +38,19 @@ export {
   type TaggedSha256V1,
   type UsageReceiptV1,
 } from "./learning-contract.js";
+
+export {
+  makeTaskSettledEvent,
+  makeTaskStartedEvent,
+  parseTaskSettledEvent,
+  parseTaskStartedEvent,
+  TASK_LIFECYCLE_EVENTS_V1,
+  type ReportedTaskOutcomeV1,
+  type TaskExecutionPhaseV1,
+  type TaskSettledEventV1,
+  type TaskStartedEventV1,
+  type TerminalTaskOutcomeV1,
+} from "@minhduydev/pi-core/task-lifecycle";
 
 // ───────────────────────────────────────────────────────────────────────────
 //  Bounded learning context (no raw transcripts, no secrets)
@@ -102,7 +115,7 @@ export interface LearningContextV1 {
 export const SUBAGENT_LEARNING_EVENTS_V1 = {
   /**
    * Emitted before a task is launched to request optional learning context.
-   * Listeners set `.response` on the mutable payload to provide context.
+   * Listeners answer on `pi-learning:v2:context-served`.
    */
   CONTEXT_REQUEST: "pi-subagents:v1:context-request",
   /**
@@ -185,12 +198,15 @@ function safeRedact(value: unknown): string {
 }
 
 export function clampString(value: string, maxLength: number): string {
+  if (!Number.isSafeInteger(maxLength) || maxLength < 0) {
+    throw new RangeError("maxLength must be a non-negative safe integer");
+  }
   if (typeof value !== "string") return "";
   // Redact if it looks like a long base64/hex token (no spaces, mostly alphanumeric)
   if (value.length > 100 && /^[A-Za-z0-9+/=_\-]{100,}$/.test(value.slice(0, 200))) {
-    return `[redacted:${value.length}chars]`;
+    return `[redacted:${value.length}chars]`.slice(0, maxLength);
   }
-  return value.slice(0, maxLength);
+  return safeRedact(value.normalize("NFKC")).slice(0, maxLength);
 }
 
 /**

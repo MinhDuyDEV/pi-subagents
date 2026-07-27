@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -60,6 +60,22 @@ describe("resource claims", () => {
       owner: "task-alpha",
       resource: "package/src/orchestration/runtime.ts",
     });
+  });
+
+  it("rejects overlapping exclusive claims even when the owner id is reused", async () => {
+    const storePath = await createStorePath();
+    await acquireResourceLease({
+      storePath,
+      owner: "same-owner",
+      claims: [{ kind: "write", resource: "src/**", mode: "exclusive" }],
+    });
+    await expect(
+      acquireResourceLease({
+        storePath,
+        owner: "same-owner",
+        claims: [{ kind: "write", resource: "src/index.ts", mode: "exclusive" }],
+      }),
+    ).rejects.toBeInstanceOf(ResourceClaimConflictError);
   });
 
   it("treats a global write glob as conflicting with every write path", async () => {
@@ -243,6 +259,7 @@ describe("resource claims", () => {
       leaseId: lease.id,
       owner: "task-canonical",
       expectedOwner: "run-preflight",
+      expectedFence: lease.fence,
     });
 
     expect(transferred?.owner).toBe("task-canonical");
@@ -264,6 +281,7 @@ describe("resource claims", () => {
         storePath,
         leaseId: lease.id,
         expectedOwner: "task-alpha",
+        expectedFence: lease.fence,
       }),
     ).toBe(true);
     expect(await listActiveResourceLeases({ storePath })).toEqual([]);
@@ -315,6 +333,7 @@ describe("resource claims", () => {
       storePath,
       leaseId: lease.id,
       owner: "opaque-owner",
+      expectedFence: lease.fence,
       now: new Date("2026-01-01T00:00:00.500Z"),
       ttlMs: 2_000,
     });
@@ -325,6 +344,7 @@ describe("resource claims", () => {
         storePath,
         leaseId: lease.id,
         owner: "forged-owner",
+        expectedFence: lease.fence,
         now: new Date("2026-01-01T00:00:00.600Z"),
       }),
     ).rejects.toThrow(/owned by opaque-owner/u);
@@ -360,6 +380,32 @@ describe("write-claim path coverage", () => {
 
     const lease = await findClaimCoveringPath({ storePath, path: "dir/a.ts" });
     expect(lease?.owner).toBe("task-owner");
+  });
+
+  it("selects the highest fence when reading overlapping legacy leases", async () => {
+    const storePath = await createStorePath();
+    const now = new Date("2026-07-19T00:00:00.000Z");
+    const lease = (id: string, fence: number) => ({
+      id,
+      owner: `owner-${fence}`,
+      claims: [{ kind: "write", resource: "dir/**", mode: "exclusive" }],
+      acquiredAt: now.toISOString(),
+      heartbeatAt: now.toISOString(),
+      expiresAt: new Date(now.getTime() + 60_000).toISOString(),
+      fence,
+    });
+    await writeFile(
+      storePath,
+      `${JSON.stringify({
+        version: 2,
+        nextFence: 10,
+        leases: [lease("old", 2), lease("new", 9)],
+      })}\n`,
+      "utf8",
+    );
+    const covering = await findClaimCoveringPath({ storePath, path: "dir/a.ts", now });
+    expect(covering?.id).toBe("new");
+    expect(covering?.fence).toBe(9);
   });
 
   it("findClaimCoveringPath treats a parent directory claim as covering a child path", async () => {

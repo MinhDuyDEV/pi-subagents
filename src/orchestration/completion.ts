@@ -1,10 +1,12 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { createHash } from "node:crypto";
 import type { WorktreeResult } from "../worktree.js";
 import {
   releaseResourceLease,
   type ResourceLease,
 } from "./claims.js";
 import type { ContextEvidence, ContextPack } from "./context.js";
+import { captureSessionCommandReceipts } from "./evidence.js";
 import { resolveTaskSessionReference } from "./lifecycle.js";
 import { getOrchestrationPaths, type OrchestrationPaths } from "./paths.js";
 import {
@@ -12,9 +14,19 @@ import {
   type EvidenceProofResult,
 } from "./proof.js";
 import {
+  completeDurableRun,
   getDurableRunByTaskId,
+  listDurableRuns,
   patchDurableRun,
+  type DurableTaskRun,
+  type TaskReportedOutcome,
 } from "./run-store.js";
+import { taggedDigest } from "../learning-contract.js";
+import {
+  isAcceptingReviewerVerdict,
+  isReviewerEventBound,
+  taskSubjectDigest,
+} from "./review.js";
 import { persistTaskHistoryReference } from "./task-state.js";
 import {
   appendOrchestrationEvent,
@@ -40,6 +52,8 @@ export interface ActiveRun {
   lastRenewMonotonicMs?: number;
   /** Set when the run lost its lease; the write guard refuses it from then on. */
   leaseLost?: boolean;
+  /** Prevent overlapping interval callbacks from racing lease transfer/renewal. */
+  heartbeatInFlight?: boolean;
   contextPack?: ContextPack;
   proof?: OrchestrationRequest["proof"];
   verifier?: OrchestrationRequest["verifier"];
@@ -47,12 +61,17 @@ export interface ActiveRun {
   executionDirectory?: string;
   batchId?: string;
   joinMode?: "async" | "group";
+  reportedOutcome?: TaskReportedOutcome;
+  semanticAttestations?: import("./run-store.js").SemanticAttestationV1[];
 }
 
 export interface BackgroundCompletionResult {
   handled: boolean;
   taskId?: string;
   executionPhase?: "completed" | "failed" | "cancelled" | "timeout";
+  reportedOutcome?: TaskReportedOutcome;
+  decisionRequest?: Record<string, unknown>;
+  decisionId?: string;
   proof?: EvidenceProofResult;
   awaitingReview?: boolean;
   issues: string[];
@@ -62,10 +81,15 @@ export async function recordForegroundCompletion(
   run: ActiveRun,
   paths: OrchestrationPaths,
   upstreamResult?: { details?: unknown; isError?: boolean },
+  pi?: ExtensionAPI,
 ): Promise<EvidenceProofResult | undefined> {
   const details = isRecord(upstreamResult?.details) ? upstreamResult.details : undefined;
   const worktreeResult = parseWorktreeResult(details?.worktree);
   const executionPhase = normalizeExecutionPhase(details, upstreamResult?.isError === true);
+  const reportedOutcome = normalizeReportedOutcome(
+    details,
+    upstreamResult?.isError === true,
+  );
   const resolvedSessionReference =
     sessionReferenceFromDetails(details) ??
     (await resolveTaskSessionReference({
@@ -73,9 +97,13 @@ export async function recordForegroundCompletion(
       taskId: run.taskId,
       sessionName: `task-${run.taskId}`,
     }));
+  const runtimeEvidence = await captureRuntimeEvidence(
+    run,
+    resolvedSessionReference,
+  );
   const evidence = mergeEvidence(
     run.contextPack?.evidence ?? [],
-    normalizeCompletionEvidence(details?.evidence, resolvedSessionReference),
+    runtimeEvidence,
   );
 
   if (executionPhase !== "completed") {
@@ -89,6 +117,34 @@ export async function recordForegroundCompletion(
       false,
       resolvedSessionReference,
       worktreeResult,
+      reportedOutcome,
+      evidence,
+    );
+    return undefined;
+  }
+
+  // A clean process exit is not semantic success.  Do not let proof/review
+  // gates run for a child that reported blocked, partial, reframed, or an
+  // unparseable result.
+  if (reportedOutcome !== "success") {
+    await recordSemanticOutcome(
+      run,
+      paths,
+      reportedOutcome,
+      details,
+      pi,
+    );
+    if (run.lease) await releaseLeaseAndRecord(paths, run.orchestrationId, run.lease);
+    await patchRunAfterCompletion(
+      paths,
+      run,
+      "completed",
+      undefined,
+      false,
+      resolvedSessionReference,
+      worktreeResult,
+      reportedOutcome,
+      evidence,
     );
     return undefined;
   }
@@ -101,6 +157,7 @@ export async function recordForegroundCompletion(
         maxEvidenceAgeMs: run.proof.maxEvidenceAgeMs ?? 15 * 60 * 1_000,
         claims: run.contextPack?.claims,
         learningClaims: run.contextPack?.learningClaims,
+        semanticAttestations: run.semanticAttestations,
       })
     : undefined;
 
@@ -116,12 +173,20 @@ export async function recordForegroundCompletion(
           ...(proof?.issues ?? []),
           ...uncovered.map((path) => `Write outside declared claims: ${path}`),
         ],
+        receiptIntegrityValid: false,
+        semanticProofValid: proof?.semanticProofValid ?? false,
         supportedClaims: proof?.supportedClaims ?? [],
       };
     }
   }
 
-  const awaitingReview = await recordExecutionAndReviewState(run, paths, proof, evidence.length);
+  const awaitingReview = await recordExecutionAndReviewState(
+    run,
+    paths,
+    proof,
+    evidence.length,
+    { reportedOutcome },
+  );
   if (run.lease) await releaseLeaseAndRecord(paths, run.orchestrationId, run.lease);
   await patchRunAfterCompletion(
     paths,
@@ -131,12 +196,14 @@ export async function recordForegroundCompletion(
     awaitingReview,
     resolvedSessionReference,
     worktreeResult,
+    reportedOutcome,
+    evidence,
   );
   return proof;
 }
 
 export async function recordBackgroundCompletion(
-  _pi: ExtensionAPI,
+  pi: ExtensionAPI,
   activeRuns: Map<string, ActiveRun>,
   message: Record<string, unknown>,
 ): Promise<BackgroundCompletionResult> {
@@ -163,11 +230,13 @@ export async function recordBackgroundCompletion(
         lastHeartbeatAt: Date.parse(stored.heartbeatAt),
         contextPack: stored.contextPack,
         proof: stored.proof,
+        semanticAttestations: stored.semanticAttestations,
         verifier: stored.verifier,
         projectDirectory: stored.projectDirectory,
         executionDirectory: stored.executionDirectory,
         batchId: stored.batchId,
         joinMode: stored.joinMode,
+        reportedOutcome: stored.reportedOutcome,
       };
     }
   }
@@ -175,6 +244,7 @@ export async function recordBackgroundCompletion(
 
   const paths = getOrchestrationPaths(run.projectDirectory);
   const executionPhase = normalizeExecutionPhase(details, false);
+  const reportedOutcome = normalizeReportedOutcome(details, false);
   if (executionPhase !== "completed") {
     activeRuns.delete(taskId);
     await recordExecutionFailure(run, paths, executionPhase, stringValue(details?.summary));
@@ -187,8 +257,9 @@ export async function recordBackgroundCompletion(
       false,
       undefined,
       worktreeResult,
+      reportedOutcome,
     );
-    return { handled: true, taskId, executionPhase, issues: [] };
+    return { handled: true, taskId, executionPhase, reportedOutcome, issues: [] };
   }
 
   const sessionName = `task-${taskId}`;
@@ -208,10 +279,42 @@ export async function recordBackgroundCompletion(
   const usage = sessionReference
     ? await summarizeTaskSessionUsage(sessionReference)
     : undefined;
+  const runtimeEvidence = await captureRuntimeEvidence(run, sessionReference);
   const evidence = mergeEvidence(
     run.contextPack?.evidence ?? [],
-    normalizeCompletionEvidence(details?.evidence, sessionReference),
+    runtimeEvidence,
   );
+  if (reportedOutcome !== "success") {
+    activeRuns.delete(taskId);
+    const decisionId = await recordSemanticOutcome(
+      run,
+      paths,
+      reportedOutcome,
+      details,
+      pi,
+    );
+    if (run.lease) await releaseLeaseAndRecord(paths, run.orchestrationId, run.lease);
+    await patchRunAfterCompletion(
+      paths,
+      run,
+      "completed",
+      undefined,
+      false,
+      sessionReference,
+      worktreeResult,
+      reportedOutcome,
+      evidence,
+    );
+    return {
+      handled: true,
+      taskId,
+      executionPhase,
+      reportedOutcome,
+      decisionRequest: decisionRequestFromDetails(details),
+      ...(decisionId ? { decisionId } : {}),
+      issues: [],
+    };
+  }
   let proof = run.proof
     ? await validateEvidenceOnlyProof({
         projectDirectory: run.executionDirectory ?? run.projectDirectory,
@@ -220,6 +323,7 @@ export async function recordBackgroundCompletion(
         maxEvidenceAgeMs: run.proof.maxEvidenceAgeMs ?? 15 * 60 * 1_000,
         claims: run.contextPack?.claims,
         learningClaims: run.contextPack?.learningClaims,
+        semanticAttestations: run.semanticAttestations,
       })
     : undefined;
 
@@ -235,6 +339,8 @@ export async function recordBackgroundCompletion(
           ...(proof?.issues ?? []),
           ...uncovered.map((path) => `Write outside declared claims: ${path}`),
         ],
+        receiptIntegrityValid: false,
+        semanticProofValid: proof?.semanticProofValid ?? false,
         supportedClaims: proof?.supportedClaims ?? [],
       };
     }
@@ -249,6 +355,7 @@ export async function recordBackgroundCompletion(
       durationMs: numericValue(details?.duration_ms),
       retryCount: numericValue(details?.retry_count),
       usage,
+      reportedOutcome,
     },
   );
   if (run.lease) await releaseLeaseAndRecord(paths, run.orchestrationId, run.lease);
@@ -261,6 +368,8 @@ export async function recordBackgroundCompletion(
     awaitingReview,
     sessionReference,
     worktreeResult,
+    reportedOutcome,
+    evidence,
   );
 
   return {
@@ -269,6 +378,7 @@ export async function recordBackgroundCompletion(
     executionPhase,
     proof,
     awaitingReview,
+    reportedOutcome,
     issues: proof?.issues ?? [],
   };
 }
@@ -284,6 +394,7 @@ export async function releaseLeaseAndRecord(
     // The owner recorded on the lease we are holding. A mismatch means the
     // lease was re-issued to someone else and must NOT be dropped from here.
     expectedOwner: lease.owner,
+    expectedFence: lease.fence,
   });
   await appendOrchestrationEvent({
     eventPath: paths.eventLog,
@@ -305,6 +416,7 @@ async function recordExecutionAndReviewState(
     durationMs?: number;
     retryCount?: number;
     usage?: Awaited<ReturnType<typeof summarizeTaskSessionUsage>>;
+    reportedOutcome?: TaskReportedOutcome;
   } = {},
 ): Promise<boolean> {
   await appendOrchestrationEvent({
@@ -320,6 +432,7 @@ async function recordExecutionAndReviewState(
       evidenceCount,
       ...(proof ? { verificationPassed: proof.valid } : {}),
       ...(metrics.usage ? { usage: metrics.usage } : {}),
+      reportedOutcome: metrics.reportedOutcome ?? "success",
     },
   });
 
@@ -336,7 +449,13 @@ async function recordExecutionAndReviewState(
       },
     });
   }
-  if (proof && !proof.valid) return false;
+  if (
+    proof &&
+    !proof.valid &&
+    !(proof.receiptIntegrityValid && run.verifier?.required)
+  ) {
+    return false;
+  }
 
   const awaitingReview = await needsIndependentReview(run, paths);
   if (awaitingReview) {
@@ -374,18 +493,30 @@ async function needsIndependentReview(
   if (!run.verifier?.required) return undefined;
   const minReviews = run.verifier.minReviews ?? 1;
   const events = await readOrchestrationEvents(paths.eventLog);
+  const subject = await getDurableRunByTaskId(paths.runStore, run.taskId);
+  if (!subject) {
+    return `Pending independent review (0/${minReviews}; subject run unavailable)`;
+  }
+  let subjectDigest: string;
+  try {
+    subjectDigest = await taskSubjectDigest(run.projectDirectory, run.taskId);
+  } catch {
+    return `Pending independent review (0/${minReviews}; subject digest unavailable)`;
+  }
+  const runs = await listDurableRuns(paths.runStore);
   const reviewerTaskIds = new Set<string>();
   for (const event of events) {
     if (
-      event.type === "task_reviewed" &&
-      event.taskId === run.taskId &&
-      event.reviewerTaskId &&
-      event.reviewerTaskId !== run.taskId &&
-      event.subjectDigest &&
-      typeof event.verdict === "string" &&
-      /^(approve|approved|accept|accepted|pass|passed)$/iu.test(event.verdict.trim())
+      isAcceptingReviewerVerdict(event.verdict) &&
+      (await isReviewerEventBound({
+        event,
+        subject,
+        subjectDigest,
+        projectDirectory: run.projectDirectory,
+        runs,
+      }))
     ) {
-      reviewerTaskIds.add(event.reviewerTaskId);
+      reviewerTaskIds.add(event.reviewerTaskId!);
     }
   }
   return reviewerTaskIds.size >= minReviews
@@ -426,21 +557,45 @@ async function patchRunAfterCompletion(
   awaitingReview: boolean,
   sessionReference?: string,
   worktreeResult?: WorktreeResult,
+  reportedOutcome: TaskReportedOutcome = "unknown",
+  evidence?: readonly ContextEvidence[],
 ): Promise<void> {
   if (!run.invocationId) return;
-  await patchDurableRun(paths.runStore, run.invocationId, {
+  const terminalPatch: Partial<DurableTaskRun> & {
+    executionPhase: "completed" | "failed" | "cancelled" | "timeout";
+  } = {
     executionPhase: phase,
+    reportedOutcome,
     verificationPhase: proof
       ? proof.valid
         ? "passed"
-        : "failed"
-      : "not-required",
-    reviewPhase: awaitingReview
-      ? "awaiting"
-      : run.verifier?.required
-        ? "accepted"
-        : "not-required",
-    verificationIssues: proof?.issues ?? [],
+        : proof.receiptIntegrityValid && run.verifier?.required
+          ? "receipt-passed"
+          : "failed"
+      : reportedOutcome === "success"
+        ? "not-required"
+        : "failed",
+    reviewPhase:
+      reportedOutcome !== "success"
+        ? "rejected"
+        : awaitingReview
+          ? "awaiting"
+          : run.verifier?.required
+            ? "accepted"
+            : "not-required",
+    verificationIssues:
+      proof?.issues ??
+      (reportedOutcome === "success"
+        ? []
+        : [`Child reported non-success outcome: ${reportedOutcome}`]),
+    ...(run.contextPack && evidence
+      ? {
+          contextPack: {
+            ...run.contextPack,
+            evidence: evidence.map((item) => ({ ...item })),
+          },
+        }
+      : {}),
     ...(sessionReference ? { sessionReference } : {}),
     ...(worktreeResult
       ? {
@@ -450,7 +605,199 @@ async function patchRunAfterCompletion(
           executionDirectory: worktreeResult.path,
         }
       : {}),
+  };
+  const resultDigest = taggedDigest({
+    invocationId: run.invocationId,
+    terminal: terminalPatch,
   });
+  await completeDurableRun(
+    paths.runStore,
+    run.invocationId,
+    resultDigest,
+    terminalPatch,
+  );
+}
+
+function normalizeReportedOutcome(
+  details: Record<string, unknown> | undefined,
+  isError: boolean,
+): TaskReportedOutcome {
+  if (isError) return "failure";
+  const execution = normalizeExecutionPhase(details, false);
+  if (execution === "failed") return "failure";
+  if (execution === "cancelled" || execution === "timeout") return "unknown";
+  if (decisionRequestFromDetails(details)) return "awaiting-decision";
+  const raw = String(
+    details?.reported_status ?? details?.reportedOutcome ?? details?.status ?? "",
+  )
+    .trim()
+    .toLowerCase();
+  if (
+    raw === "success" ||
+    raw === "failure" ||
+    raw === "blocked" ||
+    raw === "partial" ||
+    raw === "reframed"
+  ) {
+    return raw;
+  }
+  return "unknown";
+}
+
+function decisionRequestFromDetails(
+  details: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+  const value = details?.decision_request ?? details?.decisionRequest;
+  if (!isRecord(value)) return undefined;
+  if (
+    typeof value.question !== "string" ||
+    !value.question.trim() ||
+    !Array.isArray(value.options) ||
+    value.options.length < 2 ||
+    value.options.length > 8
+  ) {
+    return undefined;
+  }
+  const options = value.options.flatMap((option) => {
+    if (
+      !isRecord(option) ||
+      typeof option.id !== "string" ||
+      !/^[A-Za-z0-9._-]{1,64}$/u.test(option.id) ||
+      typeof option.label !== "string" ||
+      !option.label.trim()
+    ) {
+      return [];
+    }
+    return [
+      {
+        id: option.id,
+        label: option.label.trim(),
+        ...(typeof option.tradeoff === "string" && option.tradeoff.trim()
+          ? { tradeoff: option.tradeoff.trim() }
+          : {}),
+      },
+    ];
+  });
+  if (options.length !== value.options.length) return undefined;
+  return {
+    question: value.question.trim(),
+    options,
+    ...(typeof value.context === "string" && value.context.trim()
+      ? { context: value.context.trim() }
+      : {}),
+  };
+}
+
+async function recordSemanticOutcome(
+  run: ActiveRun,
+  paths: OrchestrationPaths,
+  reportedOutcome: TaskReportedOutcome,
+  details: Record<string, unknown> | undefined,
+  pi?: ExtensionAPI,
+): Promise<string | undefined> {
+  const decision = decisionRequestFromDetails(details);
+  let decisionId: string | undefined;
+  if (reportedOutcome === "awaiting-decision" && decision && run.invocationId) {
+    const canonical = JSON.stringify(decision);
+    const hex = createHash("sha256").update(canonical).digest("hex");
+    decisionId = `decision-${hex.slice(0, 24)}`;
+    await patchDurableRun(paths.runStore, run.invocationId, {
+      reportedOutcome,
+      decisionRequest: {
+        id: decisionId,
+        question: String(decision.question),
+        options: (decision.options as Array<Record<string, unknown>>).map(
+          (option) => ({
+            id: String(option.id),
+            label: String(option.label),
+            ...(typeof option.tradeoff === "string"
+              ? { tradeoff: option.tradeoff }
+              : {}),
+          }),
+        ),
+        ...(typeof decision.context === "string"
+          ? { context: decision.context }
+          : {}),
+        requestedAt: new Date().toISOString(),
+        requestDigest: `sha256:v1:${hex}`,
+        status: "pending",
+      },
+    });
+    await appendOrchestrationEvent({
+      eventPath: paths.eventLog,
+      event: {
+        type: "decision_requested",
+        orchestrationId: run.orchestrationId,
+        taskId: run.taskId,
+        reportedOutcome,
+        decisionId,
+        idempotencyKey: `${run.invocationId}:decision:${decisionId}`,
+      },
+    });
+    try {
+      await pi?.events.emit("herdr:blocked", {
+        active: true,
+        blockerId: decisionId,
+        taskId: run.taskId,
+        label: String(decision.question),
+      });
+    } catch {
+      // Herdr is a wake-up/UI projection. The durable decision remains the
+      // authority and must settle even when that optional listener fails.
+    }
+  }
+  await appendOrchestrationEvent({
+    eventPath: paths.eventLog,
+    event: {
+      type:
+        reportedOutcome === "awaiting-decision"
+          ? "task_awaiting_decision"
+          : "task_outcome_reported",
+      orchestrationId: run.orchestrationId,
+      taskId: run.taskId,
+      ...(run.agentType ? { agentType: run.agentType } : {}),
+      reportedOutcome,
+      ...(decisionId ? { decisionId } : {}),
+      idempotencyKey: `${run.invocationId}:outcome:${reportedOutcome}`,
+    },
+  });
+  return decisionId;
+}
+
+async function captureRuntimeEvidence(
+  run: ActiveRun,
+  sessionReference: string | undefined,
+): Promise<ContextEvidence[]> {
+  if (!sessionReference) return [];
+  const paths = getOrchestrationPaths(run.projectDirectory);
+  try {
+    const receipts = await captureSessionCommandReceipts({
+      storeDirectory: paths.evidenceStore,
+      projectDirectory: run.projectDirectory,
+      taskId: run.taskId,
+      producerTaskId: run.taskId,
+      sessionPath: sessionReference,
+      notBefore: run.startedAt,
+    });
+    return receipts.map((receipt) => ({
+      description: receipt.description,
+      reference: receipt.artifactPath,
+      recordedAt: receipt.observedAt,
+      receiptId: receipt.id,
+      sha256: receipt.sha256,
+      source: "runtime-receipt",
+      receiptKind: receipt.kind,
+      ...(receipt.exitCode === undefined ? {} : { exitCode: receipt.exitCode }),
+      ...(receipt.command ? { command: receipt.command } : {}),
+      ...(receipt.cwd ? { cwd: receipt.cwd } : {}),
+      ...(receipt.toolCallId ? { toolCallId: receipt.toolCallId } : {}),
+      ...(receipt.sessionDigest
+        ? { sessionDigest: receipt.sessionDigest }
+        : {}),
+    }));
+  } catch {
+    return [];
+  }
 }
 
 function normalizeExecutionPhase(
@@ -463,43 +810,6 @@ function normalizeExecutionPhase(
   if (raw === "timeout" || raw === "timed_out") return "timeout";
   if (raw === "failed" || raw === "error") return "failed";
   return "completed";
-}
-
-function normalizeCompletionEvidence(
-  value: unknown,
-  sessionReference: string | undefined,
-): ContextEvidence[] {
-  const items = typeof value === "string" ? [value] : value;
-  if (!Array.isArray(items)) return [];
-  const now = new Date().toISOString();
-  return items.flatMap((item): ContextEvidence[] => {
-    if (typeof item === "string" && item.trim()) {
-      return [{
-        description: item.trim(),
-        reference: sessionReference
-          ? `session:${sessionReference}`
-          : `command:${item.trim()}`,
-        recordedAt: now,
-        source: sessionReference ? "runtime-session" : "declared",
-      }];
-    }
-    if (
-      isRecord(item) &&
-      typeof item.description === "string" &&
-      typeof item.reference === "string"
-    ) {
-      return [{
-        description: item.description,
-        reference: sessionReference
-          ? `session:${sessionReference}`
-          : item.reference,
-        recordedAt: now,
-        source: sessionReference ? "runtime-session" : "declared",
-        ...(typeof item.claim === "string" ? { claim: item.claim } : {}),
-      }];
-    }
-    return [];
-  });
 }
 
 function mergeEvidence(

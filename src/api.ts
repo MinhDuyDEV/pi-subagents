@@ -6,12 +6,15 @@ export {
 } from "./orchestration/rpc.js";
 export {
   canTransitionExecution,
+  completeDurableRun,
   createDurableRun,
+  getDurableRunByDecisionId,
   getDurableRunByInvocationId,
   getDurableRunByTaskId,
   isTerminalExecutionPhase,
   listDurableRuns,
   type DurableTaskRun,
+  type SemanticAttestationV1,
   type TaskExecutionPhase,
   type TaskReviewPhase,
   type TaskVerificationPhase,
@@ -58,6 +61,11 @@ import {
   type ProofVerifiedPayloadV1,
   type ReviewCompletedPayloadV1,
 } from "./events.js";
+import {
+  TASK_LIFECYCLE_EVENTS_V1,
+  type TaskSettledEventV1,
+  type TaskStartedEventV1,
+} from "@minhduydev/pi-core/task-lifecycle";
 
 export {
   SUBAGENT_LEARNING_EVENTS_V1,
@@ -74,32 +82,17 @@ export {
 
 export const TASK_LIFECYCLE_PROTOCOL_VERSION = 1;
 export const TASK_LIFECYCLE_EVENTS = [
-  "pi-subagents:task-started",
-  "pi-subagents:task-settled",
+  TASK_LIFECYCLE_EVENTS_V1.STARTED,
+  TASK_LIFECYCLE_EVENTS_V1.SETTLED,
   "pi-subagents:batch-settled",
   ...Object.values(SUBAGENT_LEARNING_EVENTS_V1),
 ] as const;
 
-export interface TaskStartedEventV1 {
-  protocolVersion: 1;
-  taskId: string;
-  invocationId: string;
-  batchId?: string;
-  agentType?: string;
-  description?: string;
-  backend?: string;
-  timestamp: string;
-}
-
-export interface TaskSettledEventV1 {
-  protocolVersion: 1;
-  taskId: string;
-  executionPhase?: "completed" | "failed" | "cancelled" | "timeout";
-  verificationPassed?: boolean;
-  awaitingReview: boolean;
-  issues: string[];
-  timestamp: string;
-}
+export {
+  TASK_LIFECYCLE_EVENTS_V1,
+  type TaskSettledEventV1,
+  type TaskStartedEventV1,
+} from "@minhduydev/pi-core/task-lifecycle";
 
 export interface BatchSettledEventV1 {
   protocolVersion: 1;

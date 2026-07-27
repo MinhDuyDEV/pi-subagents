@@ -180,6 +180,10 @@ describe("Phase 5 explicit learning claims", () => {
       },
     });
     const now = new Date("2026-03-20T10:00:00.000Z");
+    const namedArtifactDigest = `sha256:${createHash("sha256")
+      .update(namedContents)
+      .digest("hex")}`;
+    const subjectDigest = `sha256:${"f".repeat(64)}`;
     const result = await validateEvidenceOnlyProof({
       projectDirectory: directory,
       evidence: [
@@ -187,18 +191,37 @@ describe("Phase 5 explicit learning claims", () => {
           description: "Named claim evidence",
           reference: namedReference,
           recordedAt: now.toISOString(),
-          source: "runtime-session",
+          source: "runtime-receipt",
+          receiptId: "receipt-1",
+          sha256: namedArtifactDigest,
+          receiptKind: "test",
+          exitCode: 0,
+          command: "npm test",
+          cwd: directory,
+          toolCallId: "tool-1",
+          sessionDigest: `sha256:${"b".repeat(64)}`,
         },
         {
           description: "Unrelated evidence that must not support the claim",
           reference: unrelatedReference,
           recordedAt: now.toISOString(),
-          source: "runtime-session",
+          source: "declared",
         },
       ],
       learningClaims: [supportedClaim, unsupportedClaim],
       maxEvidenceAgeMs: 60_000,
       now,
+      subjectDigest,
+      semanticAttestations: [{
+        claim: supportedClaim.statement,
+        receiptId: "receipt-1",
+        artifactDigest: namedArtifactDigest,
+        reviewerTaskId: "reviewer-task",
+        reviewerInvocationId: "reviewer-invocation",
+        reviewerOutputDigest: `sha256:${"c".repeat(64)}`,
+        subjectDigest,
+        attestedAt: now.toISOString(),
+      }],
     } as Parameters<typeof validateEvidenceOnlyProof>[0] & { learningClaims: unknown[] });
 
     expect((result as { supportedClaims?: unknown[] }).supportedClaims).toEqual([

@@ -16,6 +16,7 @@ import {
   acquireResourceLease,
   assertNoConflictingWrite,
   isResourceClaim,
+  isResourceLease,
   listActiveResourceLeases,
   pruneExpiredLeases,
   releaseOrphanedLeases,
@@ -48,6 +49,37 @@ afterEach(async () => {
 });
 
 describe("lease fencing (§2.7)", () => {
+  it("rejects non-positive or missing fence tokens at the authority boundary", async () => {
+    expect(
+      isResourceLease({
+        id: "lease",
+        owner: "task",
+        claims: [{ kind: "write", resource: "src/**", mode: "exclusive" }],
+        acquiredAt: "2026-07-26T00:00:00.000Z",
+        expiresAt: "2099-01-01T00:00:00.000Z",
+        fence: 0,
+      }),
+    ).toBe(false);
+    expect(
+      isResourceLease({
+        id: "lease",
+        owner: "task",
+        claims: [{ kind: "write", resource: "src/**", mode: "exclusive" }],
+        acquiredAt: "2026-07-26T00:00:00.000Z",
+        expiresAt: "2099-01-01T00:00:00.000Z",
+      }),
+    ).toBe(false);
+    const storePath = await createStorePath();
+    await expect(
+      assertNoConflictingWrite({
+        storePath,
+        ownerTaskId: "task",
+        path: "src/a.ts",
+        fence: -1,
+      }),
+    ).rejects.toThrow(/positive safe integer/u);
+  });
+
   it("refuses a write from a holder whose lease was superseded after expiry", async () => {
     const storePath = await createStorePath();
     const t0 = new Date("2026-07-26T00:00:00.000Z");
@@ -99,7 +131,13 @@ describe("lease fencing (§2.7)", () => {
 
     // And A cannot quietly renew its way back in.
     await expect(
-      renewResourceLease({ storePath, leaseId: a.id, owner: "task-a", now: afterExpiry }),
+      renewResourceLease({
+        storePath,
+        leaseId: a.id,
+        owner: "task-a",
+        expectedFence: a.fence,
+        now: afterExpiry,
+      }),
     ).resolves.toBeUndefined();
   });
 
@@ -164,10 +202,39 @@ describe("lease fencing (§2.7)", () => {
       leaseId: lease.id,
       owner: "task-1",
       expectedOwner: "invocation-1",
+      expectedFence: lease.fence,
       now,
     });
 
     expect(transferred?.fence).toBeGreaterThan(lease.fence);
+    await expect(
+      renewResourceLease({
+        storePath,
+        leaseId: lease.id,
+        owner: "task-1",
+        expectedFence: lease.fence,
+        now,
+      }),
+    ).rejects.toThrow(/has fence/u);
+    await expect(
+      releaseResourceLease({
+        storePath,
+        leaseId: lease.id,
+        expectedOwner: "task-1",
+        expectedFence: lease.fence,
+        now,
+      }),
+    ).rejects.toThrow(/has fence/u);
+    await expect(
+      transferResourceLeaseOwnership({
+        storePath,
+        leaseId: lease.id,
+        owner: "task-2",
+        expectedOwner: "task-1",
+        expectedFence: lease.fence,
+        now,
+      }),
+    ).rejects.toThrow(/has fence/u);
     await expect(
       assertNoConflictingWrite({
         storePath,
@@ -188,7 +255,13 @@ describe("lease fencing (§2.7)", () => {
       claims: [{ kind: "write", resource: "src/**", mode: "exclusive" }],
       now,
     });
-    await releaseResourceLease({ storePath, leaseId: first.id, expectedOwner: "task-a", now });
+    await releaseResourceLease({
+      storePath,
+      leaseId: first.id,
+      expectedOwner: "task-a",
+      expectedFence: first.fence,
+      now,
+    });
     const second = await acquireResourceLease({
       storePath,
       owner: "task-b",
@@ -235,7 +308,13 @@ describe("lease ownership (S-B)", () => {
     });
 
     await expect(
-      releaseResourceLease({ storePath, leaseId: lease.id, expectedOwner: "attacker", now }),
+      releaseResourceLease({
+        storePath,
+        leaseId: lease.id,
+        expectedOwner: "attacker",
+        expectedFence: lease.fence,
+        now,
+      }),
     ).rejects.toThrow(/owned by task-c/u);
 
     // The lease survived the attempt.
@@ -258,6 +337,7 @@ describe("lease ownership (S-B)", () => {
         leaseId: lease.id,
         owner: "ATTACKER",
         expectedOwner: "someone-else",
+        expectedFence: lease.fence,
         now,
       }),
     ).rejects.toThrow(/owned by task-b/u);
@@ -280,7 +360,13 @@ describe("lease ownership (S-B)", () => {
     // for JS callers. System-side reaping of dead owners goes through
     // releaseOrphanedLeases, which proves liveness instead of ownership.
     await expect(
-      releaseResourceLease({ storePath, leaseId: lease.id, expectedOwner: "", now }),
+      releaseResourceLease({
+        storePath,
+        leaseId: lease.id,
+        expectedOwner: "",
+        expectedFence: lease.fence,
+        now,
+      }),
     ).rejects.toThrow(/requires the expected owner/u);
     await expect(
       transferResourceLeaseOwnership({
@@ -288,6 +374,7 @@ describe("lease ownership (S-B)", () => {
         leaseId: lease.id,
         owner: "task-next",
         expectedOwner: "",
+        expectedFence: lease.fence,
         now,
       }),
     ).rejects.toThrow(/requires the expected current owner/u);
@@ -470,5 +557,50 @@ describe("store migration (S-F)", () => {
 
     await expect(listActiveResourceLeases({ storePath })).resolves.toEqual([]);
     expect(reports).toEqual(["store failed schema validation"]);
+  });
+
+  it("quarantines v2 stores with duplicate or rewound fence state", async () => {
+    for (const leases of [
+      [
+        {
+          id: "lease-a",
+          owner: "task-a",
+          claims: [{ kind: "write", resource: "src/a/**", mode: "exclusive" }],
+          acquiredAt: "2026-07-26T00:00:00.000Z",
+          expiresAt: "2099-01-01T00:00:00.000Z",
+          fence: 1,
+        },
+        {
+          id: "lease-b",
+          owner: "task-b",
+          claims: [{ kind: "write", resource: "src/b/**", mode: "exclusive" }],
+          acquiredAt: "2026-07-26T00:00:00.000Z",
+          expiresAt: "2099-01-01T00:00:00.000Z",
+          fence: 1,
+        },
+      ],
+      [
+        {
+          id: "lease-a",
+          owner: "task-a",
+          claims: [{ kind: "write", resource: "src/a/**", mode: "exclusive" }],
+          acquiredAt: "2026-07-26T00:00:00.000Z",
+          expiresAt: "2099-01-01T00:00:00.000Z",
+          fence: 3,
+        },
+      ],
+    ] as const) {
+      const storePath = await createStorePath();
+      await writeFile(
+        storePath,
+        JSON.stringify({ version: 2, nextFence: 3, leases }),
+        "utf8",
+      );
+      const reports: string[] = [];
+      setStoreQuarantineReporter((info) => reports.push(info.reason));
+      await expect(listActiveResourceLeases({ storePath })).resolves.toEqual([]);
+      expect(reports).toEqual(["store failed schema validation"]);
+      setStoreQuarantineReporter(() => undefined);
+    }
   });
 });
