@@ -1264,6 +1264,9 @@ async function detectWriteTaskProofFailure(
   // of surfacing an unverified self-report as success.
   try {
     const durable = await getDurableRunByTaskId(paths.runStore, taskId);
+    if (durable?.reportedOutcome && durable.reportedOutcome !== "success") {
+      return undefined;
+    }
     if (durable?.verificationPhase === "failed") {
       return durable.verificationIssues.join(" ") || "Verification failed.";
     }

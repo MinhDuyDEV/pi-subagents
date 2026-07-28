@@ -6,6 +6,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-07-28
+
+### Fixed
+- Child-reported failure, partial, blocked, reframed, and unknown outcomes remain retrievable through `task_control result` instead of being hidden by the success proof gate.
+- Background review failures now report that the task completed with blocking findings and tell the parent how to retrieve the review, avoiding the misleading impression that the subagent runtime crashed.
+
+### Tests
+- Added regression coverage for retrieving a valid reviewer failure result and for the non-success completion notification contract.
+
 ## [0.10.0] - 2026-07-28
 
 ### Added

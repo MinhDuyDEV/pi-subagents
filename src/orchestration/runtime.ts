@@ -2057,14 +2057,18 @@ function applyCompletionOutcome(
   if (!outcome.handled) return message;
   const details = isRecord(message.details) ? message.details : {};
   if (outcome.reportedOutcome && outcome.reportedOutcome !== "success") {
+    const taskId = outcome.taskId ?? "unknown";
+    const outcomeMessage =
+      outcome.reportedOutcome === "awaiting-decision"
+        ? `Task ${taskId} is awaiting a parent decision${
+            outcome.decisionId ? ` (${outcome.decisionId})` : ""
+          }.`
+        : outcome.reportedOutcome === "failure"
+          ? `Task ${taskId} completed with blocking findings; retrieve the review with task_control result. Verification and shipment were not advanced.`
+          : `Task ${taskId} completed with status ${outcome.reportedOutcome}; retrieve its result with task_control result. Verification and shipment were not advanced.`;
     return {
       ...message,
-      content:
-        outcome.reportedOutcome === "awaiting-decision"
-          ? `Task ${outcome.taskId ?? "unknown"} is awaiting a parent decision${
-              outcome.decisionId ? ` (${outcome.decisionId})` : ""
-            }.`
-          : `Task ${outcome.taskId ?? "unknown"} reported ${outcome.reportedOutcome}; verification and shipment were not advanced.`,
+      content: outcomeMessage,
       details: {
         ...details,
         phase: outcome.reportedOutcome.replaceAll("-", "_"),

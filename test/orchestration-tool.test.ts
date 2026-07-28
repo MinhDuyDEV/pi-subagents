@@ -481,6 +481,59 @@ describe("task_control orchestration tool", () => {
     });
   });
 
+  it("returns a child-reported failure result without applying the success proof gate", async () => {
+    const projectDirectory = await createTemporaryProject();
+    const taskId = "task-review-findings";
+    const sessionName = `task-${taskId}`;
+    const paths = getOrchestrationPaths(projectDirectory);
+    const pack = await buildContextPack({
+      projectDirectory,
+      input: {
+        goal: "Review the change.",
+        authorization: "read-only",
+        nextStep: "Report blocking findings.",
+      },
+    });
+    await saveContextPack({ storeDirectory: paths.contextStore, key: taskId, pack });
+    const run = createDurableRun({
+      invocationId: "review-findings-invocation",
+      projectDirectory,
+      contextPack: pack,
+    });
+    run.taskId = taskId;
+    run.executionPhase = "completed";
+    run.reportedOutcome = "failure";
+    run.verificationPhase = "failed";
+    run.verificationIssues = ["Child reported non-success outcome: failure"];
+    await putDurableRun(paths.runStore, run);
+    await createSessionWithFinalText(
+      projectDirectory,
+      taskId,
+      "Do not ship: path traversal is still possible.",
+    );
+    await writeFile(
+      join(projectDirectory, ".pi", "task-session-history.json"),
+      `${JSON.stringify([
+        { id: taskId, sessionName, status: "completed", description: "Review done" },
+      ])}\n`,
+      "utf8",
+    );
+
+    const result = await createTaskControlTool().execute(
+      "result-call",
+      { action: "result", task_id: taskId },
+      new AbortController().signal,
+      undefined,
+      createContext(projectDirectory),
+    );
+
+    expect(result.isError).not.toBe(true);
+    expect(result.content[0]).toMatchObject({
+      type: "text",
+      text: "Do not ship: path traversal is still possible.",
+    });
+  });
+
   it("does not accept a session-authored artifact as runtime proof", async () => {
     const projectDirectory = await createTemporaryProject();
     const taskId = "task-write-claim-proven";

@@ -771,6 +771,72 @@ describe("orchestrated task runtime", () => {
     });
   });
 
+  it("describes child-reported review failures as blocking findings with a retrievable result", async () => {
+    const projectDirectory = await createTemporaryProject();
+    const fakePi = createFakePi();
+    let upstreamPi: ExtensionAPI | undefined;
+    const upstream = (pi: ExtensionAPI) => {
+      upstreamPi = pi;
+      pi.registerTool({
+        name: "task",
+        label: "Task",
+        description: "Fake upstream task",
+        parameters: Type.Object({
+          agent_type: Type.String(),
+          prompt: Type.String(),
+          description: Type.String(),
+          background: Type.Optional(Type.Boolean()),
+        }),
+        async execute() {
+          return {
+            content: [{ type: "text" as const, text: "Started task task-review-failure." }],
+            details: { taskId: "task-review-failure", phase: "running" },
+          };
+        },
+      });
+    };
+
+    createTaskRuntime(upstream)(fakePi.api);
+    await fakePi.tools.get("task")?.execute(
+      "review-failure-call",
+      {
+        agent_type: "reviewer",
+        prompt: "Review the change.",
+        description: "Blocking review",
+        background: true,
+      },
+      new AbortController().signal,
+      undefined,
+      createContext(projectDirectory),
+    );
+    upstreamPi?.sendMessage(
+      {
+        customType: "task-complete",
+        content: "Do not ship: path traversal is still possible.",
+        display: true,
+        details: {
+          task_id: "task-review-failure",
+          duration_ms: 1_000,
+          phase: "done",
+          execution_phase: "done",
+          reported_status: "failure",
+        },
+      },
+      { triggerTurn: false },
+    );
+
+    await vi.waitFor(() => {
+      expect(fakePi.messages).toEqual([
+        expect.objectContaining({
+          customType: "task-complete",
+          content: expect.stringContaining(
+            "completed with blocking findings; retrieve the review with task_control result",
+          ),
+        }),
+      ]);
+    });
+  });
+
   it("releases background claims and records proof-aware completion events", async () => {
     const projectDirectory = await createTemporaryProject();
     const fakePi = createFakePi();
