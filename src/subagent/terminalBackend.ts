@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { chooseTmuxSplitDirection } from "../helpers.js";
 
 export type TerminalBackendKind = "tmux" | "herdr";
+export type HerdrLayout = "attached";
 export type ExecutionBackendKind = "sdk" | TerminalBackendKind;
 export type RequestedBackendKind = "auto" | ExecutionBackendKind;
 
@@ -20,6 +21,7 @@ export type TerminalHandle =
       tabId?: string;
       workspaceId?: string;
       workspaceGroup?: string;
+      herdrLayout?: HerdrLayout;
     };
 
 export type HerdrTerminalHandle = Extract<TerminalHandle, { backend: "herdr" }>;
@@ -34,6 +36,7 @@ export interface TerminalLaunchInput {
   env?: Record<string, string>;
   remainOnExit?: boolean;
   workspaceGroup?: string;
+  herdrLayout?: HerdrLayout;
   signal?: AbortSignal;
   timeoutMs?: number;
 }

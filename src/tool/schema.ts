@@ -13,7 +13,10 @@ export function taskParametersSchema() {
           description: "A short (3-5 word) summary of the task",
         }),
         workspace_group: Type.Optional(Type.String({
-          description: "Shared HerdR workspace group. Concurrent tasks with the same value use panes in one workspace.",
+          description: "Shared terminal workspace group. HerdR creates a dedicated workspace by default.",
+        })),
+        herdr_layout: Type.Optional(Type.Literal("attached", {
+          description: "With workspace_group on HerdR, keep the parent in the left half and grid children in the right half; ignored by tmux and SDK backends.",
         })),
         isolation: Type.Optional(Type.Literal("worktree", {
           description: "Run writes in an isolated Git worktree. Changed worktrees are retained and returned; unchanged worktrees are removed.",

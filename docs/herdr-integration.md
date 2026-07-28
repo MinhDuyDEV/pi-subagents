@@ -33,7 +33,9 @@
 
 ## Grouping
 
-Groups are namespaced by socket, parent pane and group label. The first task creates an owned workspace root; later tasks stack downward. Group state is a cache only—persisted handles remain the cleanup authority after restart.
+Groups are namespaced by socket, parent pane, group label, and layout mode. By default, the first task creates an owned workspace root. One task fills it, two are side-by-side, three use one full-height column and two half-height panes, and four form a 2x2 grid. Additional tasks recursively split the largest remaining cell. Persisted handles retain workspace ownership for restoration and cleanup.
+
+Set `herdr_layout: "attached"` together with `workspace_group` to keep the current parent pane as the left 50% and grid children within the right 50%. The first child is a right split from the parent at ratio `0.5`; later children split only child panes. Attached handles never own the parent workspace, so intermediate and final cleanup close child panes only. Tmux and SDK execution accept but ignore this HerdR-specific option.
 
 ## Coexistence with `@ogulcancelik/pi-herdr`
 

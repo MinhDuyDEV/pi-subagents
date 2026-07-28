@@ -25,17 +25,49 @@ interface HerdrResponse<T> {
 }
 
 let launchQueue: Promise<void> = Promise.resolve();
-const groupedWorkspaces = new Map<
-  string,
-  { workspaceId: string; paneIds: Set<string>; restored?: boolean }
->();
+type HerdrGroupMode = "dedicated" | "attached";
+
+interface HerdrWorkspaceGroup {
+  mode: HerdrGroupMode;
+  workspaceId?: string;
+  paneIds: Set<string>;
+  restored?: boolean;
+}
+
+const groupedWorkspaces = new Map<string, HerdrWorkspaceGroup>();
 
 function workspaceGroupKey(
   socketPath: string,
   parentPaneId: string | undefined,
   group: string,
+  mode: HerdrGroupMode,
 ): string {
-  return `${socketPath}\u0000${parentPaneId ?? "unknown-parent"}\u0000${group}`;
+  return `${socketPath}\u0000${parentPaneId ?? "unknown-parent"}\u0000${group}\u0000${mode}`;
+}
+
+function nextGridSplit(
+  paneIds: readonly string[],
+  mode: HerdrGroupMode,
+): { targetPane: string; direction: "right" | "down" } {
+  const depths = new Map<string, number>();
+  for (const paneId of paneIds) {
+    if (depths.size === 0) {
+      depths.set(paneId, 0);
+      continue;
+    }
+    const target = [...depths].reduce((best, entry) =>
+      entry[1] <= best[1] ? entry : best,
+    );
+    depths.set(target[0], target[1] + 1);
+    depths.set(paneId, target[1] + 1);
+  }
+  const target = [...depths].reduce((best, entry) =>
+    entry[1] <= best[1] ? entry : best,
+  );
+  const direction = mode === "attached"
+    ? (target[1] % 2 === 0 ? "down" : "right")
+    : (target[1] % 2 === 0 ? "right" : "down");
+  return { targetPane: target[0], direction };
 }
 
 async function serializeLaunch<T>(operation: () => Promise<T>): Promise<T> {
@@ -189,13 +221,17 @@ export function restoreHerdrWorkspaceGroups(
   handles: readonly HerdrTerminalHandle[],
 ): void {
   for (const handle of handles) {
-    if (!handle.workspaceId || !handle.workspaceGroup) continue;
+    if (!handle.workspaceGroup) continue;
+    const mode: HerdrGroupMode = handle.herdrLayout === "attached" ? "attached" : "dedicated";
+    if (mode === "dedicated" && !handle.workspaceId) continue;
     const key = workspaceGroupKey(
       handle.socketPath,
       handle.parentPaneId,
       handle.workspaceGroup,
+      mode,
     );
     const group = groupedWorkspaces.get(key) ?? {
+      mode,
       workspaceId: handle.workspaceId,
       paneIds: new Set<string>(),
       restored: true,
@@ -282,8 +318,19 @@ export function createHerdrTerminalBackend(
         }
         const launchRun = (args: readonly string[]) =>
           run(args, { signal: input.signal, timeoutMs: input.timeoutMs });
+        if (input.herdrLayout === "attached" && !input.workspaceGroup) {
+          throw new Error("HerdR attached layout requires workspace_group");
+        }
+        const groupMode: HerdrGroupMode = input.herdrLayout === "attached"
+          ? "attached"
+          : "dedicated";
         const groupKey = input.workspaceGroup
-          ? workspaceGroupKey(socketPath, env.HERDR_PANE_ID, input.workspaceGroup)
+          ? workspaceGroupKey(
+              socketPath,
+              env.HERDR_PANE_ID,
+              input.workspaceGroup,
+              groupMode,
+            )
           : undefined;
         let existingGroup = groupKey
           ? groupedWorkspaces.get(groupKey)
@@ -298,9 +345,11 @@ export function createHerdrTerminalBackend(
             }
           }
           if (existingGroup.paneIds.size === 0) {
-            await run(["workspace", "close", existingGroup.workspaceId]).catch(
-              () => undefined,
-            );
+            if (existingGroup.mode === "dedicated" && existingGroup.workspaceId) {
+              await run(["workspace", "close", existingGroup.workspaceId]).catch(
+                () => undefined,
+              );
+            }
             if (groupKey) groupedWorkspaces.delete(groupKey);
             existingGroup = undefined;
           } else {
@@ -311,7 +360,7 @@ export function createHerdrTerminalBackend(
           ([name, value]) => ["--env", `${name}=${value}`],
         );
         const workspaceResponse =
-          groupKey && !existingGroup
+          groupKey && !existingGroup && groupMode === "dedicated"
             ? await runWithRetry(
                 launchRun,
                 [
@@ -340,11 +389,14 @@ export function createHerdrTerminalBackend(
             );
             created = paneFrom(decode(response.stdout, "pane get"));
           } else {
-            const targetPane = existingGroup
-              ? existingGroup.paneIds.values().next().value
+            const panes = existingGroup ? [...existingGroup.paneIds] : [];
+            const gridSplit = panes.length > 0
+              ? nextGridSplit(panes, groupMode)
               : undefined;
-            if (existingGroup && !targetPane) {
-              throw new Error("HerdR workspace has no live task pane to split");
+            const targetPane = gridSplit?.targetPane
+              ?? (groupMode === "attached" ? env.HERDR_PANE_ID : undefined);
+            if (groupMode === "attached" && !targetPane) {
+              throw new Error("HerdR attached layout requires a parent pane");
             }
             const response = await runWithRetry(
               launchRun,
@@ -353,7 +405,10 @@ export function createHerdrTerminalBackend(
                 "split",
                 ...(targetPane ? [targetPane] : ["--current"]),
                 "--direction",
-                input.direction ?? (existingGroup ? "down" : "right"),
+                groupKey
+                  ? (gridSplit?.direction ?? "right")
+                  : (input.direction ?? "right"),
+                ...(groupKey ? ["--ratio", "0.5"] : []),
                 "--cwd",
                 input.cwd,
                 ...terminalEnvArgs,
@@ -395,7 +450,8 @@ export function createHerdrTerminalBackend(
           }
           if (groupKey) {
             const group = existingGroup ?? {
-              workspaceId: workspace!.workspace_id,
+              mode: groupMode,
+              workspaceId: workspace?.workspace_id,
               paneIds: new Set<string>(),
             };
             group.paneIds.add(created.pane_id);
@@ -423,12 +479,13 @@ export function createHerdrTerminalBackend(
             parentPaneId: env.HERDR_PANE_ID,
             agentName: input.label ?? "pi-task",
             ...(created.tab_id ? { tabId: created.tab_id } : {}),
-            ...(workspace || existingGroup
-              ? { workspaceId: workspace?.workspace_id ?? existingGroup!.workspaceId }
+            ...((workspace?.workspace_id ?? existingGroup?.workspaceId)
+              ? { workspaceId: workspace?.workspace_id ?? existingGroup?.workspaceId }
               : {}),
             ...(input.workspaceGroup
               ? { workspaceGroup: input.workspaceGroup }
               : {}),
+            ...(input.herdrLayout ? { herdrLayout: input.herdrLayout } : {}),
           };
         } catch (error) {
           if (workspace) {
@@ -498,15 +555,13 @@ export function createHerdrTerminalBackend(
 
     async close(handle) {
       return serializeLaunch(async () => {
-        if (
-          handle.backend === "herdr" &&
-          handle.workspaceId &&
-          handle.workspaceGroup
-        ) {
+        if (handle.backend === "herdr" && handle.workspaceGroup) {
+          const mode: HerdrGroupMode = handle.herdrLayout === "attached" ? "attached" : "dedicated";
           const key = workspaceGroupKey(
             handle.socketPath,
             handle.parentPaneId,
             handle.workspaceGroup,
+            mode,
           );
           const group = groupedWorkspaces.get(key);
           if (!group || group.workspaceId !== handle.workspaceId) {
@@ -523,7 +578,11 @@ export function createHerdrTerminalBackend(
             return;
           }
           groupedWorkspaces.delete(key);
-          await run(["workspace", "close", handle.workspaceId]);
+          if (mode === "attached") {
+            await run(["pane", "close", handle.resourceId]);
+          } else if (handle.workspaceId) {
+            await run(["workspace", "close", handle.workspaceId]);
+          }
           return;
         }
         if (handle.backend === "herdr" && handle.workspaceId) {
@@ -593,15 +652,13 @@ export function createSyncHerdrControl(
       );
     },
     close(handle: HerdrTerminalHandle): void {
-      if (
-        handle.backend === "herdr" &&
-        handle.workspaceId &&
-        handle.workspaceGroup
-      ) {
+      if (handle.backend === "herdr" && handle.workspaceGroup) {
+        const mode: HerdrGroupMode = handle.herdrLayout === "attached" ? "attached" : "dedicated";
         const key = workspaceGroupKey(
           handle.socketPath,
           handle.parentPaneId,
           handle.workspaceGroup,
+          mode,
         );
         const group = groupedWorkspaces.get(key);
         if (!group || group.workspaceId !== handle.workspaceId) {
@@ -618,10 +675,14 @@ export function createSyncHerdrControl(
           return;
         }
         groupedWorkspaces.delete(key);
-        try {
-          run(["workspace", "close", handle.workspaceId], handle.socketPath);
-        } catch (error) {
-          if (!isMissingWorkspace(error)) throw error;
+        if (mode === "attached") {
+          run(["pane", "close", handle.resourceId], handle.socketPath);
+        } else if (handle.workspaceId) {
+          try {
+            run(["workspace", "close", handle.workspaceId], handle.socketPath);
+          } catch (error) {
+            if (!isMissingWorkspace(error)) throw error;
+          }
         }
         return;
       }

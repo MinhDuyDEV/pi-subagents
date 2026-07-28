@@ -74,7 +74,8 @@ Core parameters:
 | `background` | defaults to `true`; `false` waits foreground |
 | `task_id` | resume an existing task |
 | `conversation_id` | durable specialist conversation |
-| `workspace_group` | put related Herdr tasks in one owned workspace |
+| `workspace_group` | put related terminal tasks in one group; HerdR uses an owned workspace by default |
+| `herdr_layout: "attached"` | keep the HerdR parent left 50% and grid grouped children in the right 50% |
 | `isolation: "worktree"` | run in a dedicated Git worktree |
 | `orchestration` | optional durable coordination and verification |
 

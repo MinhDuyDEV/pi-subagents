@@ -6,8 +6,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-07-28
+
 ### Added
-- _Development cycle for 0.6.0._
+- Public `herdr_layout: "attached"` task option for keeping the parent pane in the left 50% while grouped child tasks occupy an adaptive grid in the right 50%.
+- Herdr backend tests covering dedicated and attached grids, concurrent grouped launches, stale-pane recovery, restored handles, and cleanup that preserves the parent workspace.
+
+### Changed
+- Dedicated Herdr `workspace_group` workspaces now use a balanced grid: one task fills the workspace, two are side-by-side, three use a balanced split, and four form a 2x2 grid. Additional tasks continue splitting the shallowest available cell.
+- Herdr group identity and restored handles now retain layout mode so dedicated and attached groups with the same label cannot collide.
+
+### Fixed
+- Repeated grouped launches no longer collapse into an increasingly short vertical pane stack.
+- Attached-group cleanup closes only owned child panes and never closes the parent workspace.
 
 ## [0.9.0] - 2026-07-27
 

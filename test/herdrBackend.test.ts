@@ -4,8 +4,10 @@ import test from "node:test";
 import {
   createHerdrTerminalBackend,
   createSyncHerdrControl,
+  restoreHerdrWorkspaceGroups,
 } from "../src/subagent/herdr.js";
 import { buildPiArgs, type AgentConfig } from "../src/helpers.js";
+import { taskParametersSchema } from "../src/tool/schema.js";
 
 test("HerdR Pi argv defers the raw task prompt instead of using a file attachment", () => {
   const agent: AgentConfig = {
@@ -107,6 +109,160 @@ test("grouped HerdR launch starts Pi in the new workspace root pane", async () =
     "report-metadata",
     "w2:p1",
   ]);
+});
+
+test("public task schema exposes the opt-in attached HerdR layout", () => {
+  const schema = taskParametersSchema() as {
+    properties: Record<string, { const?: string; description?: string }>;
+  };
+
+  assert.equal(schema.properties.herdr_layout?.const, "attached");
+  assert.match(schema.properties.herdr_layout?.description ?? "", /workspace_group/u);
+});
+
+test("dedicated HerdR groups grow as full, columns, then a balanced 2x2 grid", async () => {
+  const calls: string[][] = [];
+  let nextPane = 2;
+  const backend = createHerdrTerminalBackend({
+    env: {
+      HERDR_ENV: "1",
+      HERDR_PANE_ID: "parent:p1",
+      HERDR_SOCKET_PATH: "/tmp/grid-dedicated.sock",
+    },
+    run: async (_command, args) => {
+      calls.push([...args]);
+      if (args[0] === "workspace") {
+        return { stdout: JSON.stringify({ workspace: { workspace_id: "grid" }, root_pane: { pane_id: "grid:p1" } }), stderr: "" };
+      }
+      if (args[0] === "pane" && args[1] === "get") {
+        const paneId = args[2]!;
+        return { stdout: JSON.stringify({ pane: { pane_id: paneId, terminal_id: `term-${paneId}` } }), stderr: "" };
+      }
+      if (args[0] === "pane" && args[1] === "split") {
+        const paneId = `grid:p${nextPane++}`;
+        return { stdout: JSON.stringify({ pane: { pane_id: paneId, terminal_id: `term-${paneId}` } }), stderr: "" };
+      }
+      const paneId = args[args.indexOf("--pane") + 1] ?? "grid:p1";
+      return { stdout: JSON.stringify({ agent: { pane_id: paneId, terminal_id: `term-${paneId}` } }), stderr: "" };
+    },
+  });
+
+  for (let index = 0; index < 4; index += 1) {
+    await backend.launch({ cwd: "/repo", agentArgs: [`task-${index + 1}`], workspaceGroup: "balanced-four" });
+  }
+
+  assert.deepEqual(calls.filter((args) => args[0] === "pane" && args[1] === "split"), [
+    ["pane", "split", "grid:p1", "--direction", "right", "--ratio", "0.5", "--cwd", "/repo", "--no-focus"],
+    ["pane", "split", "grid:p2", "--direction", "down", "--ratio", "0.5", "--cwd", "/repo", "--no-focus"],
+    ["pane", "split", "grid:p1", "--direction", "down", "--ratio", "0.5", "--cwd", "/repo", "--no-focus"],
+  ]);
+});
+
+test("attached HerdR groups split right from the parent and grid only within that half", async () => {
+  const calls: string[][] = [];
+  let nextPane = 1;
+  const backend = createHerdrTerminalBackend({
+    env: {
+      HERDR_ENV: "1",
+      HERDR_PANE_ID: "parent:p1",
+      HERDR_SOCKET_PATH: "/tmp/grid-attached.sock",
+    },
+    run: async (_command, args) => {
+      calls.push([...args]);
+      if (args[0] === "pane" && args[1] === "get") {
+        const paneId = args[2]!;
+        return { stdout: JSON.stringify({ pane: { pane_id: paneId, terminal_id: `term-${paneId}` } }), stderr: "" };
+      }
+      if (args[0] === "pane" && args[1] === "split") {
+        const paneId = `parent:c${nextPane++}`;
+        return { stdout: JSON.stringify({ pane: { pane_id: paneId, terminal_id: `term-${paneId}` } }), stderr: "" };
+      }
+      const paneId = args[args.indexOf("--pane") + 1]!;
+      return { stdout: JSON.stringify({ agent: { pane_id: paneId, terminal_id: `term-${paneId}` } }), stderr: "" };
+    },
+  });
+
+  const handles = [];
+  for (let index = 0; index < 4; index += 1) {
+    handles.push(await backend.launch({
+      cwd: "/repo",
+      agentArgs: [`task-${index + 1}`],
+      workspaceGroup: "attached-four",
+      herdrLayout: "attached",
+    }));
+  }
+
+  assert.deepEqual(calls.filter((args) => args[0] === "pane" && args[1] === "split"), [
+    ["pane", "split", "parent:p1", "--direction", "right", "--ratio", "0.5", "--cwd", "/repo", "--no-focus"],
+    ["pane", "split", "parent:c1", "--direction", "down", "--ratio", "0.5", "--cwd", "/repo", "--no-focus"],
+    ["pane", "split", "parent:c2", "--direction", "right", "--ratio", "0.5", "--cwd", "/repo", "--no-focus"],
+    ["pane", "split", "parent:c1", "--direction", "right", "--ratio", "0.5", "--cwd", "/repo", "--no-focus"],
+  ]);
+  assert.ok(calls.every((args) => !args.includes("--focus")));
+  assert.ok(calls.every((args) => args[0] !== "workspace"));
+  assert.ok(handles.every((handle) => handle.herdrLayout === "attached"));
+  assert.ok(handles.every((handle) => handle.workspaceId === undefined));
+});
+
+test("concurrent attached HerdR launches serialize into one parent-side grid", async () => {
+  const calls: string[][] = [];
+  let nextPane = 1;
+  const backend = createHerdrTerminalBackend({
+    env: { HERDR_ENV: "1", HERDR_PANE_ID: "parent:p1", HERDR_SOCKET_PATH: "/tmp/concurrent-attached.sock" },
+    run: async (_command, args) => {
+      calls.push([...args]);
+      if (args[0] === "pane" && args[1] === "split") {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        const paneId = `parent:parallel-${nextPane++}`;
+        return { stdout: JSON.stringify({ pane: { pane_id: paneId, terminal_id: `term-${paneId}` } }), stderr: "" };
+      }
+      const paneId = args[args.indexOf("--pane") + 1]!;
+      return { stdout: JSON.stringify({ agent: { pane_id: paneId, terminal_id: `term-${paneId}` } }), stderr: "" };
+    },
+  });
+
+  await Promise.all([1, 2, 3].map((index) => backend.launch({
+    cwd: "/repo",
+    agentArgs: [`parallel-${index}`],
+    workspaceGroup: "parallel",
+    herdrLayout: "attached",
+  })));
+
+  assert.deepEqual(
+    calls.filter((args) => args[0] === "pane" && args[1] === "split").map((args) => [args[2], args[4], args[6]]),
+    [["parent:p1", "right", "0.5"], ["parent:parallel-1", "down", "0.5"], ["parent:parallel-2", "right", "0.5"]],
+  );
+});
+
+test("restored attached groups discard stale children without closing the parent workspace", async () => {
+  const calls: string[][] = [];
+  const socketPath = "/tmp/stale-attached.sock";
+  restoreHerdrWorkspaceGroups([{
+    backend: "herdr",
+    socketPath,
+    parentPaneId: "parent:p1",
+    resourceId: "parent:stale",
+    terminalId: "term-stale",
+    workspaceGroup: "stale",
+    herdrLayout: "attached",
+  }]);
+  const backend = createHerdrTerminalBackend({
+    env: { HERDR_ENV: "1", HERDR_PANE_ID: "parent:p1", HERDR_SOCKET_PATH: socketPath },
+    run: async (_command, args) => {
+      calls.push([...args]);
+      if (args[0] === "pane" && args[1] === "get") throw new Error("pane not found");
+      if (args[0] === "pane" && args[1] === "split") {
+        return { stdout: JSON.stringify({ pane: { pane_id: "parent:fresh", terminal_id: "term-fresh" } }), stderr: "" };
+      }
+      return { stdout: JSON.stringify({ agent: { pane_id: "parent:fresh", terminal_id: "term-fresh" } }), stderr: "" };
+    },
+  });
+
+  await backend.launch({ cwd: "/repo", agentArgs: ["fresh"], workspaceGroup: "stale", herdrLayout: "attached" });
+
+  assert.ok(calls.every((args) => args[0] !== "workspace"));
+  assert.deepEqual(calls.find((args) => args[0] === "pane" && args[1] === "split"),
+    ["pane", "split", "parent:p1", "--direction", "right", "--ratio", "0.5", "--cwd", "/repo", "--no-focus"]);
 });
 
 test("HerdR launch retries until a new workspace root is an available shell", async () => {
@@ -454,6 +610,36 @@ test("HerdR cleanup after restart closes only an untracked grouped task pane", a
   });
 
   assert.deepEqual(calls, [["pane", "close", "w2:p2"]]);
+});
+
+test("attached HerdR cleanup closes intermediate and last children but never the parent workspace", async () => {
+  const calls: string[][] = [];
+  const backend = createHerdrTerminalBackend({
+    env: { HERDR_ENV: "1", HERDR_SOCKET_PATH: "/tmp/attached-cleanup.sock" },
+    run: async (_command, args) => {
+      calls.push([...args]);
+      return { stdout: "", stderr: "" };
+    },
+  });
+  const base = {
+    backend: "herdr" as const,
+    socketPath: "/tmp/attached-cleanup.sock",
+    parentPaneId: "parent:p1",
+    workspaceGroup: "cleanup",
+    herdrLayout: "attached" as const,
+  };
+  restoreHerdrWorkspaceGroups([
+    { ...base, resourceId: "parent:c1", terminalId: "term-1" },
+    { ...base, resourceId: "parent:c2", terminalId: "term-2" },
+  ]);
+
+  await backend.close({ ...base, resourceId: "parent:c1", terminalId: "term-1" });
+  await backend.close({ ...base, resourceId: "parent:c2", terminalId: "term-2" });
+
+  assert.deepEqual(calls, [
+    ["pane", "close", "parent:c1"],
+    ["pane", "close", "parent:c2"],
+  ]);
 });
 
 test("sync steering uses atomic HerdR agent prompt", () => {

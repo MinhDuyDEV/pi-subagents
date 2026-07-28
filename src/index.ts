@@ -980,6 +980,7 @@ export default function (pi: ExtensionAPI) {
             },
             label: `${agent.name}-${id.slice(0, 8)}`,
             workspaceGroup: params.workspace_group,
+            herdrLayout: params.herdr_layout,
             signal,
           });
           paneId = handle.resourceId;
