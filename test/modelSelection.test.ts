@@ -79,3 +79,24 @@ test("SDK subagents preserve an explicitly configured agent model", async () => 
 
   assert.equal(resolved, configured);
 });
+
+test("SDK subagents fail clearly when a pinned model is unavailable", async () => {
+  const current = { id: "gpt-5", provider: { id: "openai" } };
+  const fallback = { id: "other", provider: { id: "other" }, name: "Other" };
+
+  await assert.rejects(
+    () =>
+      resolveSdkModel(
+        {
+          model: current,
+          modelRegistry: {
+            find: () => undefined,
+            getAll: () => [fallback],
+            getAvailable: () => [fallback],
+          },
+        },
+        "missing/provider-model",
+      ),
+    /requested subagent model.*not available/i,
+  );
+});

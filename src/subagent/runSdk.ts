@@ -45,6 +45,7 @@ export async function resolveSdkModel(
         model.name === requested,
     );
     if (byId) return byId;
+    throw new Error(`Requested subagent model "${requested}" is not available`);
   }
   return available[0];
 }

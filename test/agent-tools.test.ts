@@ -81,3 +81,11 @@ test("SDK backend fails preflight when no-extensions cannot provide selected too
     /SDK backend.*extensions are disabled: semantic_query/i,
   );
 });
+
+test("interactive ask_user remains parent-only across task backends", () => {
+  const selection = buildAgentToolSelection({
+    parentToolNames: ["read", "ask_user"],
+  });
+
+  assert.deepEqual(selection.tools, ["read"]);
+});

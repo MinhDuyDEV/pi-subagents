@@ -62,6 +62,8 @@ Then delegate:
 
 Both terminal and SDK launches derive one effective tool allowlist. SDK sessions disable extensions; if the selected contract requires an extension tool, SDK execution fails before prompting the child instead of silently dropping capabilities.
 
+Interactive handoff tools such as `ask_user` remain parent-only and are never delegated to child sessions. An explicit profile `model:` must resolve in the SDK registry; unavailable pinned seats fail clearly rather than silently switching to an unrelated model.
+
 Profiles with `readonly: true` use a fail-closed positive allowlist. Shell access and repository mutators—including built-in edits, Snap Edit, todo, and workflow-state mutation—cannot be restored through inherited parent tools or an explicit `tools:` list.
 
 Herdr lifecycle (`working`, `blocked`, `idle`, `done`, `unknown`) is a wake-up and UI signal. It never replaces the child Pi JSONL stop reason as authoritative completion.

@@ -11,9 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 - Terminal and SDK backends derive the same effective tool allowlist. SDK execution fails before prompting when its no-extensions session cannot provide a selected extension tool; SDK callers must restrict agents to Pi built-ins or use Herdr/tmux.
+- Interactive `ask_user` remains parent-only and is removed from child tool contracts across backends.
+- SDK model resolution now fails clearly when a pinned agent model is unavailable instead of silently selecting an unrelated model.
 
 ### Tests
-- Added focused coverage for readonly mutation denial, terminal/SDK allowlist parity, and SDK extension-tool preflight failure.
+- Added focused coverage for readonly mutation denial, terminal/SDK allowlist parity, SDK extension-tool preflight failure, parent-only interactive tools, and unavailable pinned models.
 
 ## [0.10.1] - 2026-07-28
 

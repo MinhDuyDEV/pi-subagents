@@ -121,9 +121,9 @@ export function resolveAgentToolAllowlist(
     ? base.filter((tool) => READONLY_TOOL_NAMES.has(tool))
     : base;
   const allowed = capabilityBase.filter((tool) => !disallowed.has(tool));
-  // Never delegate the parent task/control plane to child Pi processes.
-  const parentControlTools = new Set([taskToolName, "task_control", "herdr"]);
-  const withoutTask = allowed.filter((tool) => !parentControlTools.has(tool));
+  // Parent control and interactive handoff tools cannot cross a task boundary.
+  const parentOnlyTools = new Set([taskToolName, "task_control", "herdr", "ask_user"]);
+  const withoutTask = allowed.filter((tool) => !parentOnlyTools.has(tool));
 
   if (withoutTask.length === 0) {
     throw new Error(
