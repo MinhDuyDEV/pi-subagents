@@ -63,7 +63,7 @@ Worktree completions include `baseSha`, branch, changed paths, and a SHA-256 dif
 
 ## Learning claims
 
-Task outcomes may contribute learning only through explicit `orchestration.context.learning_claims` (max 32), each a versioned claim (`kind: pattern | discovery`, tagged-digest `claimId`, bounded `statement`/`applicability`) whose `support` names 1-16 bounded evidence refs (`mode: direct-artifact | task-outcome`). Task descriptions, free-form context claims, review prose, TODO text, and DCP summaries are never learning candidates by themselves. Do not invent claim IDs, evidence digests, usage receipts, or lower-trust outcome bindings; omit the learning claim when the producer cannot supply the canonical contract.
+Task outcomes may contribute learning only through explicit `orchestration.context.learning_claims` (max 32). New callers use a V2 launch intent with `kind: pattern | discovery`, bounded `statement`/`applicability`, and an optional canonical `claimId` that the task boundary computes when omitted. V2 never declares evidence that does not exist yet: after completion, runtime receipts plus reviewer semantic attestations bind the exact claim ID and produce supported evidence digests. V1 pre-bound claims remain accepted during migration, but V1/V2 lists cannot be mixed. Task descriptions, free-form claims, review prose, TODO text, and DCP summaries never become learning candidates by themselves; never invent evidence digests, receipts, or lower-trust outcome bindings.
 
 ## Herdr behavior
 

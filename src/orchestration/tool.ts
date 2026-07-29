@@ -510,6 +510,16 @@ async function executeHerdrAction(
         subjectDigest,
       );
       const receipts = await listEvidenceReceipts(paths.evidenceStore, taskId);
+      const learningClaimIds = new Map<
+        string,
+        NonNullable<SemanticAttestationV1["claimId"]>[]
+      >();
+      for (const claim of subjectPack?.learningClaims ?? []) {
+        learningClaimIds.set(
+          claim.statement,
+          [...(learningClaimIds.get(claim.statement) ?? []), claim.claimId],
+        );
+      }
       const semanticAttestations: SemanticAttestationV1[] = semanticInputs.map((input) => {
         const receipt = receipts.find((candidate) => candidate.id === input.receiptId);
         if (
@@ -524,6 +534,9 @@ async function executeHerdrAction(
         }
         return {
           ...input,
+          ...(learningClaimIds.get(input.claim)?.length === 1
+            ? { claimId: learningClaimIds.get(input.claim)![0] }
+            : {}),
           reviewerTaskId,
           reviewerInvocationId: reviewer.invocationId,
           reviewerOutputDigest: reviewerVerdict.outputDigest,
@@ -572,6 +585,7 @@ async function executeHerdrAction(
             const conflict = existing.find(
               (candidate) =>
                 candidate.claim === attestation.claim &&
+                candidate.claimId === attestation.claimId &&
                 (candidate.subjectDigest !== attestation.subjectDigest ||
                   candidate.artifactDigest !== attestation.artifactDigest),
             );
@@ -587,6 +601,7 @@ async function executeHerdrAction(
                 !semanticAttestations.some(
                   (attestation) =>
                     attestation.claim === candidate.claim &&
+                    attestation.claimId === candidate.claimId &&
                     attestation.subjectDigest === candidate.subjectDigest,
                 ),
             ),

@@ -7,7 +7,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
-import { parseLearningClaims, type LearningClaimV1 } from "../learning-contract.js";
+import { parseLearningClaims, type LearningClaim } from "../learning-contract.js";
 import {
   parseWorkflowCheckpoint,
   type HandoffPackV1,
@@ -100,7 +100,7 @@ export interface ContextPackInput {
   references?: readonly ContextReferenceInput[];
   evidence?: readonly ContextEvidence[];
   claims?: readonly string[];
-  learningClaims?: readonly LearningClaimV1[];
+  learningClaims?: readonly LearningClaim[];
   nextStep: string;
   /**
    * Durable disclosure policy.  "blind-first" requires a separate orientation
@@ -123,7 +123,7 @@ export interface ContextPack {
   references: ContextReference[];
   evidence: ContextEvidence[];
   claims: string[];
-  learningClaims: LearningClaimV1[];
+  learningClaims: LearningClaim[];
   nextStep: string;
   disclosure: ContextDisclosure;
   blindDisclosure?: BlindDisclosureState;
@@ -697,7 +697,7 @@ function isBlindDisclosureState(value: unknown): value is BlindDisclosureState {
   );
 }
 
-function parseStoredLearningClaims(value: unknown): value is LearningClaimV1[] {
+function parseStoredLearningClaims(value: unknown): value is LearningClaim[] {
   try {
     parseLearningClaims(value);
     return true;

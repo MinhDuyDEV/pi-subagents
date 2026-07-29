@@ -79,6 +79,17 @@ const LearningClaimSchema = Type.Object(
   },
   { additionalProperties: false },
 );
+const LearningClaimIntentSchema = Type.Object(
+  {
+    version: Type.Literal(2),
+    kind: Type.Union([Type.Literal("pattern"), Type.Literal("discovery")]),
+    claimId: Type.Optional(TaggedDigestSchema),
+    statement: Type.String({ minLength: 1, maxLength: 400 }),
+    applicability: Type.String({ minLength: 1, maxLength: 300 }),
+  },
+  { additionalProperties: false },
+);
+const LearningInputSchema = Type.Union([LearningClaimSchema, LearningClaimIntentSchema]);
 
 const ContextPackInputSchema = Type.Object(
   {
@@ -101,7 +112,7 @@ const ContextPackInputSchema = Type.Object(
     ),
     evidence: Type.Optional(Type.Array(ContextEvidenceSchema)),
     claims: Type.Optional(Type.Array(Type.String())),
-    learning_claims: Type.Optional(Type.Array(LearningClaimSchema, { maxItems: 32 })),
+    learning_claims: Type.Optional(Type.Array(LearningInputSchema, { maxItems: 32 })),
     next_step: Type.String({ minLength: 1 }),
     disclosure: Type.Optional(
       Type.Union([Type.Literal("open"), Type.Literal("blind-first")]),

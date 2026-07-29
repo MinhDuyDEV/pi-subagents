@@ -51,6 +51,7 @@ export {
 
 import {
   SUBAGENT_LEARNING_EVENTS_V1,
+  SUBAGENT_LEARNING_EVENTS_V2,
   validateLearningContext,
   mergeLearningFacts,
   type LearningContextV1,
@@ -58,6 +59,7 @@ import {
   type LearningPatternV1,
   type LearningMetricsV1,
   type ContextRequestPayloadV1,
+  type ContextRequestPayloadV2,
   type ProofVerifiedPayloadV1,
   type ReviewCompletedPayloadV1,
 } from "./events.js";
@@ -69,6 +71,7 @@ import {
 
 export {
   SUBAGENT_LEARNING_EVENTS_V1,
+  SUBAGENT_LEARNING_EVENTS_V2,
   validateLearningContext,
   mergeLearningFacts,
   type LearningContextV1,
@@ -76,6 +79,7 @@ export {
   type LearningPatternV1,
   type LearningMetricsV1,
   type ContextRequestPayloadV1,
+  type ContextRequestPayloadV2,
   type ProofVerifiedPayloadV1,
   type ReviewCompletedPayloadV1,
 };
@@ -86,6 +90,7 @@ export const TASK_LIFECYCLE_EVENTS = [
   TASK_LIFECYCLE_EVENTS_V1.SETTLED,
   "pi-subagents:batch-settled",
   ...Object.values(SUBAGENT_LEARNING_EVENTS_V1),
+  ...Object.values(SUBAGENT_LEARNING_EVENTS_V2),
 ] as const;
 
 export {

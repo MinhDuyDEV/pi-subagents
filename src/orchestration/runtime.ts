@@ -3,12 +3,6 @@ import { existsSync, realpathSync } from "node:fs";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import {
-  parseContextAccepted,
-  parseContextServed,
-  PI_EVENTS_V2,
-  type ContextServedPayloadV2,
-} from "@minhduydev/pi-core";
-import {
   makeTaskSettledEvent,
   makeTaskStartedEvent,
   TASK_LIFECYCLE_EVENTS_V1,
@@ -50,11 +44,10 @@ import {
 } from "./context.js";
 import {
   clampString,
-  SUBAGENT_LEARNING_EVENTS_V1,
   makeContextRequestPayload,
-  validateLearningContext,
-  mergeLearningFacts,
+  makeContextRequestPayloadV2,
 } from "../events.js";
+import { requestLearningContext } from "../learning-handshake.js";
 import {
   recordBackgroundCompletion,
   recordForegroundCompletion,
@@ -91,6 +84,17 @@ import { registerTaskCommands, stopOwnedTask } from "./commands.js";
 import { registerTaskRpc, type TaskRpcHandle } from "./rpc.js";
 import { TaskScheduler } from "./scheduler.js";
 import { getFinalTaskResult, getTaskSnapshot } from "./task-query.js";
+
+/**
+ * Learning handshake timeout split.
+ *
+ * A provider that acknowledges synchronously (the real pi-learning provider)
+ * skips the ACK wait entirely. The ACK window only bounds the wait for an
+ * asynchronous acknowledgement; when no provider is installed it fails open
+ * within this window instead of blocking for the full served timeout.
+ */
+const LEARNING_ACK_TIMEOUT_MS = 75;
+const LEARNING_SERVED_TIMEOUT_MS = 2_000;
 
 interface PendingCompletion {
   message: Parameters<ExtensionAPI["sendMessage"]>[0];
@@ -713,93 +717,44 @@ function createOrchestratedTaskTool(
           | undefined;
         let usageBindings: import("../learning-contract.js").UsageReceiptV1[] | undefined;
         if (pi?.events && !resumedTaskId) {
-          const contextRequest = makeContextRequestPayload(
+          const learningClaims = orchestration?.context?.learningClaims;
+          const requestArgs = [
             invocationId,
             agentType ?? "unknown",
             description ?? "",
             orchestration?.id ?? invocationId,
-            orchestration?.context?.learningClaims,
-          );
-          let accepted = false;
-          let resolveServed!: (served: ContextServedPayloadV2 | undefined) => void;
-          const servedResponse = new Promise<ContextServedPayloadV2 | undefined>((resolve) => {
-            resolveServed = resolve;
+            learningClaims,
+          ] as const;
+          const contextRequest = learningClaims?.[0]?.version === 2
+            ? makeContextRequestPayloadV2(...requestArgs)
+            : makeContextRequestPayload(...requestArgs);
+          contextRequestDigest = contextRequest.requestDigest;
+          // The provider may acknowledge then serve after async work, so the
+          // handshake must wait asynchronously rather than checking a flag set
+          // only during the synchronous emit dispatch. Fails open on any
+          // timeout, mismatch, or listener error so learning never blocks the
+          // task.
+          const handshake = await requestLearningContext(pi.events, contextRequest, {
+            ackTimeoutMs: LEARNING_ACK_TIMEOUT_MS,
+            servedTimeoutMs: LEARNING_SERVED_TIMEOUT_MS,
+            existingFacts: orchestration?.context?.knownFacts,
           });
-          const unsubscribeAccepted = pi.events.on(
-            PI_EVENTS_V2.LEARNING_CONTEXT_ACCEPTED,
-            (value: unknown) => {
-              const event = parseContextAccepted(value);
-              if (
-                event?.taskId === contextRequest.taskId &&
-                event.correlationId === contextRequest.correlationId &&
-                event.requestDigest === contextRequest.requestDigest
-              ) {
-                accepted = true;
-              }
-            },
-          );
-          const unsubscribeServed = pi.events.on(
-            PI_EVENTS_V2.LEARNING_CONTEXT_SERVED,
-            (value: unknown) => {
-              const event = parseContextServed(value);
-              if (
-                event?.taskId === contextRequest.taskId &&
-                event.correlationId === contextRequest.correlationId &&
-                event.requestDigest === contextRequest.requestDigest
-              ) {
-                resolveServed(event);
-              }
-            },
-          );
-          try {
-            pi.events.emit(
-              SUBAGENT_LEARNING_EVENTS_V1.CONTEXT_REQUEST,
-              contextRequest,
-            );
-            contextRequestDigest = contextRequest.requestDigest;
-            if (accepted) {
-              let timeout: NodeJS.Timeout | undefined;
-              const served = await Promise.race([
-                servedResponse,
-                new Promise<undefined>((resolve) => {
-                  timeout = setTimeout(() => resolve(undefined), 2_000);
-                  timeout.unref?.();
-                }),
-              ]).finally(() => {
-                if (timeout) clearTimeout(timeout);
+          if (handshake) {
+            learningBinding = handshake.learningBinding;
+            usageBindings = handshake.usageBindings;
+            if (handshake.factsGrew) {
+              // Merge learning facts into the orchestration context as
+              // provenance-labelled non-authoritative entries.
+              // This never overrides user prompt or policy.
+              const contextInput = {
+                ...(orchestration?.context ?? { goal: description ?? "", authorization: "read-only" as const, nextStep: "" }),
+                knownFacts: handshake.mergedFacts,
+              };
+              contextPack = await buildContextPack({
+                projectDirectory: ctx.cwd,
+                input: contextInput,
               });
-              if (served) {
-                learningBinding = {
-                  projectId: served.projectId,
-                  trustEpoch: served.trustEpoch,
-                  sessionGeneration: served.sessionGeneration,
-                };
-              }
-              const validated = validateLearningContext(served?.context);
-              usageBindings = validated?.usageReceipts;
-              if (validated && validated.facts.length > 0) {
-                // Merge learning facts into orchestration context as
-                // provenance-labelled non-authoritative entries.
-                // This never overrides user prompt or policy.
-                const existingFacts = orchestration?.context?.knownFacts;
-                const mergedFacts = mergeLearningFacts(existingFacts, validated, 1200);
-                if (mergedFacts.length > (existingFacts?.length ?? 0)) {
-                  const contextInput = {
-                    ...(orchestration?.context ?? { goal: description ?? "", authorization: "read-only" as const, nextStep: "" }),
-                    knownFacts: mergedFacts,
-                  };
-                  contextPack = await buildContextPack({
-                    projectDirectory: ctx.cwd,
-                    input: contextInput,
-                  });
-                }
-              }
             }
-          } catch {
-            // fail-open: listener error must not block task launch
-          } finally {
-            unsubscribeAccepted();
-            unsubscribeServed();
           }
         }
 

@@ -19,9 +19,17 @@ import { getOrchestrationPaths } from "../src/orchestration/paths.ts";
 import {
   createDurableRun,
   getDurableRunByDecisionId,
+  listDurableRuns,
   patchDurableRun,
   putDurableRun,
 } from "../src/orchestration/run-store.ts";
+import { SUBAGENT_LEARNING_EVENTS_V1 } from "../src/events.ts";
+import {
+  makeContextAcceptedPayload,
+  makeContextServedPayload,
+  makeLearningClaimIntent,
+  PI_EVENTS_V2,
+} from "@minhduydev/pi-core";
 
 const temporaryDirectories: string[] = [];
 
@@ -271,6 +279,121 @@ describe("orchestrated task runtime", () => {
       ),
     ).rejects.toThrow(/conflicts with/u);
     expect(upstreamCalls).toHaveLength(1);
+  });
+
+  it("persists asynchronously served learning context, binding, and usage receipts", async () => {
+    const projectDirectory = await createTemporaryProject();
+    const fakePi = createFakePi();
+    const upstreamCalls: Array<Record<string, unknown>> = [];
+    const upstream = (pi: ExtensionAPI) => {
+      pi.registerTool({
+        name: "task",
+        label: "Task",
+        description: "Fake upstream task",
+        parameters: Type.Object({
+          agent_type: Type.String(),
+          prompt: Type.String(),
+          description: Type.String(),
+          background: Type.Optional(Type.Boolean()),
+        }),
+        async execute(_id, params) {
+          upstreamCalls.push(params as Record<string, unknown>);
+          return {
+            content: [{ type: "text" as const, text: "Started." }],
+            details: {
+              taskId: "task-learning-context",
+              phase: "running",
+              reported_status: "unknown",
+              session: "/synthetic/task-learning-context.jsonl",
+            },
+          };
+        },
+      });
+    };
+    const intent = makeLearningClaimIntent({
+      version: 2,
+      kind: "discovery",
+      statement: "Use the project learning handshake",
+      applicability: "pi-subagents runtime",
+    });
+    const digest = `sha256:v1:${"a".repeat(64)}`;
+    fakePi.api.events.on(PI_EVENTS_V2.SUBAGENT_CONTEXT_REQUEST, (value) => {
+      const request = value as Parameters<typeof makeContextAcceptedPayload>[0];
+      setTimeout(() => {
+        fakePi.api.events.emit(
+          PI_EVENTS_V2.LEARNING_CONTEXT_ACCEPTED,
+          makeContextAcceptedPayload(request),
+        );
+        setTimeout(() => {
+          fakePi.api.events.emit(
+            PI_EVENTS_V2.LEARNING_CONTEXT_SERVED,
+            makeContextServedPayload({
+              request,
+              projectId: "project-learning",
+              trustEpoch: "trust-learning",
+              sessionGeneration: "generation-learning",
+              context: {
+                version: 1,
+                facts: [{
+                  domain: "workflow",
+                  summary: "Learning context arrived asynchronously",
+                  confidence: "high",
+                  evidenceDigest: "b".repeat(64),
+                }],
+                usageReceipts: [{
+                  version: 1,
+                  usageId: digest,
+                  projectId: "project-learning",
+                  trustEpoch: "trust-learning",
+                  sessionGeneration: "generation-learning",
+                  consumer: { kind: "subagent", id: "task-learning-context" },
+                  correlationId: request.correlationId,
+                  requestDigest: request.requestDigest,
+                  queryDigest: digest,
+                  learningId: "learning-context-1",
+                  learningRevision: 1,
+                  learningDigest: digest,
+                  returnedAt: "2026-08-06T00:00:00.000Z",
+                }],
+              },
+            }),
+          );
+        }, 10);
+      }, 10);
+    });
+
+    createTaskRuntime(upstream)(fakePi.api);
+    const task = fakePi.tools.get("task");
+    await task?.execute(
+      "learning-context",
+      {
+        agent_type: "general",
+        prompt: "Inspect the learning integration",
+        description: "Inspect learning context",
+        background: true,
+        orchestration: {
+          context: {
+            goal: "Inspect learning context",
+            authorization: "read-only",
+            learning_claims: [intent],
+            next_step: "Report findings",
+          },
+        },
+      },
+      new AbortController().signal,
+      undefined,
+      createContext(projectDirectory),
+    );
+
+    expect(upstreamCalls[0]?.prompt).toContain("Learning context arrived asynchronously");
+    const runs = await listDurableRuns(getOrchestrationPaths(projectDirectory).runStore);
+    expect(runs).toHaveLength(1);
+    expect(runs[0]?.learningBinding).toEqual({
+      projectId: "project-learning",
+      trustEpoch: "trust-learning",
+      sessionGeneration: "generation-learning",
+    });
+    expect(runs[0]?.usageBindings).toHaveLength(1);
   });
 
   it("surfaces foreground evidence-only proof failures in the task result", async () => {

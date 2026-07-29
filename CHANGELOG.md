@@ -6,6 +6,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-07-29
+
+### Added
+- V2 launch-time learning intents whose canonical claim IDs are computed at the task boundary and whose support is bound only after runtime evidence and reviewer attestation exist.
+
+### Fixed
+- Learning context requests now await a correlated asynchronous ACK/served handshake instead of checking a synchronous flag, so matching context, bindings, and usage receipts reach the real task runtime.
+- Keep handshake timeout timers referenced until their awaited promises settle, so standalone packed consumers fail open normally instead of exiting with an unsettled top-level await when no learning provider is loaded.
+- V2 semantic attestations bind the full claim ID as well as statement, receipt, artifact, and subject digests; altered applicability cannot reuse a statement-only attestation.
+
+### Changed
+- V1 learning claims remain compatible; mixed V1/V2 lists fail closed and V2 uses its dedicated request channel.
+
 ## [0.10.2] - 2026-07-29
 
 ### Security

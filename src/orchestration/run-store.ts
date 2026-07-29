@@ -89,6 +89,7 @@ export interface DurableDecisionRequest {
 
 export interface SemanticAttestationV1 {
   claim: string;
+  claimId?: TaggedSha256V1;
   receiptId: string;
   artifactDigest: string;
   reviewerTaskId: string;
@@ -561,6 +562,7 @@ function isSemanticAttestation(value: unknown): value is SemanticAttestationV1 {
     typeof value.claim === "string" &&
     value.claim.length > 0 &&
     value.claim.length <= 1_000 &&
+    (value.claimId === undefined || isTaggedSha256(value.claimId)) &&
     typeof value.receiptId === "string" &&
     value.receiptId.length > 0 &&
     value.receiptId.length <= 256 &&

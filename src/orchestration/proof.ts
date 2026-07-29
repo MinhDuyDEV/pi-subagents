@@ -7,6 +7,7 @@ import {
 } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
 import type {
+  LearningClaim,
   LearningClaimV1,
   SupportedLearningClaimV1,
   TaggedSha256V1,
@@ -31,7 +32,7 @@ export async function validateEvidenceOnlyProof(input: {
   now?: Date;
   maxEvidenceAgeMs: number;
   claims?: readonly string[];
-  learningClaims?: readonly LearningClaimV1[];
+  learningClaims?: readonly LearningClaim[];
   /** Reviewer-owned, canonical semantic attestations. */
   semanticAttestations?: readonly SemanticAttestationV1[];
   /** Current subject digest to which each attestation must bind. */
@@ -89,7 +90,7 @@ export async function validateEvidenceOnlyProof(input: {
 }
 
 function unsupportedLearningClaims(
-  claims: readonly LearningClaimV1[] | undefined,
+  claims: readonly LearningClaim[] | undefined,
 ): SupportedLearningClaimV1[] {
   return (claims ?? []).map((claim) => ({
     claimId: claim.claimId,
@@ -99,7 +100,7 @@ function unsupportedLearningClaims(
 }
 
 function validateLearningClaims(
-  claims: readonly LearningClaimV1[] | undefined,
+  claims: readonly LearningClaim[] | undefined,
   evidence: readonly ContextEvidence[],
   projectDirectories: readonly string[],
   now: Date,
@@ -108,57 +109,125 @@ function validateLearningClaims(
   subjectDigest: string | undefined,
   issues: string[],
 ): SupportedLearningClaimV1[] {
-  return (claims ?? []).map((claim): SupportedLearningClaimV1 => {
-    const boundEvidence = claim.support.evidenceRefs.map((reference) => ({
-      reference,
-      evidence: evidence.find(
-        (item) =>
-          item.reference === reference.ref || item.receiptId === reference.ref,
-      ),
-    }));
-    if (boundEvidence.some((item) => item.evidence === undefined)) {
-      return { claimId: claim.claimId, supported: false, evidenceDigests: [] };
-    }
-
-    const verifiedDigests: TaggedSha256V1[] = [];
-    let substantiated = false;
-    for (const binding of boundEvidence) {
-      const item = binding.evidence!;
-      const bindingIssues: string[] = [];
-      validateEvidenceAuthority(item, bindingIssues);
-      validateFreshness(item, now, maxEvidenceAgeMs, bindingIssues);
-      validateReference(item, projectDirectories, bindingIssues);
-      const filePath = resolveEvidenceFilePath(item, projectDirectories);
-      if (bindingIssues.length > 0 || filePath === undefined) {
-        return { claimId: claim.claimId, supported: false, evidenceDigests: [] };
-      }
-      const digest = `sha256:v1:${createHash("sha256")
-        .update(readFileSync(filePath))
-        .digest("hex")}` as TaggedSha256V1;
-      if (digest !== binding.reference.digest) {
-        return { claimId: claim.claimId, supported: false, evidenceDigests: [] };
-      }
-      verifiedDigests.push(digest);
-      const attestation = findSemanticAttestation(
+  return (claims ?? []).map((claim) => claim.version === 2
+    ? validateLearningIntent(
+        claim,
+        evidence,
+        projectDirectories,
+        now,
+        maxEvidenceAgeMs,
         semanticAttestations,
-        claim.statement,
-        item.receiptId ?? item.reference,
-        item.sha256 ?? "",
         subjectDigest,
-      );
-      substantiated ||= attestation !== undefined;
-    }
+        issues,
+      )
+    : validatePreboundLearningClaim(
+        claim,
+        evidence,
+        projectDirectories,
+        now,
+        maxEvidenceAgeMs,
+        semanticAttestations,
+        subjectDigest,
+        issues,
+      ));
+}
 
-    if (!substantiated) {
-      issues.push(`Learning claim has no verifier-bound semantic proof: ${claim.claimId}`);
-    }
+function validatePreboundLearningClaim(
+  claim: LearningClaimV1,
+  evidence: readonly ContextEvidence[],
+  projectDirectories: readonly string[],
+  now: Date,
+  maxEvidenceAgeMs: number,
+  semanticAttestations: readonly SemanticAttestationV1[] | undefined,
+  subjectDigest: string | undefined,
+  issues: string[],
+): SupportedLearningClaimV1 {
+  const boundEvidence = claim.support.evidenceRefs.map((reference) => ({
+    reference,
+    evidence: evidence.find(
+      (item) => item.reference === reference.ref || item.receiptId === reference.ref,
+    ),
+  }));
+  if (boundEvidence.some((item) => item.evidence === undefined)) {
+    return unsupportedClaim(claim.claimId);
+  }
+  const verifiedDigests: TaggedSha256V1[] = [];
+  let substantiated = false;
+  for (const binding of boundEvidence) {
+    const item = binding.evidence!;
+    const digest = verifiedEvidenceDigest(
+      item, projectDirectories, now, maxEvidenceAgeMs,
+    );
+    if (!digest || digest !== binding.reference.digest) return unsupportedClaim(claim.claimId);
+    verifiedDigests.push(digest);
+    substantiated ||= findSemanticAttestation(
+      semanticAttestations,
+      claim.statement,
+      item.receiptId ?? item.reference,
+      item.sha256 ?? "",
+      subjectDigest,
+    ) !== undefined;
+  }
+  if (!substantiated) {
+    issues.push(`Learning claim has no verifier-bound semantic proof: ${claim.claimId}`);
+  }
+  return {
+    claimId: claim.claimId,
+    supported: substantiated,
+    evidenceDigests: substantiated ? verifiedDigests : [],
+  };
+}
 
-    return {
-      claimId: claim.claimId,
-      supported: substantiated,
-      evidenceDigests: substantiated ? verifiedDigests : [],
-    };
-  });
+function validateLearningIntent(
+  claim: Extract<LearningClaim, { version: 2 }>,
+  evidence: readonly ContextEvidence[],
+  projectDirectories: readonly string[],
+  now: Date,
+  maxEvidenceAgeMs: number,
+  semanticAttestations: readonly SemanticAttestationV1[] | undefined,
+  subjectDigest: string | undefined,
+  issues: string[],
+): SupportedLearningClaimV1 {
+  const attestations = (semanticAttestations ?? []).filter(
+    (attestation) => attestation.claim === claim.statement &&
+      attestation.claimId === claim.claimId &&
+      subjectDigest !== undefined && attestation.subjectDigest === subjectDigest,
+  );
+  const verifiedDigests: TaggedSha256V1[] = [];
+  for (const attestation of attestations) {
+    const item = evidence.find((candidate) => candidate.receiptId === attestation.receiptId);
+    if (!item || item.sha256 !== attestation.artifactDigest) continue;
+    const digest = verifiedEvidenceDigest(
+      item, projectDirectories, now, maxEvidenceAgeMs,
+    );
+    if (digest && !verifiedDigests.includes(digest)) verifiedDigests.push(digest);
+  }
+  const supported = verifiedDigests.length > 0;
+  if (!supported) {
+    issues.push(`Learning claim has no verifier-bound semantic proof: ${claim.claimId}`);
+  }
+  return { claimId: claim.claimId, supported, evidenceDigests: verifiedDigests };
+}
+
+function verifiedEvidenceDigest(
+  evidence: ContextEvidence,
+  projectDirectories: readonly string[],
+  now: Date,
+  maxEvidenceAgeMs: number,
+): TaggedSha256V1 | undefined {
+  const validationIssues: string[] = [];
+  validateEvidenceAuthority(evidence, validationIssues);
+  validateFreshness(evidence, now, maxEvidenceAgeMs, validationIssues);
+  validateReference(evidence, projectDirectories, validationIssues);
+  const filePath = resolveEvidenceFilePath(evidence, projectDirectories);
+  if (validationIssues.length > 0 || filePath === undefined) return undefined;
+  return `sha256:v1:${createHash("sha256")
+    .update(readFileSync(filePath))
+    .digest("hex")}` as TaggedSha256V1;
+}
+
+function unsupportedClaim(claimId: TaggedSha256V1): SupportedLearningClaimV1 {
+  return { claimId, supported: false, evidenceDigests: [] };
 }
 
 function validateEvidenceAuthority(

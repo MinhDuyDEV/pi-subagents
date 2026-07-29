@@ -18,6 +18,7 @@
 
 import { redactSensitiveText } from "./orchestration/context.js";
 import type { ContextFact } from "./orchestration/context.js";
+import { PI_EVENTS_V2 } from "@minhduydev/pi-core";
 import {
   parseSupportedLearningClaims,
   parseUsageReceipts,
@@ -29,10 +30,13 @@ import {
 
 export {
   makeLearningClaim,
+  makeLearningClaimIntent,
   parseLearningClaims,
   parseSupportedLearningClaims,
   parseUsageReceipts,
   taggedDigest,
+  type LearningClaim,
+  type LearningClaimIntentV2,
   type LearningClaimV1,
   type SupportedLearningClaimV1,
   type TaggedSha256V1,
@@ -73,10 +77,14 @@ export interface LearningFactV1 {
 // two packages no longer need a third to bridge them (audit §2.2, §2.3).
 export {
   contextRequestPreimage,
+  contextRequestPreimageV2,
   makeContextRequestPayload,
+  makeContextRequestPayloadV2,
   parseContextRequest,
+  parseContextRequestV2,
   withContextRequestBinding,
   type ContextRequestPayloadV1,
+  type ContextRequestPayloadV2,
   type LearningConfidenceV1,
 } from "@minhduydev/pi-core";
 
@@ -128,6 +136,10 @@ export const SUBAGENT_LEARNING_EVENTS_V1 = {
    * Carries verdict, reviewer identity, and subject digest.
    */
   REVIEW_COMPLETED: "pi-subagents:v1:review-completed",
+} as const;
+
+export const SUBAGENT_LEARNING_EVENTS_V2 = {
+  CONTEXT_REQUEST: PI_EVENTS_V2.SUBAGENT_CONTEXT_REQUEST,
 } as const;
 
 // ───────────────────────────────────────────────────────────────────────────

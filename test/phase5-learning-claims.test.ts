@@ -24,6 +24,12 @@ type ClaimApi = {
     claimId: string;
     statement: string;
   };
+  makeLearningClaimIntent(value: unknown): {
+    version: 2;
+    claimId: string;
+    statement: string;
+    applicability: string;
+  };
   makeContextRequestPayload(
     taskId: string,
     agentType: string,
@@ -31,6 +37,13 @@ type ClaimApi = {
     correlationId: string,
     learningClaims?: readonly unknown[],
   ): { description: string; requestDigest: string; learningClaims: readonly unknown[] };
+  makeContextRequestPayloadV2(
+    taskId: string,
+    agentType: string,
+    description: string,
+    correlationId: string,
+    learningIntents?: readonly unknown[],
+  ): { description: string; requestDigest: string; learningIntents: readonly unknown[] };
   makeProofVerifiedPayload(
     taskId: string,
     passed: boolean,
@@ -236,5 +249,138 @@ describe("Phase 5 explicit learning claims", () => {
         evidenceDigests: [],
       },
     ]);
+  });
+
+  it("accepts a V2 launch intent and binds runtime evidence only after reviewer attestation", async () => {
+    const parsed = parseOrchestrationRequest({
+      context: {
+        goal: "Verify a bounded intent",
+        authorization: "read-only",
+        learning_claims: [{
+          version: 2,
+          kind: "pattern",
+          statement: "Use completion-bound runtime evidence",
+          applicability: "Verified orchestration tasks",
+        }],
+        next_step: "Return proof",
+      },
+    });
+    const intent = parsed.context?.learningClaims[0];
+    expect(intent?.version).toBe(2);
+    expect(intent?.claimId).toMatch(/^sha256:v1:[0-9a-f]{64}$/);
+    if (!intent || intent.version !== 2) throw new Error("expected V2 learning intent");
+
+    const directory = await mkdtemp(join(tmpdir(), "pi-subagents-intent-"));
+    temporaryDirectories.push(directory);
+    const artifactPath = join(directory, "runtime-intent.json");
+    const contents = "verified completion output\n";
+    await writeFile(artifactPath, contents, "utf8");
+    const rawDigest = `sha256:${createHash("sha256").update(contents).digest("hex")}`;
+    const subjectDigest = `sha256:${"e".repeat(64)}`;
+    const now = new Date("2026-08-06T00:00:00.000Z");
+    const result = await validateEvidenceOnlyProof({
+      projectDirectory: directory,
+      evidence: [{
+        description: "runtime observed completion",
+        reference: "runtime-intent.json",
+        recordedAt: now.toISOString(),
+        receiptId: "observation-intent",
+        sha256: rawDigest,
+        source: "runtime-receipt",
+        receiptKind: "command-output",
+        exitCode: 0,
+        command: "npm test",
+        cwd: directory,
+        toolCallId: "tool-intent",
+        sessionDigest: `sha256:v1:${"a".repeat(64)}`,
+      }],
+      learningClaims: [intent],
+      now,
+      maxEvidenceAgeMs: 60_000,
+      subjectDigest,
+      semanticAttestations: [{
+        claim: intent.statement,
+        claimId: intent.claimId,
+        receiptId: "observation-intent",
+        artifactDigest: rawDigest,
+        reviewerTaskId: "reviewer-intent",
+        reviewerInvocationId: "reviewer-invocation",
+        subjectDigest,
+        attestedAt: now.toISOString(),
+      }],
+    });
+
+    expect(result.valid).toBe(true);
+    expect(result.supportedClaims).toEqual([{
+      claimId: intent.claimId,
+      supported: true,
+      evidenceDigests: [`sha256:v1:${createHash("sha256").update(contents).digest("hex")}`],
+    }]);
+
+    const unbound = await validateEvidenceOnlyProof({
+      projectDirectory: directory,
+      evidence: [{
+        description: "runtime observed completion",
+        reference: "runtime-intent.json",
+        recordedAt: now.toISOString(),
+        receiptId: "observation-intent",
+        sha256: rawDigest,
+        source: "runtime-receipt",
+        receiptKind: "command-output",
+        exitCode: 0,
+        command: "npm test",
+        cwd: directory,
+        toolCallId: "tool-intent",
+        sessionDigest: `sha256:v1:${"a".repeat(64)}`,
+      }],
+      learningClaims: [intent],
+      now,
+      maxEvidenceAgeMs: 60_000,
+      subjectDigest,
+      semanticAttestations: [{
+        claim: intent.statement,
+        receiptId: "observation-intent",
+        artifactDigest: rawDigest,
+        reviewerTaskId: "reviewer-intent",
+        reviewerInvocationId: "reviewer-invocation",
+        subjectDigest,
+        attestedAt: now.toISOString(),
+      }],
+    });
+    expect(unbound.supportedClaims[0]).toMatchObject({ supported: false });
+  });
+
+  it("rejects mixed V1 claims and V2 intents at the task boundary", async () => {
+    const { makeLearningClaim, makeLearningClaimIntent } = await import(
+      "../src/learning-contract.js",
+    ) as ClaimApi;
+    const v1 = makeLearningClaim({
+      version: 1,
+      kind: "pattern",
+      statement: "V1",
+      applicability: "compatibility",
+      support: {
+        mode: "direct-artifact",
+        evidenceRefs: [{
+          kind: "repository-file",
+          ref: "evidence.txt",
+          digest: `sha256:v1:${"b".repeat(64)}`,
+        }],
+      },
+    });
+    const v2 = makeLearningClaimIntent({
+      version: 2,
+      kind: "pattern",
+      statement: "V2",
+      applicability: "completion evidence",
+    });
+    expect(() => parseOrchestrationRequest({
+      context: {
+        goal: "Reject mixed claims",
+        authorization: "read-only",
+        learning_claims: [v1, v2],
+        next_step: "Stop",
+      },
+    })).toThrow(/one protocol version/);
   });
 });
