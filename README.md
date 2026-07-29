@@ -60,6 +60,10 @@ Then delegate:
 
 `PI_TASK_BACKEND=herdr|tmux|sdk|auto` overrides selection. In `auto`, absence of Herdr context may fall back. A detected Herdr control-plane outage fails visibly rather than silently launching the same work elsewhere.
 
+Both terminal and SDK launches derive one effective tool allowlist. SDK sessions disable extensions; if the selected contract requires an extension tool, SDK execution fails before prompting the child instead of silently dropping capabilities.
+
+Profiles with `readonly: true` use a fail-closed positive allowlist. Shell access and repository mutators—including built-in edits, Snap Edit, todo, and workflow-state mutation—cannot be restored through inherited parent tools or an explicit `tools:` list.
+
 Herdr lifecycle (`working`, `blocked`, `idle`, `done`, `unknown`) is a wake-up and UI signal. It never replaces the child Pi JSONL stop reason as authoritative completion.
 
 ## The `task` tool

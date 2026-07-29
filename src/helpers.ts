@@ -631,11 +631,16 @@ export function discoverAgents(
   };
 }
 
-/** Mutating tools denied when `readonly: true`. Bash is not denied — use explicit `tools:` or `disallowed_tools` to block shell. */
+/** Known mutators denied for diagnostics; runtime also enforces a positive read-only allowlist. */
 const READONLY_TOOL_DENY = [
+  "bash",
   "write",
   "edit",
   "apply_patch",
+  "quick_edit",
+  "target_edit",
+  "todo",
+  "workflow_state",
 ] as const;
 
 export function parseBool(value: unknown): boolean | undefined {

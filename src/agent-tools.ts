@@ -5,7 +5,7 @@
 
 import { parseMergedDisallowedTools } from "./policy.js";
 
-/** Pi built-in tools exposed to task subagents when present in the parent session. */
+/** Pi built-in tools available when SDK execution disables extensions. */
 const BUILTIN_TOOL_NAMES = [
   "read",
   "bash",
@@ -15,6 +15,29 @@ const BUILTIN_TOOL_NAMES = [
   "find",
   "ls",
 ] as const;
+
+const READONLY_TOOL_NAMES = new Set([
+  "read",
+  "grep",
+  "find",
+  "ls",
+  "websearch",
+  "codesearch",
+  "web_fetch",
+  "get_fetch_content",
+  "context7",
+  "deepwiki",
+  "firecrawl_scrape",
+  "firecrawl_crawl",
+  "ollama_web_search",
+  "ollama_web_fetch",
+  "semantic_query",
+  "semantic_grep",
+  "semantic_inspect",
+  "semantic_show",
+  "semantic_review",
+  "dcp_recall",
+]);
 
 /**
  * Extension tools commonly granted to research / read-only subagents when
@@ -56,6 +79,8 @@ export interface ResolveAgentToolsInput {
   tools?: string | string[];
   /** `disallowed_tools` from frontmatter */
   disallowedTools?: string | string[];
+  /** Enforce the fail-closed read-only capability policy. */
+  readonly?: boolean;
   /**
    * When set, used as base instead of default builtin+extension catalog
    * (intersection applied when agent also sets `tools:`).
@@ -92,7 +117,10 @@ export function resolveAgentToolAllowlist(
     base = [...BUILTIN_TOOL_NAMES, ...TASK_DEFAULT_EXTENSION_TOOLS];
   }
 
-  const allowed = base.filter((t) => !disallowed.has(t));
+  const capabilityBase = input.readonly
+    ? base.filter((tool) => READONLY_TOOL_NAMES.has(tool))
+    : base;
+  const allowed = capabilityBase.filter((tool) => !disallowed.has(tool));
   // Never delegate the parent task/control plane to child Pi processes.
   const parentControlTools = new Set([taskToolName, "task_control", "herdr"]);
   const withoutTask = allowed.filter((tool) => !parentControlTools.has(tool));
@@ -116,4 +144,15 @@ export function buildAgentToolSelection(input: ResolveAgentToolsInput): {
     tools: resolveAgentToolAllowlist(input),
     excludeTools: [taskToolName, "task_control", "herdr"],
   };
+}
+
+export function assertSdkToolCapability(tools: readonly string[]): void {
+  const builtins = new Set<string>(BUILTIN_TOOL_NAMES);
+  const unavailable = tools.filter((tool) => !builtins.has(tool));
+  if (unavailable.length > 0) {
+    throw new Error(
+      `SDK backend cannot provide selected tools while extensions are disabled: ${unavailable.join(", ")}. ` +
+        "Run inside tmux/Herdr or restrict the agent to Pi built-in tools.",
+    );
+  }
 }

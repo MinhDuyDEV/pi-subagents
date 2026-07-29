@@ -6,6 +6,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security
+- `readonly: true` now enforces a fail-closed positive tool allowlist. Shell access, built-in writers, Snap Edit, todo, workflow-state mutation, and unknown inherited tools cannot cross the child capability boundary.
+
+### Changed
+- Terminal and SDK backends derive the same effective tool allowlist. SDK execution fails before prompting when its no-extensions session cannot provide a selected extension tool; SDK callers must restrict agents to Pi built-ins or use Herdr/tmux.
+
+### Tests
+- Added focused coverage for readonly mutation denial, terminal/SDK allowlist parity, and SDK extension-tool preflight failure.
+
 ## [0.10.1] - 2026-07-28
 
 ### Fixed

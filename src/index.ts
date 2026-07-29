@@ -25,7 +25,10 @@ import type {
   ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
 
-import { buildAgentToolSelection } from "./agent-tools.js";
+import {
+  assertSdkToolCapability,
+  buildAgentToolSelection,
+} from "./agent-tools.js";
 import {
   BACKGROUND_CHECK_MS,
   COUNT_POLL_MS,
@@ -715,41 +718,43 @@ export default function (pi: ExtensionAPI) {
       );
       const useSdkBackend = selectedBackend === "sdk";
 
-          const toolSelection = buildAgentToolSelection({
-            tools: agent.tools,
-            disallowedTools: agent.disallowedTools,
-            parentToolNames,
-            taskToolName,
-          });
-          const runSdkFallback = async (
-            foregroundTask?: BackgroundTask,
-            onSession?: (session: AgentSession) => () => void,
-          ) => {
-            // The SDK subagent runs in-process with `noExtensions: true`, so no
-            // guard can see its writes. A launch holding write claims in the
-            // shared project directory is refused here rather than run
-            // unenforced — worktree isolation or a terminal backend both work.
-            if (await holdsSharedWriteClaims()) {
-              throw new Error(
-                "This task holds write claims but the SDK backend cannot enforce them. " +
-                  'Run inside tmux/Herdr, or pass isolation: "worktree" to isolate the writes.',
-              );
-            }
-            return runSdkSubagent({
-              onSession: foregroundTask
-                ? (session) => subscribeToolEvents(session, foregroundTask, 10, taskWidget.requestRender)
-                : onSession,
-              prompt: promptContent,
-              agent,
-              cwd: executionCwd,
-              ctx,
-              model: agent.model,
-              thinkingLevel: agent.thinking,
-              tools: toolSelection.tools,
-              excludeTools: toolSelection.excludeTools,
-              systemPrompt: agent.body,
-            });
-          };
+      const toolSelection = buildAgentToolSelection({
+        tools: agent.tools,
+        disallowedTools: agent.disallowedTools,
+        readonly: agent.readonly,
+        parentToolNames,
+        taskToolName,
+      });
+      const runSdkFallback = async (
+        foregroundTask?: BackgroundTask,
+        onSession?: (session: AgentSession) => () => void,
+      ) => {
+        assertSdkToolCapability(toolSelection.tools);
+        // The SDK subagent runs in-process with `noExtensions: true`, so no
+        // guard can see its writes. A launch holding write claims in the
+        // shared project directory is refused here rather than run
+        // unenforced — worktree isolation or a terminal backend both work.
+        if (await holdsSharedWriteClaims()) {
+          throw new Error(
+            "This task holds write claims but the SDK backend cannot enforce them. " +
+              'Run inside tmux/Herdr, or pass isolation: "worktree" to isolate the writes.',
+          );
+        }
+        return runSdkSubagent({
+          onSession: foregroundTask
+            ? (session) => subscribeToolEvents(session, foregroundTask, 10, taskWidget.requestRender)
+            : onSession,
+          prompt: promptContent,
+          agent,
+          cwd: executionCwd,
+          ctx,
+          model: agent.model,
+          thinkingLevel: agent.thinking,
+          tools: toolSelection.tools,
+          excludeTools: toolSelection.excludeTools,
+          systemPrompt: agent.body,
+        });
+      };
 
       const foregroundTask: BackgroundTask | undefined = isBackground
         ? undefined

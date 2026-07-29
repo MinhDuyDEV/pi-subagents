@@ -28,6 +28,7 @@ export function buildPiArgv(opts: BuildPiArgvOptions): string[] {
   const allowedTools = resolveAgentToolAllowlist({
     tools: agent.tools,
     disallowedTools: agent.disallowedTools,
+    readonly: agent.readonly,
     parentToolNames: opts.parentToolNames,
     taskToolName: opts.taskToolName,
   });
