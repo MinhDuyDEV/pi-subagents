@@ -6,6 +6,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.10.2] - 2026-07-29
+
 ### Security
 - `readonly: true` now enforces a fail-closed positive tool allowlist. Shell access, built-in writers, Snap Edit, todo, workflow-state mutation, and unknown inherited tools cannot cross the child capability boundary.
 
