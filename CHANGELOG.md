@@ -6,6 +6,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-08-07
+
+### Added
+- First-class `cwd` support across SDK, tmux and HerdR, with canonical path validation, durable persistence, resume identity checks and worktree creation from the selected repository.
+- Multi-repo orchestration roots: parent/control state remains in the session repository while Context Packs, relative claims, evidence, proof paths and write guards are scoped to the selected workspace repository.
+- Per-identity launch admission that serializes concurrent `task_id`/`conversation_id` launches and rejects foreground relaunch of an active background task.
+
+### Fixed
+- HerdR initial prompts now use bounded lifecycle waits and retry only a structured stalled-prompt response with a verified state-sequence transition.
+- HerdR retry and cleanup fail closed when terminal, agent or foreground process identity changes, avoiding input or destructive cleanup against a replacement agent.
+- Identical relative resource claims can coexist in different canonical repositories while legacy unscoped leases remain conservatively global.
+
+### Compatibility
+- Existing task/run/lease records without `cwd`, workspace roots or lease scopes remain readable; old unscoped records preserve their previous single-project semantics.
+- Pi peer dependencies remain on the verified `0.81.1` generation; upstream's development-only `0.82` refresh is intentionally not included.
+
 ## [0.11.0] - 2026-07-29
 
 ### Added

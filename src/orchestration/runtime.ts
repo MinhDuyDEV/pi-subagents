@@ -12,6 +12,7 @@ import type { TSchema } from "typebox";
 import { readRegistry, setRegistryQuarantineReporter } from "../conversation.js";
 import { findPiDir, parseResultXml } from "../helpers.js";
 import { getAgentTerminalStopReason } from "../session-text.js";
+import { resolveTaskCwd } from "../task-cwd.js";
 import type { WorktreeHandle } from "../worktree.js";
 import type {
   AgentToolResult,
@@ -245,6 +246,7 @@ export function createTaskRuntime(
           semanticAttestations: run.semanticAttestations,
           verifier: run.verifier,
           projectDirectory: run.projectDirectory,
+          workspaceDirectory: run.workspaceDirectory ?? run.projectDirectory,
           executionDirectory: run.executionDirectory,
           batchId: run.batchId,
           joinMode: run.joinMode,
@@ -436,6 +438,14 @@ function createOrchestratedTaskTool(
       const invocationId = randomUUID();
       const paths = getOrchestrationPaths(ctx.cwd);
       state.projectDirectories.add(ctx.cwd);
+      const requestedWorkspace = resolveTaskCwd(ctx.cwd, rawParameters.cwd);
+      if (requestedWorkspace.kind === "invalid") {
+        return {
+          content: [{ type: "text" as const, text: requestedWorkspace.message }],
+          details: { phase: "failed" as const, error: "invalid cwd" },
+          isError: true,
+        };
+      }
       if (orchestration?.schedule) {
         const scheduler = await ensureScheduler(state, paths.scheduleStore, ctx);
         const scheduledParameters = structuredClone(parametersValue);
@@ -476,6 +486,24 @@ function createOrchestratedTaskTool(
       const resumedRun = resumedTaskId
         ? await getDurableRunByTaskId(paths.runStore, resumedTaskId)
         : undefined;
+      const persistedWorkspace = resumedRun
+        ? (resumedRun.workspaceDirectory ??
+          resumedRun.worktree?.repositoryRoot ??
+          resumedRun.executionDirectory)
+        : undefined;
+      const workspaceResolution = resolveTaskCwd(
+        ctx.cwd,
+        rawParameters.cwd,
+        persistedWorkspace,
+      );
+      if (workspaceResolution.kind === "invalid") {
+        return {
+          content: [{ type: "text" as const, text: workspaceResolution.message }],
+          details: { phase: "failed" as const, error: "invalid cwd" },
+          isError: true,
+        };
+      }
+      const workspaceDirectory = workspaceResolution.cwd;
       const orchestrationId =
         orchestration?.id ??
         resumedRun?.correlationId ??
@@ -544,6 +572,7 @@ function createOrchestratedTaskTool(
           lease = await acquireResourceLease({
             storePath: paths.leaseStore,
             owner: invocationId,
+            scope: workspaceDirectory,
             claims: effectiveClaims,
             ttlMs: effectiveLeaseTtlMs,
           });
@@ -698,6 +727,8 @@ function createOrchestratedTaskTool(
               agentType,
               description,
               projectDirectory: ctx.cwd,
+              workspaceDirectory,
+              executionDirectory: workspaceDirectory,
               startedAt,
               claims: effectiveClaims,
               lease,
@@ -751,7 +782,7 @@ function createOrchestratedTaskTool(
                 knownFacts: handshake.mergedFacts,
               };
               contextPack = await buildContextPack({
-                projectDirectory: ctx.cwd,
+                projectDirectory: workspaceDirectory,
                 input: contextInput,
               });
             }
@@ -760,7 +791,7 @@ function createOrchestratedTaskTool(
 
         if (!contextPack && orchestration?.context) {
           contextPack = await buildContextPack({
-            projectDirectory: ctx.cwd,
+            projectDirectory: workspaceDirectory,
             input: orchestration.context,
           });
         } else if (resumedTaskId) {
@@ -798,6 +829,8 @@ function createOrchestratedTaskTool(
             agentType,
             description,
             projectDirectory: ctx.cwd,
+            workspaceDirectory,
+            executionDirectory: workspaceDirectory,
             startedAt,
             claims: effectiveClaims,
             lease,
@@ -974,7 +1007,7 @@ function createOrchestratedTaskTool(
           : undefined;
         const resultWorktreePath = stringValue(resultWorktree?.path);
         const executionDirectory =
-          registryEntry?.worktree?.path ?? resultWorktreePath ?? ctx.cwd;
+          registryEntry?.worktree?.path ?? resultWorktreePath ?? workspaceDirectory;
 
         if (lease && lease.owner !== taskId) {
           await alignLaunchLeaseOwner(
@@ -1050,6 +1083,7 @@ function createOrchestratedTaskTool(
           proof: effectiveProof,
           verifier: effectiveVerifier,
           projectDirectory: ctx.cwd,
+          workspaceDirectory,
           executionDirectory,
           batchId: orchestration?.batchId ?? resumedRun?.batchId,
           joinMode: orchestration?.join ?? resumedRun?.joinMode,
@@ -1471,6 +1505,7 @@ async function recoverAllocatingRuns(
       const reacquired = await acquireResourceLease({
         storePath: paths.leaseStore,
         owner: entry.id,
+        scope: run.workspaceDirectory ?? entry.cwd ?? projectDirectory,
         claims: run.claims,
         ttlMs: run.leaseTtlMs,
       }).catch(() => undefined);
@@ -1487,7 +1522,9 @@ async function recoverAllocatingRuns(
     const patch: Partial<DurableTaskRun> = {
       taskId: entry.id,
       executionPhase: "working",
-      executionDirectory: entry.worktree?.path ?? projectDirectory,
+      workspaceDirectory:
+        run.workspaceDirectory ?? entry.cwd ?? entry.worktree?.repositoryRoot ?? projectDirectory,
+      executionDirectory: entry.worktree?.path ?? entry.cwd ?? projectDirectory,
       heartbeatAt: new Date().toISOString(),
       ...(entry.worktree ? { worktree: entry.worktree } : {}),
       ...(lease ? { lease } : {}),
@@ -1673,6 +1710,7 @@ function registerChildWriteClaimGuard(pi: ExtensionAPI): void {
         const relativePath = projectRelativePath.replaceAll("\\", "/");
         const covering = await findClaimCoveringPath({
           storePath: config.leaseStore,
+          scope: config.projectDirectory,
           path: relativePath,
         });
         const expectedClaim = guardState?.claims.find(
@@ -1787,28 +1825,26 @@ function registerWriteClaimGuard(pi: ExtensionAPI): void {
       if (activeLeases.length === 0) return;
 
       for (const rawPath of pathsToCheck) {
-        const absolutePath = isAbsolute(rawPath)
+        const unresolvedPath = isAbsolute(rawPath)
           ? resolve(rawPath)
           : resolve(projectDirectory, rawPath.replace(/^@/u, ""));
-        const projectRelativePath = relative(projectDirectory, absolutePath);
-        if (
-          projectRelativePath === ".." ||
-          projectRelativePath.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`) ||
-          isAbsolute(projectRelativePath)
-        ) {
+        const absolutePath = canonicalizePotentialPath(unresolvedPath);
+        const controlScope = realpathSync(resolve(projectDirectory));
+        const scopes = [
+          controlScope,
+          ...activeLeases.flatMap((lease) => lease.scope ? [lease.scope] : []),
+        ].sort((left, right) => right.length - left.length);
+        const scope = scopes.find((candidate) => pathIsWithin(candidate, absolutePath));
+        if (!scope) {
           return {
             block: true,
-            reason: `Write blocked: ${rawPath} is outside the project while task leases are active`,
+            reason: `Write blocked: ${rawPath} is outside every project scope with active task leases`,
           };
         }
-        if (pathEscapesProject(projectDirectory, absolutePath)) {
-          return {
-            block: true,
-            reason: `Write blocked: ${rawPath} resolves outside the project through a symlink`,
-          };
-        }
+        const projectRelativePath = relative(scope, absolutePath);
         await assertNoConflictingWrite({
           storePath: paths.leaseStore,
+          scope,
           ownerTaskId: "parent",
           path: projectRelativePath.replaceAll("\\", "/"),
         });
@@ -1833,23 +1869,22 @@ function registerWriteClaimGuard(pi: ExtensionAPI): void {
   });
 }
 
-function pathEscapesProject(
-  projectDirectory: string,
-  absolutePath: string,
-): boolean {
-  const projectRoot = realpathSync(resolve(projectDirectory));
-  let probe = absolutePath;
-  while (!existsSync(probe)) {
-    const parent = dirname(probe);
-    if (parent === probe) break;
-    probe = parent;
+function canonicalizePotentialPath(absolutePath: string): string {
+  let existing = absolutePath;
+  while (!existsSync(existing)) {
+    const parent = dirname(existing);
+    if (parent === existing) break;
+    existing = parent;
   }
-  const resolvedProbe = realpathSync(probe);
-  const relativeProbe = relative(projectRoot, resolvedProbe);
-  return (
-    relativeProbe === ".." ||
-    relativeProbe.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`) ||
-    isAbsolute(relativeProbe)
+  return resolve(realpathSync(existing), relative(existing, absolutePath));
+}
+
+function pathIsWithin(parent: string, child: string): boolean {
+  const candidate = relative(parent, child);
+  return !(
+    candidate === ".." ||
+    candidate.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`) ||
+    isAbsolute(candidate)
   );
 }
 

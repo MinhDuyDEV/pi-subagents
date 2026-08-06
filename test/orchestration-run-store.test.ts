@@ -43,6 +43,21 @@ describe("durable task run store", () => {
     expect(await listDurableRuns(path)).toHaveLength(1);
   });
 
+  it("normalizes legacy single-repo runs to their control project", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "pi-runs-legacy-workspace-"));
+    directories.push(directory);
+    const path = join(directory, "runs.json");
+    const legacy = structuredClone(
+      createDurableRun({ invocationId: "legacy-workspace", projectDirectory: directory }),
+    ) as Record<string, unknown>;
+    delete legacy.workspaceDirectory;
+    await writeFile(path, JSON.stringify({ version: 1, runs: [legacy] }));
+
+    const [loaded] = await listDurableRuns(path);
+
+    expect(loaded?.workspaceDirectory).toBe(directory);
+  });
+
   it("rejects resurrection or rewriting of a terminal execution phase", async () => {
     const directory = await mkdtemp(join(tmpdir(), "pi-runs-"));
     directories.push(directory);

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { Type, type TSchema } from "typebox";
@@ -115,6 +115,74 @@ function createContext(projectDirectory: string): ExtensionContext {
 }
 
 describe("orchestrated task runtime", () => {
+  it("scopes multi-repo claims and context to cwd while retaining control state", async () => {
+    const controlDirectory = await createTemporaryProject();
+    const executionDirectory = await createTemporaryProject();
+    await mkdir(join(executionDirectory, "src"), { recursive: true });
+    await writeFile(join(executionDirectory, "src", "target.ts"), "export {};\n", "utf8");
+    const fakePi = createFakePi();
+    const upstreamCalls: Array<Record<string, unknown>> = [];
+    createTaskRuntime((pi) => {
+      pi.registerTool({
+        name: "task",
+        label: "Task",
+        description: "Multi-repo upstream",
+        parameters: Type.Object({
+          agent_type: Type.String(),
+          prompt: Type.String(),
+          description: Type.String(),
+          cwd: Type.Optional(Type.String()),
+          background: Type.Optional(Type.Boolean()),
+        }),
+        async execute(_id, params) {
+          upstreamCalls.push(params as Record<string, unknown>);
+          return {
+            content: [{ type: "text" as const, text: "Started task task-multi." }],
+            details: { taskId: "task-multi", phase: "running" },
+          };
+        },
+      });
+    })(fakePi.api);
+
+    await fakePi.tools.get("task")?.execute(
+      "multi-repo",
+      {
+        agent_type: "general",
+        prompt: "Inspect the target repository.",
+        description: "Multi repo task",
+        cwd: executionDirectory,
+        background: true,
+        orchestration: {
+          claims: [{ kind: "write", resource: "src", mode: "exclusive" }],
+          context: {
+            goal: "Update the target repository",
+            authorization: "write-approved",
+            references: [{ path: "src/target.ts" }],
+            next_step: "Inspect the target",
+          },
+        },
+      },
+      new AbortController().signal,
+      undefined,
+      createContext(controlDirectory),
+    );
+
+    expect(upstreamCalls[0]?.cwd).toBe(executionDirectory);
+    const paths = getOrchestrationPaths(controlDirectory);
+    const runs = await listDurableRuns(paths.runStore);
+    const canonicalExecutionDirectory = await realpath(executionDirectory);
+    expect(runs[0]).toMatchObject({
+      projectDirectory: controlDirectory,
+      workspaceDirectory: canonicalExecutionDirectory,
+      executionDirectory: canonicalExecutionDirectory,
+    });
+    expect(runs[0]?.contextPack?.references[0]?.path).toBe("src/target.ts");
+    const leases = JSON.parse(await readFile(paths.leaseStore, "utf8")) as {
+      leases: Array<{ scope?: string }>;
+    };
+    expect(leases.leases[0]?.scope).toBe(canonicalExecutionDirectory);
+  });
+
   it("resolves the upstream extension from an ESM module boundary", () => {
     const upstream = () => undefined;
     expect(resolveUpstreamTaskExtension({ default: upstream })).toBe(upstream);
@@ -1847,6 +1915,42 @@ describe("orchestrated task runtime", () => {
     const blocked = await handler?.(
       { type: "tool_call", toolName: "edit", input: { path: "src/a.ts" } },
       createContext(projectDirectory),
+    );
+    expect(blocked).toMatchObject({ block: true });
+  });
+
+  it("guards writes against the matching multi-repo lease scope", async () => {
+    const controlDirectory = await createTemporaryProject();
+    const executionDirectory = await createTemporaryProject();
+    const paths = getOrchestrationPaths(controlDirectory);
+    await acquireResourceLease({
+      storePath: paths.leaseStore,
+      owner: "task-owner",
+      scope: await realpath(executionDirectory),
+      claims: [{ kind: "write", resource: "src", mode: "exclusive" }],
+    });
+    const fakePi = createFakePi();
+    createTaskRuntime(() => undefined)(fakePi.api);
+    const handler = fakePi.handlers.get("tool_call")?.[0];
+    expect(handler).toBeDefined();
+
+    const unclaimed = await handler?.(
+      {
+        type: "tool_call",
+        toolName: "edit",
+        input: { path: join(executionDirectory, "docs", "readme.md") },
+      },
+      createContext(controlDirectory),
+    );
+    expect(unclaimed).toBeUndefined();
+
+    const blocked = await handler?.(
+      {
+        type: "tool_call",
+        toolName: "edit",
+        input: { path: join(executionDirectory, "src", "a.ts") },
+      },
+      createContext(controlDirectory),
     );
     expect(blocked).toMatchObject({ block: true });
   });

@@ -108,6 +108,8 @@ import type {
   TerminalHandle,
 } from "./types.js";
 import { ignoreStaleExtensionCtx } from "./stale-ctx.js";
+import { serializeTaskAdmission } from "./task-admission.js";
+import { resolveTaskCwd } from "./task-cwd.js";
 import {
   createTaskWorktree,
   finalizeTaskWorktree,
@@ -156,9 +158,13 @@ export default function (pi: ExtensionAPI) {
   // ── Restore active tasks from registry on load ──────────────────────────
 
   const syncHerdr = createSyncHerdrControl();
-  const registryEntryAlive = (entry: RegistryEntry): boolean => entry.handle?.backend === "herdr"
-    ? syncHerdr.exists(entry.handle)
-    : Boolean(entry.paneId && paneExists(entry.paneId));
+  const registryEntryAlive = (entry: RegistryEntry): boolean => {
+    if (entry.handle?.backend === "herdr") return syncHerdr.exists(entry.handle);
+    const paneId = entry.handle?.backend === "tmux"
+      ? entry.handle.resourceId
+      : entry.paneId;
+    return Boolean(paneId && paneExists(paneId));
+  };
   const registryEntryStatus = (entry: RegistryEntry): "alive" | "missing" | "unavailable" => {
     try {
       return registryEntryAlive(entry) ? "alive" : "missing";
@@ -280,9 +286,27 @@ export default function (pi: ExtensionAPI) {
         };
       }
       const agent = preflight.agent;
+      if (params.cwd !== undefined) {
+        const requestedTaskCwd = resolveTaskCwd(ctx.cwd, params.cwd);
+        if (requestedTaskCwd.kind === "invalid") {
+          return {
+            content: [{ type: "text" as const, text: requestedTaskCwd.message }],
+            details: { phase: "failed" as const, error: "invalid cwd" },
+            isError: true,
+          };
+        }
+      }
+      let persistedTaskCwd: string | undefined;
 
       // ── Resolve task identity: new, task resume, or conversation resume ──
       const conversationId = normalizeConversationId(params.conversation_id);
+      const taskId = normalizeConversationId(params.task_id);
+      const admissionKey = conversationId
+        ? `${piDir}\0conversation:${conversationId}`
+        : taskId
+          ? `${piDir}\0task:${taskId}`
+          : undefined;
+      return serializeTaskAdmission(admissionKey, async () => {
       const taskSessionsRegistry = conversationId
         ? readTaskSessionsRegistry(piDir)
         : {};
@@ -322,6 +346,7 @@ export default function (pi: ExtensionAPI) {
             id = registeredTaskId;
             sessionName = conversationId ?? `task-${id}`;
             const previous = findTaskSessionHistory(piDir, id);
+            persistedTaskCwd = previous?.cwd ?? previous?.worktree?.repositoryRoot;
             const metadataAgent = previous?.agentType;
             if (metadataAgent && metadataAgent !== agent.name) {
               return {
@@ -345,6 +370,15 @@ export default function (pi: ExtensionAPI) {
         const entry = readRegistry(piDir).find(
           (candidate) => candidate.id === id,
         );
+        persistedTaskCwd = entry?.cwd ?? entry?.worktree?.repositoryRoot ?? persistedTaskCwd;
+        const activeTaskCwd = resolveTaskCwd(ctx.cwd, params.cwd, persistedTaskCwd);
+        if (activeTaskCwd.kind === "invalid") {
+          return {
+            content: [{ type: "text" as const, text: activeTaskCwd.message }],
+            details: { phase: "failed" as const, error: "invalid cwd", task_id: id },
+            isError: true,
+          };
+        }
         const entryStatus = entry ? registryEntryStatus(entry) : "missing";
         if (entryStatus === "unavailable") {
           return {
@@ -353,13 +387,17 @@ export default function (pi: ExtensionAPI) {
             isError: true,
           };
         }
-        if (
-          params.background !== false &&
-          entry &&
-          entryStatus === "alive"
-        ) {
+        if (entry && entryStatus === "alive") {
+          if (params.background === false) {
+            return {
+              content: [{ type: "text" as const, text: `Conversation "${conversationId}" is already running in the background and cannot be relaunched as foreground.` }],
+              details: { phase: "failed" as const, error: "active task cannot run foreground", task_id: id },
+              isError: true,
+            };
+          }
           const bgtask: BackgroundTask = {
             dir: artifactsDir,
+            cwd: activeTaskCwd.cwd,
             agentType: entry.agentType,
             sessionName,
             paneId: entry.handle?.resourceId ?? entry.paneId,
@@ -456,6 +494,16 @@ export default function (pi: ExtensionAPI) {
          resume = true;
          resumeSessionRef = entry.sessionRef;
          resumeWorktree = entry.worktree;
+         persistedTaskCwd = entry.cwd ?? entry.worktree?.repositoryRoot;
+
+        const activeTaskCwd = resolveTaskCwd(ctx.cwd, params.cwd, persistedTaskCwd);
+        if (activeTaskCwd.kind === "invalid") {
+          return {
+            content: [{ type: "text" as const, text: activeTaskCwd.message }],
+            details: { phase: "failed" as const, error: "invalid cwd", task_id: id },
+            isError: true,
+          };
+        }
 
         // If background and the terminal resource is still alive, reattach to the tracker.
         const entryStatus = registryEntryStatus(entry);
@@ -466,12 +514,17 @@ export default function (pi: ExtensionAPI) {
             isError: true,
           };
         }
-        if (
-          params.background !== false &&
-          entryStatus === "alive"
-        ) {
+        if (entryStatus === "alive") {
+          if (params.background === false) {
+            return {
+              content: [{ type: "text" as const, text: `Task "${params.task_id}" is already running in the background and cannot be relaunched as foreground.` }],
+              details: { phase: "failed" as const, error: "active task cannot run foreground", task_id: id },
+              isError: true,
+            };
+          }
           const bgtask: BackgroundTask = {
             dir: artifactsDir,
+            cwd: activeTaskCwd.cwd,
             agentType: entry.agentType,
             sessionName,
             paneId: entry.handle?.resourceId ?? entry.paneId,
@@ -535,6 +588,16 @@ export default function (pi: ExtensionAPI) {
          sessionName = conversationId ?? `task-${id}`;
        }
 
+      const taskCwdResolution = resolveTaskCwd(ctx.cwd, params.cwd, persistedTaskCwd);
+      if (taskCwdResolution.kind === "invalid") {
+        return {
+          content: [{ type: "text" as const, text: taskCwdResolution.message }],
+          details: { phase: "failed" as const, error: "invalid cwd" },
+          isError: true,
+        };
+      }
+      const taskCwd = taskCwdResolution.cwd;
+
       const durableBackendPreference = (process.env.PI_TASK_BACKEND ?? "auto").trim().toLowerCase();
       const herdrContextAvailable = process.env.HERDR_ENV === "1"
         && Boolean(process.env.HERDR_PANE_ID)
@@ -580,7 +643,7 @@ export default function (pi: ExtensionAPI) {
       }
       if (!worktree && params.isolation === "worktree") {
         try {
-          worktree = createTaskWorktree({ cwd: ctx.cwd, taskIdHint: id });
+          worktree = createTaskWorktree({ cwd: taskCwd, taskIdHint: id });
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           return {
@@ -590,7 +653,7 @@ export default function (pi: ExtensionAPI) {
           };
         }
       }
-      const executionCwd = worktree?.path ?? ctx.cwd;
+      const executionCwd = worktree?.path ?? taskCwd;
 
       // Everything the child needs to enforce write claims on itself: where
       // the parent's lease store is, and which identities it may write under.
@@ -598,7 +661,7 @@ export default function (pi: ExtensionAPI) {
       // was the one process whose writes were never checked (audit S-A).
       const claimGuardConfig: ChildClaimGuardConfig = {
         version: 2,
-        projectDirectory: ctx.cwd,
+        projectDirectory: taskCwd,
         leaseStore: getOrchestrationPaths(ctx.cwd).leaseStore,
         guardStatePath: join(
           getOrchestrationPaths(ctx.cwd).root,
@@ -760,6 +823,7 @@ export default function (pi: ExtensionAPI) {
         ? undefined
         : {
             dir: artifactsDir,
+            cwd: taskCwd,
             agentType: agent.name,
             sessionName,
                     backend: selectedBackend,
@@ -786,6 +850,7 @@ export default function (pi: ExtensionAPI) {
 
               const backgroundTask: BackgroundTask = {
                 dir: artifactsDir,
+                cwd: taskCwd,
                 agentType: agent.name,
                 sessionName,
                 backend: "sdk",
@@ -811,6 +876,7 @@ export default function (pi: ExtensionAPI) {
                 startedAt: backgroundTask.startedAt,
                 piDir,
                 artifactsDir,
+                cwd: taskCwd,
                 conversationId,
                 worktree,
                 run: async () => runSdkFallback(undefined, bgOnSession),
@@ -1059,6 +1125,7 @@ export default function (pi: ExtensionAPI) {
           handle,
           piDir,
           dir: artifactsDir,
+          cwd: taskCwd,
           conversationId,
           worktree,
           status: "running",
@@ -1124,6 +1191,7 @@ export default function (pi: ExtensionAPI) {
           handle,
           piDir,
           dir: artifactsDir,
+          cwd: taskCwd,
           conversationId,
           sessionRef: completedSessionRef,
           worktree,
@@ -1185,6 +1253,7 @@ export default function (pi: ExtensionAPI) {
 
       const bgtask: BackgroundTask = {
         dir: artifactsDir,
+        cwd: taskCwd,
         agentType: agent.name,
         sessionName,
         paneId,
@@ -1213,6 +1282,7 @@ export default function (pi: ExtensionAPI) {
         handle,
         piDir,
         dir: artifactsDir,
+        cwd: taskCwd,
         conversationId,
         worktree,
       };
@@ -1283,6 +1353,7 @@ export default function (pi: ExtensionAPI) {
           background: true,
         },
       };
+      });
     },
 
         renderCall,

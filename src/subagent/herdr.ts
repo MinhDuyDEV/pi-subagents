@@ -5,6 +5,7 @@ import { HerdrClient } from "./herdrClient.js";
 import {
   createDefaultCommandRunner,
   type CommandRunner,
+  type CommandResult,
   type TerminalBackend,
   type TerminalLaunchInput,
 } from "./terminalBackend.js";
@@ -12,6 +13,7 @@ import {
 interface HerdrPane {
   pane_id: string;
   terminal_id: string;
+  agent?: string;
   tab_id?: string;
 }
 
@@ -22,6 +24,25 @@ interface HerdrWorkspace {
 
 interface HerdrResponse<T> {
   result?: T;
+}
+
+interface HerdrAgentInfo {
+  terminal_id: string;
+  pane_id: string;
+  name?: string;
+  agent?: string;
+  agent_status: string;
+  state_change_seq: number;
+  foreground_process_group_id?: number;
+}
+
+type HerdrRun = (args: readonly string[]) => Promise<CommandResult>;
+
+class HerdrIdentityError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "HerdrIdentityError";
+  }
 }
 
 let launchQueue: Promise<void> = Promise.resolve();
@@ -149,6 +170,349 @@ function errorText(error: unknown): string {
     .join("\n");
 }
 
+function herdrError(
+  error: unknown,
+): { code: string; message?: string } | undefined {
+  if (!(error instanceof Error)) return undefined;
+  const output = error as Error & { stdout?: unknown; stderr?: unknown };
+  for (const value of [output.stderr, output.stdout]) {
+    if (typeof value !== "string") continue;
+    try {
+      const parsed = JSON.parse(value) as {
+        error?: { code?: unknown; message?: unknown };
+      };
+      if (typeof parsed.error?.code === "string") {
+        return {
+          code: parsed.error.code,
+          ...(typeof parsed.error.message === "string"
+            ? { message: parsed.error.message }
+            : {}),
+        };
+      }
+    } catch {
+      // Non-JSON command diagnostics are never eligible for prompt retry.
+    }
+  }
+  return undefined;
+}
+
+function stalledPromptBaseline(error: unknown): number | undefined {
+  const details = herdrError(error);
+  if (details?.code !== "agent_prompt_stalled" || !details.message) return undefined;
+  const match = /state_change_seq remained (\d+)\s*$/u.exec(details.message);
+  if (!match) return undefined;
+  const baseline = Number(match[1]);
+  return Number.isSafeInteger(baseline) ? baseline : undefined;
+}
+
+function agentFrom(value: unknown): HerdrAgentInfo {
+  const agent = (value as { agent?: Partial<HerdrAgentInfo> }).agent;
+  if (
+    typeof agent?.terminal_id !== "string" ||
+    typeof agent.pane_id !== "string" ||
+    typeof agent.agent_status !== "string" ||
+    typeof agent.state_change_seq !== "number"
+  ) {
+    throw new Error("HerdR response did not include a complete agent identity");
+  }
+  return agent as HerdrAgentInfo;
+}
+
+function processInfoFrom(value: unknown): {
+  pane_id: string;
+  foreground_process_group_id: number;
+} {
+  const processInfo = (value as {
+    process_info?: {
+      pane_id?: unknown;
+      foreground_process_group_id?: unknown;
+    };
+  }).process_info;
+  if (
+    typeof processInfo?.pane_id !== "string" ||
+    typeof processInfo.foreground_process_group_id !== "number"
+  ) {
+    throw new Error(
+      "HerdR response did not include pane_id and foreground process group id",
+    );
+  }
+  return {
+    pane_id: processInfo.pane_id,
+    foreground_process_group_id: processInfo.foreground_process_group_id,
+  };
+}
+
+function sameAgentIdentity(
+  expected: HerdrAgentInfo,
+  current: HerdrAgentInfo,
+): boolean {
+  return (
+    expected.pane_id === current.pane_id &&
+    expected.terminal_id === current.terminal_id &&
+    (expected.name === undefined || expected.name === current.name) &&
+    (expected.agent === undefined || expected.agent === current.agent) &&
+    expected.foreground_process_group_id !== undefined &&
+    expected.foreground_process_group_id === current.foreground_process_group_id
+  );
+}
+
+function assertSameAgentIdentity(
+  expected: HerdrAgentInfo,
+  current: HerdrAgentInfo,
+): void {
+  if (!sameAgentIdentity(expected, current)) {
+    throw new HerdrIdentityError(
+      `HerdR agent identity changed for ${expected.pane_id}`,
+    );
+  }
+}
+
+function isSettledPromptState(status: string): boolean {
+  return ["idle", "working", "blocked", "done"].includes(status);
+}
+
+async function readAgent(
+  run: HerdrRun,
+  paneId: string,
+): Promise<HerdrAgentInfo> {
+  const readProcess = async () =>
+    processInfoFrom(
+      decode(
+        (await run(["pane", "process-info", "--pane", paneId])).stdout,
+        "pane process-info",
+      ),
+    );
+  const processBefore = await readProcess();
+  const agent = agentFrom(
+    decode((await run(["agent", "get", paneId])).stdout, "agent get"),
+  );
+  const processAfter = await readProcess();
+  if (
+    processBefore.pane_id !== agent.pane_id ||
+    processAfter.pane_id !== agent.pane_id ||
+    processBefore.foreground_process_group_id !==
+      processAfter.foreground_process_group_id
+  ) {
+    throw new HerdrIdentityError(
+      `HerdR process identity changed for ${agent.pane_id}`,
+    );
+  }
+  return {
+    ...agent,
+    foreground_process_group_id: processAfter.foreground_process_group_id,
+  };
+}
+
+async function waitForRetryTransition(
+  run: HerdrRun,
+  expected: HerdrAgentInfo,
+  baseline: number,
+  timeoutMs: number,
+  pollMs: number,
+  signal?: AbortSignal,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (true) {
+    let current: HerdrAgentInfo;
+    try {
+      current = await readAgent(run, expected.pane_id);
+    } catch (error) {
+      throw new HerdrIdentityError(
+        `HerdR could not verify retry identity: ${errorText(error)}`,
+      );
+    }
+    assertSameAgentIdentity(expected, current);
+    if (
+      current.state_change_seq > baseline &&
+      isSettledPromptState(current.agent_status)
+    ) {
+      return;
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(
+        `HerdR retry produced no confirmed lifecycle transition for ${expected.pane_id}`,
+      );
+    }
+    await sleep(pollMs, signal);
+  }
+}
+
+async function verifyPromptTimeout(
+  run: HerdrRun,
+  promptIdentity: HerdrAgentInfo,
+): Promise<void> {
+  let current: HerdrAgentInfo;
+  try {
+    current = await readAgent(run, promptIdentity.pane_id);
+  } catch (error) {
+    throw new HerdrIdentityError(
+      `HerdR could not verify prompt timeout identity: ${errorText(error)}`,
+    );
+  }
+  assertSameAgentIdentity(promptIdentity, current);
+  if (current.state_change_seq <= promptIdentity.state_change_seq) {
+    throw new Error(
+      `HerdR prompt timeout did not prove activity for ${promptIdentity.pane_id}`,
+    );
+  }
+}
+
+async function retryStalledPrompt(
+  run: HerdrRun,
+  promptIdentity: HerdrAgentInfo,
+  error: unknown,
+  timeoutMs: number,
+  pollMs: number,
+  signal?: AbortSignal,
+): Promise<void> {
+  const stalledBaseline = stalledPromptBaseline(error);
+  if (stalledBaseline === undefined) {
+    throw new HerdrIdentityError(
+      "HerdR stalled prompt did not include HerdR's state sequence baseline",
+    );
+  }
+  let beforeRetry: HerdrAgentInfo;
+  try {
+    beforeRetry = await readAgent(run, promptIdentity.pane_id);
+  } catch (readError) {
+    throw new HerdrIdentityError(
+      `HerdR could not verify retry identity: ${errorText(readError)}`,
+    );
+  }
+  assertSameAgentIdentity(promptIdentity, beforeRetry);
+  if (beforeRetry.state_change_seq < stalledBaseline) {
+    throw new HerdrIdentityError(
+      `HerdR retry state sequence regressed for ${promptIdentity.pane_id}`,
+    );
+  }
+  if (beforeRetry.state_change_seq > stalledBaseline) {
+    await waitForRetryTransition(
+      run,
+      beforeRetry,
+      stalledBaseline,
+      timeoutMs,
+      pollMs,
+      signal,
+    );
+    return;
+  }
+  if (!beforeRetry.name) {
+    throw new HerdrIdentityError(
+      `HerdR cannot safely retry an unnamed agent in ${promptIdentity.pane_id}`,
+    );
+  }
+  try {
+    await run(["agent", "send-keys", beforeRetry.name, "enter"]);
+  } catch (sendError) {
+    throw new HerdrIdentityError(
+      `HerdR could not verify retry submission: ${errorText(sendError)}`,
+    );
+  }
+  await waitForRetryTransition(
+    run,
+    beforeRetry,
+    beforeRetry.state_change_seq,
+    timeoutMs,
+    pollMs,
+    signal,
+  );
+}
+
+async function readStartedAgent(
+  run: HerdrRun,
+  created: HerdrPane,
+): Promise<HerdrAgentInfo> {
+  const identity = await readAgent(run, created.pane_id);
+  if (
+    identity.terminal_id !== created.terminal_id ||
+    (identity.agent !== undefined && identity.agent !== "pi")
+  ) {
+    throw new HerdrIdentityError(
+      `HerdR agent identity did not match started pane ${created.pane_id}`,
+    );
+  }
+  return identity;
+}
+
+async function submitInitialPrompt(
+  run: HerdrRun,
+  created: HerdrPane,
+  identity: HerdrAgentInfo,
+  prompt: string,
+  promptTimeoutMs: number,
+  retryTimeoutMs: number,
+  retryPollMs: number,
+  signal?: AbortSignal,
+): Promise<void> {
+  try {
+    await run([
+      "agent",
+      "prompt",
+      created.pane_id,
+      prompt,
+      "--wait",
+      "--until",
+      "working",
+      "--until",
+      "blocked",
+      "--until",
+      "done",
+      "--timeout",
+      String(promptTimeoutMs),
+    ]);
+  } catch (error) {
+    const code = herdrError(error)?.code;
+    if (code === "timeout") {
+      await verifyPromptTimeout(run, identity);
+      return;
+    }
+    if (code === "agent_prompt_stalled") {
+      await retryStalledPrompt(
+        run,
+        identity,
+        error,
+        retryTimeoutMs,
+        retryPollMs,
+        signal,
+      );
+      return;
+    }
+    throw error;
+  }
+}
+
+async function closeCreatedResource(
+  run: HerdrRun,
+  workspace: HerdrWorkspace | undefined,
+  created: HerdrPane | undefined,
+  expectedAgent: HerdrAgentInfo | undefined,
+): Promise<void> {
+  if (!expectedAgent) return;
+  try {
+    assertSameAgentIdentity(
+      expectedAgent,
+      await readAgent(run, expectedAgent.pane_id),
+    );
+    if (created) {
+      const current = paneFrom(
+        decode((await run(["pane", "get", created.pane_id])).stdout, "pane get"),
+      );
+      if (current.terminal_id !== created.terminal_id || current.agent !== "pi") {
+        return;
+      }
+    }
+  } catch {
+    return;
+  }
+  if (workspace) {
+    await run(["workspace", "close", workspace.workspace_id]).catch(
+      () => undefined,
+    );
+  } else if (created) {
+    await run(["pane", "close", created.pane_id]).catch(() => undefined);
+  }
+}
+
 function isAgentPaneBusy(error: unknown): boolean {
   return /agent_pane_busy|not an available shell/i.test(errorText(error));
 }
@@ -245,6 +609,9 @@ export function restoreHerdrWorkspaceGroups(
 export interface HerdrTerminalBackendOptions {
   run?: CommandRunner["run"];
   env?: NodeJS.ProcessEnv;
+  promptTimeoutMs?: number;
+  retryTimeoutMs?: number;
+  retryPollMs?: number;
 }
 
 export function createHerdrTerminalBackend(
@@ -253,6 +620,9 @@ export function createHerdrTerminalBackend(
   const env = options.env ?? process.env;
   const runner = options.run ?? createDefaultCommandRunner().run;
   const socketPath = env.HERDR_SOCKET_PATH;
+  const promptTimeoutMs = options.promptTimeoutMs ?? 8_000;
+  const retryTimeoutMs = options.retryTimeoutMs ?? promptTimeoutMs;
+  const retryPollMs = options.retryPollMs ?? 100;
   const commandEnv = { ...env, HERDR_SOCKET_PATH: socketPath };
   const run = (
     args: readonly string[],
@@ -380,6 +750,7 @@ export function createHerdrTerminalBackend(
           ? workspaceFrom(decode(workspaceResponse.stdout, "workspace create"))
           : undefined;
         let created: HerdrPane | undefined;
+        let expectedAgent: HerdrAgentInfo | undefined;
         try {
           if (workspace) {
             const response = await runWithRetry(
@@ -441,12 +812,17 @@ export function createHerdrTerminalBackend(
             }
           }
           if (input.initialPrompt !== undefined) {
-            await launchRun([
-              "agent",
-              "prompt",
-              created.pane_id,
+            expectedAgent = await readStartedAgent(launchRun, created);
+            await submitInitialPrompt(
+              launchRun,
+              created,
+              expectedAgent,
               input.initialPrompt,
-            ]);
+              promptTimeoutMs,
+              retryTimeoutMs,
+              retryPollMs,
+              input.signal,
+            );
           }
           if (groupKey) {
             const group = existingGroup ?? {
@@ -488,12 +864,13 @@ export function createHerdrTerminalBackend(
             ...(input.herdrLayout ? { herdrLayout: input.herdrLayout } : {}),
           };
         } catch (error) {
-          if (workspace) {
-            await run(["workspace", "close", workspace.workspace_id]).catch(
-              () => undefined,
+          if (!(error instanceof HerdrIdentityError)) {
+            await closeCreatedResource(
+              launchRun,
+              workspace,
+              created,
+              expectedAgent,
             );
-          } else if (created) {
-            await run(["pane", "close", created.pane_id]).catch(() => undefined);
           }
           throw error;
         }

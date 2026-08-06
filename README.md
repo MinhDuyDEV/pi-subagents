@@ -4,12 +4,12 @@ A Herdr-native delegation runtime for [Pi](https://pi.dev): durable foreground/b
 
 **Runtime-only.** The package ships no agent profiles. Profiles remain owned by the consumer in `.pi/agents/*.md` or `~/.pi/agent/agents/*.md`. The runtime is additive and does not inject package policy into the consumer's parent system prompt. Its packaged skill is loaded only on demand through Pi's normal skill mechanism.
 
-## What's new in 0.11.0
+## What's new in 0.12.0
 
-- **Asynchronous learning context handshake** removes the production ACK/served race while preserving fail-open task startup.
-- **V2 learning intents** receive canonical claim IDs at the task boundary and bind completion-time verifier evidence before learning.
-- **Durable context bindings and usage receipts** connect injected learning to the task outcome without learning from task descriptions.
-- Peer `@minhduydev/pi-core` moved to `^0.3.0`. See `CHANGELOG.md`.
+- **First-class multi-repo execution:** `cwd` selects a canonical execution repository while durable state and agent profiles remain owned by the parent/control repository.
+- **Repo-scoped orchestration:** Context Pack references, claims, write guards, evidence and worktrees resolve against the selected repository; identical relative claims in different repositories no longer conflict.
+- **Durable launch admission:** concurrent launches for one `task_id`/`conversation_id` serialize, and an active background identity cannot be relaunched in foreground.
+- **Identity-safe HerdR prompts:** bounded lifecycle waits, verified stalled-prompt retry, and fail-closed cleanup prevent acting on a replacement agent.
 
 ## Requirements
 
@@ -77,6 +77,7 @@ Core parameters:
 | `description` | short task title |
 | `prompt` | governed-outcome brief: self-contained about context, not pre-solved about solution |
 | `background` | defaults to `true`; `false` waits foreground |
+| `cwd` | absolute existing repository/directory to execute in; defaults to the parent cwd and is immutable when resuming an identity |
 | `task_id` | resume an existing task |
 | `conversation_id` | durable specialist conversation |
 | `workspace_group` | put related terminal tasks in one group; HerdR uses an owned workspace by default |
@@ -118,6 +119,27 @@ Use it for parallel or sensitive writers:
 ```
 
 The runtime requires a clean source repository, then creates a branch under `pi-subagents/*` and a checkout outside it. This prevents local edits from being silently omitted from the delegated base. It records `baseSha`, branch, changed paths, and a SHA-256 diff/content digest. Unchanged worktrees are removed automatically; changed worktrees are retained for review and explicit merge. Write claims must be exclusive and project-relative.
+
+### Multi-repo execution
+
+Use `cwd` when the parent session coordinates work in another checkout:
+
+```json
+{
+  "agent_type": "general",
+  "description": "Update the API client",
+  "prompt": "Outcome: the client matches the current API contract.",
+  "cwd": "/absolute/path/to/api-client",
+  "background": true,
+  "orchestration": {
+    "claims": [
+      { "kind": "write", "resource": "src/client", "mode": "exclusive" }
+    ]
+  }
+}
+```
+
+The parent cwd is the **control root**: it owns profiles, task history, run records, leases, Context Pack storage and orchestration events. `cwd` is the canonical **workspace root**: it owns file-reference validation, relative claims, write protection and worktree creation. The actual child directory is the **execution root**, which equals the workspace root unless worktree isolation is enabled. Resume always reuses the persisted workspace root; changing repositories requires a new durable identity. Paths must be absolute, existing directories and are canonicalized through symlinks before launch.
 
 ## Durable orchestration
 

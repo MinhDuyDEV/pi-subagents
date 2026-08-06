@@ -280,7 +280,7 @@ async function executeHerdrAction(
       const subjectDigest = await taskSubjectDigest(projectDirectory, taskId);
       const proof = await validateEvidenceOnlyProof({
         projectDirectory: run.executionDirectory,
-        allowedProjectDirectories: [projectDirectory],
+        allowedProjectDirectories: [run.workspaceDirectory ?? projectDirectory],
         evidence: pack?.evidence ?? [],
         claims: pack?.claims,
         learningClaims: pack?.learningClaims,
@@ -1314,7 +1314,7 @@ async function detectWriteTaskProofFailure(
     // task finished.
     const proof = await validateEvidenceOnlyProof({
       projectDirectory: durable?.executionDirectory ?? projectDirectory,
-      allowedProjectDirectories: [projectDirectory],
+      allowedProjectDirectories: [durable?.workspaceDirectory ?? projectDirectory],
       evidence: pack?.evidence ?? [],
       maxEvidenceAgeMs: 15 * 60 * 1_000,
       ...(completionEvent.timestamp
@@ -1447,7 +1447,7 @@ async function ensureTaskContextPack(
   const run = knownRun ?? (await getDurableRunByTaskId(paths.runStore, taskId));
   if (!run) throw new Error(`Task not found: ${taskId}`);
   const created = await buildContextPack({
-    projectDirectory,
+    projectDirectory: run.workspaceDirectory ?? projectDirectory,
     input: {
       goal: run.description ?? `Continue task ${taskId}`,
       authorization: run.claims.some((claim) => claim.kind === "write")

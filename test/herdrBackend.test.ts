@@ -9,6 +9,23 @@ import {
 import { buildPiArgs, type AgentConfig } from "../src/helpers.js";
 import { taskParametersSchema } from "../src/tool/schema.js";
 
+function processInfoResult(
+  paneId = "w1:p2",
+  foregroundProcessGroupId = 123,
+) {
+  return {
+    stdout: JSON.stringify({
+      result: {
+        process_info: {
+          pane_id: paneId,
+          foreground_process_group_id: foregroundProcessGroupId,
+        },
+      },
+    }),
+    stderr: "",
+  };
+}
+
 test("HerdR Pi argv defers the raw task prompt instead of using a file attachment", () => {
   const agent: AgentConfig = {
     name: "reviewer",
@@ -390,7 +407,7 @@ test("ungrouped HerdR launch splits the caller pane before starting Pi", async (
   ]);
 });
 
-test("HerdR sends the initial task prompt as raw agent input after startup", async () => {
+test("HerdR submits the initial task prompt with a bounded lifecycle wait", async () => {
   const calls: string[][] = [];
   const backend = createHerdrTerminalBackend({
     env: {
@@ -407,6 +424,26 @@ test("HerdR sends the initial task prompt as raw agent input after startup", asy
           }),
           stderr: "",
         };
+      }
+      if (args[0] === "agent" && args[1] === "get") {
+        return {
+          stdout: JSON.stringify({
+            result: {
+              agent: {
+                pane_id: "w1:p2",
+                terminal_id: "term-2",
+                name: "pi-task",
+                agent: "pi",
+                agent_status: "idle",
+                state_change_seq: 10,
+              },
+            },
+          }),
+          stderr: "",
+        };
+      }
+      if (args[0] === "pane" && args[1] === "process-info") {
+        return processInfoResult();
       }
       return {
         stdout: JSON.stringify({
@@ -426,8 +463,181 @@ test("HerdR sends the initial task prompt as raw agent input after startup", asy
 
   assert.deepEqual(
     calls.find((args) => args[0] === "agent" && args[1] === "prompt"),
-    ["agent", "prompt", "w1:p2", initialPrompt],
+    [
+      "agent",
+      "prompt",
+      "w1:p2",
+      initialPrompt,
+      "--wait",
+      "--until",
+      "working",
+      "--until",
+      "blocked",
+      "--until",
+      "done",
+      "--timeout",
+      "8000",
+    ],
   );
+});
+
+test("HerdR retries only a stalled prompt and requires a newer sequence", async () => {
+  const calls: string[][] = [];
+  let retrySent = false;
+  const backend = createHerdrTerminalBackend({
+    promptTimeoutMs: 5_001,
+    retryTimeoutMs: 5,
+    retryPollMs: 1,
+    env: {
+      HERDR_ENV: "1",
+      HERDR_PANE_ID: "w1:p1",
+      HERDR_SOCKET_PATH: "/tmp/herdr-retry.sock",
+    },
+    run: async (_command, args) => {
+      calls.push([...args]);
+      if (args[0] === "pane" && args[1] === "split") {
+        return { stdout: JSON.stringify({ pane: { pane_id: "w1:p2", terminal_id: "term-2" } }), stderr: "" };
+      }
+      if (args[0] === "agent" && args[1] === "prompt") {
+        throw Object.assign(new Error("prompt stalled"), {
+          stderr: JSON.stringify({ error: { code: "agent_prompt_stalled", message: "agent prompt produced no observed state change within 5000 ms; status is idle and state_change_seq remained 10" } }),
+        });
+      }
+      if (args[0] === "agent" && args[1] === "get") {
+        return { stdout: JSON.stringify({ result: { agent: { pane_id: "w1:p2", terminal_id: "term-2", name: "pi-task", agent: "pi", agent_status: retrySent ? "working" : "idle", state_change_seq: retrySent ? 11 : 10 } } }), stderr: "" };
+      }
+      if (args[0] === "pane" && args[1] === "process-info") return processInfoResult();
+      if (args[0] === "agent" && args[1] === "send-keys") retrySent = true;
+      return { stdout: JSON.stringify({ agent: { pane_id: "w1:p2", terminal_id: "term-2" } }), stderr: "" };
+    },
+  });
+
+  await backend.launch({ cwd: "/repo", agentArgs: ["task"], initialPrompt: "Review." });
+
+  assert.deepEqual(
+    calls.find((args) => args[0] === "agent" && args[1] === "send-keys"),
+    ["agent", "send-keys", "pi-task", "enter"],
+  );
+});
+
+test("HerdR accepts an ordinary prompt timeout only after verified activity", async () => {
+  const calls: string[][] = [];
+  let agentGets = 0;
+  const backend = createHerdrTerminalBackend({
+    env: { HERDR_ENV: "1", HERDR_PANE_ID: "w1:p1", HERDR_SOCKET_PATH: "/tmp/herdr-timeout.sock" },
+    run: async (_command, args) => {
+      calls.push([...args]);
+      if (args[0] === "pane" && args[1] === "split") return { stdout: JSON.stringify({ pane: { pane_id: "w1:p2", terminal_id: "term-2" } }), stderr: "" };
+      if (args[0] === "agent" && args[1] === "prompt") {
+        throw Object.assign(new Error("prompt timed out"), { stderr: JSON.stringify({ error: { code: "timeout", message: "timed out waiting for agent status" } }) });
+      }
+      if (args[0] === "agent" && args[1] === "get") {
+        agentGets += 1;
+        return { stdout: JSON.stringify({ result: { agent: { pane_id: "w1:p2", terminal_id: "term-2", name: "pi-task", agent: "pi", agent_status: "working", state_change_seq: agentGets > 1 ? 11 : 10 } } }), stderr: "" };
+      }
+      if (args[0] === "pane" && args[1] === "process-info") return processInfoResult();
+      return { stdout: JSON.stringify({ agent: { pane_id: "w1:p2", terminal_id: "term-2" } }), stderr: "" };
+    },
+  });
+
+  await backend.launch({ cwd: "/repo", agentArgs: ["task"], initialPrompt: "Review." });
+
+  assert.equal(calls.some((args) => args[0] === "agent" && args[1] === "send-keys"), false);
+});
+
+test("HerdR rejects a dropped retry Enter with no lifecycle transition", async () => {
+  const calls: string[][] = [];
+  const backend = createHerdrTerminalBackend({
+    promptTimeoutMs: 5_001,
+    retryTimeoutMs: 5,
+    retryPollMs: 1,
+    env: { HERDR_ENV: "1", HERDR_PANE_ID: "w1:p1", HERDR_SOCKET_PATH: "/tmp/herdr-dropped-enter.sock" },
+    run: async (_command, args) => {
+      calls.push([...args]);
+      if (args[0] === "pane" && args[1] === "split") return { stdout: JSON.stringify({ pane: { pane_id: "w1:p2", terminal_id: "term-2" } }), stderr: "" };
+      if (args[0] === "agent" && args[1] === "prompt") throw Object.assign(new Error("prompt stalled"), { stderr: JSON.stringify({ error: { code: "agent_prompt_stalled", message: "state_change_seq remained 10" } }) });
+      if (args[0] === "agent" && args[1] === "get") return { stdout: JSON.stringify({ result: { agent: { pane_id: "w1:p2", terminal_id: "term-2", name: "pi-task", agent: "pi", agent_status: "idle", state_change_seq: 10 } } }), stderr: "" };
+      if (args[0] === "pane" && args[1] === "process-info") return processInfoResult();
+      if (args[0] === "pane" && args[1] === "get") return { stdout: JSON.stringify({ pane: { pane_id: "w1:p2", terminal_id: "term-2", agent: "pi" } }), stderr: "" };
+      return { stdout: JSON.stringify({ agent: { pane_id: "w1:p2", terminal_id: "term-2" } }), stderr: "" };
+    },
+  });
+
+  await assert.rejects(
+    backend.launch({ cwd: "/repo", agentArgs: ["task"], initialPrompt: "Review." }),
+    /no confirmed lifecycle transition/iu,
+  );
+  assert.equal(calls.some((args) => args[0] === "agent" && args[1] === "send-keys"), true);
+});
+
+test("HerdR rejects a replacement agent and does not clean up its pane", async () => {
+  const calls: string[][] = [];
+  let retrySent = false;
+  const backend = createHerdrTerminalBackend({
+    promptTimeoutMs: 5_001,
+    retryTimeoutMs: 5,
+    retryPollMs: 1,
+    env: { HERDR_ENV: "1", HERDR_PANE_ID: "w1:p1", HERDR_SOCKET_PATH: "/tmp/herdr-replaced.sock" },
+    run: async (_command, args) => {
+      calls.push([...args]);
+      if (args[0] === "pane" && args[1] === "split") return { stdout: JSON.stringify({ pane: { pane_id: "w1:p2", terminal_id: "term-2" } }), stderr: "" };
+      if (args[0] === "agent" && args[1] === "prompt") {
+        throw Object.assign(new Error("prompt stalled"), { stderr: JSON.stringify({ error: { code: "agent_prompt_stalled", message: "state_change_seq remained 10" } }) });
+      }
+      if (args[0] === "agent" && args[1] === "get") return { stdout: JSON.stringify({ result: { agent: { pane_id: "w1:p2", terminal_id: retrySent ? "term-replaced" : "term-2", name: "pi-task", agent: "pi", agent_status: retrySent ? "working" : "idle", state_change_seq: retrySent ? 11 : 10 } } }), stderr: "" };
+      if (args[0] === "pane" && args[1] === "process-info") return processInfoResult("w1:p2", retrySent ? 124 : 123);
+      if (args[0] === "agent" && args[1] === "send-keys") retrySent = true;
+      return { stdout: JSON.stringify({ agent: { pane_id: "w1:p2", terminal_id: "term-2" } }), stderr: "" };
+    },
+  });
+
+  await assert.rejects(
+    backend.launch({ cwd: "/repo", agentArgs: ["task"], initialPrompt: "Review." }),
+    /identity|terminal/iu,
+  );
+  assert.equal(calls.some((args) => args[0] === "pane" && args[1] === "close"), false);
+});
+
+test("HerdR skips destructive cleanup when initial identity capture fails", async () => {
+  const calls: string[][] = [];
+  const backend = createHerdrTerminalBackend({
+    env: { HERDR_ENV: "1", HERDR_PANE_ID: "w1:p1", HERDR_SOCKET_PATH: "/tmp/herdr-identity.sock" },
+    run: async (_command, args) => {
+      calls.push([...args]);
+      if (args[0] === "pane" && args[1] === "split") return { stdout: JSON.stringify({ pane: { pane_id: "w1:p2", terminal_id: "term-2" } }), stderr: "" };
+      if (args[0] === "agent" && args[1] === "get") throw new Error("agent lookup unavailable");
+      if (args[0] === "pane" && args[1] === "process-info") return processInfoResult();
+      return { stdout: JSON.stringify({ agent: { pane_id: "w1:p2", terminal_id: "term-2" } }), stderr: "" };
+    },
+  });
+
+  await assert.rejects(
+    backend.launch({ cwd: "/repo", agentArgs: ["task"], initialPrompt: "Review." }),
+    /lookup unavailable/iu,
+  );
+  assert.equal(calls.some((args) => args[1] === "close"), false);
+});
+
+test("HerdR cleans up a prompt failure only after identity was captured", async () => {
+  const calls: string[][] = [];
+  const backend = createHerdrTerminalBackend({
+    env: { HERDR_ENV: "1", HERDR_PANE_ID: "w1:p1", HERDR_SOCKET_PATH: "/tmp/herdr-owned-cleanup.sock" },
+    run: async (_command, args) => {
+      calls.push([...args]);
+      if (args[0] === "pane" && args[1] === "split") return { stdout: JSON.stringify({ pane: { pane_id: "w1:p2", terminal_id: "term-2" } }), stderr: "" };
+      if (args[0] === "agent" && args[1] === "prompt") throw new Error("unstructured prompt failure");
+      if (args[0] === "agent" && args[1] === "get") return { stdout: JSON.stringify({ result: { agent: { pane_id: "w1:p2", terminal_id: "term-2", name: "pi-task", agent: "pi", agent_status: "idle", state_change_seq: 10 } } }), stderr: "" };
+      if (args[0] === "pane" && args[1] === "process-info") return processInfoResult();
+      if (args[0] === "pane" && args[1] === "get") return { stdout: JSON.stringify({ pane: { pane_id: "w1:p2", terminal_id: "term-2", agent: "pi" } }), stderr: "" };
+      return { stdout: JSON.stringify({ agent: { pane_id: "w1:p2", terminal_id: "term-2" } }), stderr: "" };
+    },
+  });
+
+  await assert.rejects(
+    backend.launch({ cwd: "/repo", agentArgs: ["task"], initialPrompt: "Review." }),
+    /prompt failure/iu,
+  );
+  assert.equal(calls.some((args) => args[0] === "pane" && args[1] === "close"), true);
 });
 
 test("parallel HerdR launches serialize workspace and pane creation", async () => {

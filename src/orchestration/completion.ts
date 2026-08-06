@@ -58,6 +58,7 @@ export interface ActiveRun {
   proof?: OrchestrationRequest["proof"];
   verifier?: OrchestrationRequest["verifier"];
   projectDirectory: string;
+  workspaceDirectory?: string;
   executionDirectory?: string;
   batchId?: string;
   joinMode?: "async" | "group";
@@ -152,7 +153,7 @@ export async function recordForegroundCompletion(
   let proof = run.proof
     ? await validateEvidenceOnlyProof({
         projectDirectory: run.executionDirectory ?? run.projectDirectory,
-        allowedProjectDirectories: [run.projectDirectory],
+        allowedProjectDirectories: [run.workspaceDirectory ?? run.projectDirectory],
         evidence,
         maxEvidenceAgeMs: run.proof.maxEvidenceAgeMs ?? 15 * 60 * 1_000,
         claims: run.contextPack?.claims,
@@ -233,6 +234,7 @@ export async function recordBackgroundCompletion(
         semanticAttestations: stored.semanticAttestations,
         verifier: stored.verifier,
         projectDirectory: stored.projectDirectory,
+        workspaceDirectory: stored.workspaceDirectory ?? stored.projectDirectory,
         executionDirectory: stored.executionDirectory,
         batchId: stored.batchId,
         joinMode: stored.joinMode,
@@ -318,7 +320,7 @@ export async function recordBackgroundCompletion(
   let proof = run.proof
     ? await validateEvidenceOnlyProof({
         projectDirectory: run.executionDirectory ?? run.projectDirectory,
-        allowedProjectDirectories: [run.projectDirectory],
+        allowedProjectDirectories: [run.workspaceDirectory ?? run.projectDirectory],
         evidence,
         maxEvidenceAgeMs: run.proof.maxEvidenceAgeMs ?? 15 * 60 * 1_000,
         claims: run.contextPack?.claims,

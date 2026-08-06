@@ -40,6 +40,8 @@ export interface ResourceClaim {
 export interface ResourceLease {
   id: string;
   owner: string;
+  /** Canonical execution root in which relative claim resources are interpreted. */
+  scope?: string;
   claims: ResourceClaim[];
   acquiredAt: string;
   heartbeatAt?: string;
@@ -78,6 +80,7 @@ export function setStoreQuarantineReporter(reporter: StoreQuarantineReporter): v
 export interface AcquireResourceLeaseInput {
   storePath: string;
   owner: string;
+  scope?: string;
   claims: readonly ResourceClaim[];
   now?: Date;
   ttlMs?: number;
@@ -182,6 +185,7 @@ export async function acquireResourceLease(
     const claims = input.claims.map(normalizeClaim);
 
     for (const lease of store.leases) {
+      if (!leaseScopesOverlap(input.scope, lease.scope)) continue;
       for (const requested of claims) {
         for (const existing of lease.claims) {
           if (claimsConflict(requested, existing)) {
@@ -199,6 +203,7 @@ export async function acquireResourceLease(
     const lease: ResourceLease = {
       id: randomUUID(),
       owner: input.owner,
+      ...(input.scope ? { scope: input.scope } : {}),
       claims,
       acquiredAt: now.toISOString(),
       heartbeatAt: now.toISOString(),
@@ -419,6 +424,7 @@ export function leaseCoversPath(lease: ResourceLease, path: string): boolean {
 
 export interface FindClaimCoveringPathInput {
   storePath: string;
+  scope?: string;
   path: string;
   now?: Date;
 }
@@ -432,12 +438,17 @@ export async function findClaimCoveringPath(
     now,
   });
   return leases
-    .filter((lease) => leaseCoversPath(lease, input.path))
+    .filter(
+      (lease) =>
+        leaseMatchesScope(lease.scope, input.scope) &&
+        leaseCoversPath(lease, input.path),
+    )
     .sort((left, right) => right.fence - left.fence)[0];
 }
 
 export interface AssertNoConflictingWriteInput {
   storePath: string;
+  scope?: string;
   ownerTaskId: string;
   path: string;
   /**
@@ -458,6 +469,7 @@ export async function assertNoConflictingWrite(
   }
   const lease = await findClaimCoveringPath({
     storePath: input.storePath,
+    scope: input.scope,
     path: input.path,
     now: input.now,
   });
@@ -570,6 +582,19 @@ function staticGlobPrefix(resource: string): string {
 
 function pathContains(parent: string, child: string): boolean {
   return parent === "" || child === parent || child.startsWith(`${parent}/`);
+}
+
+function leaseScopesOverlap(left: string | undefined, right: string | undefined): boolean {
+  // Unscoped leases predate multi-repo support and remain conservatively global
+  // until they expire or are released.
+  return left === undefined || right === undefined || left === right;
+}
+
+function leaseMatchesScope(
+  leaseScope: string | undefined,
+  requestedScope: string | undefined,
+): boolean {
+  return requestedScope === undefined || leaseScope === undefined || leaseScope === requestedScope;
 }
 
 function activeLeases(leases: readonly ResourceLease[], now: Date): ResourceLease[] {
@@ -715,6 +740,8 @@ function isPersistedLease(
     value.id.trim().length > 0 &&
     typeof value.owner === "string" &&
     value.owner.trim().length > 0 &&
+    (value.scope === undefined ||
+      (typeof value.scope === "string" && value.scope.trim().length > 0)) &&
     typeof value.acquiredAt === "string" &&
     Number.isFinite(Date.parse(value.acquiredAt)) &&
     (value.heartbeatAt === undefined ||

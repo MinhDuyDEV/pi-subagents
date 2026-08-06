@@ -31,6 +31,39 @@ afterEach(async () => {
 });
 
 describe("resource claims", () => {
+  it("isolates identical relative claims across execution roots", async () => {
+    const storePath = await createStorePath();
+    const first = await acquireResourceLease({
+      storePath,
+      owner: "task-alpha",
+      scope: "/repos/alpha",
+      claims: [{ kind: "write", resource: "src", mode: "exclusive" }],
+    });
+    const second = await acquireResourceLease({
+      storePath,
+      owner: "task-beta",
+      scope: "/repos/beta",
+      claims: [{ kind: "write", resource: "src", mode: "exclusive" }],
+    });
+
+    expect(first.scope).toBe("/repos/alpha");
+    expect(second.scope).toBe("/repos/beta");
+    await expect(
+      findClaimCoveringPath({
+        storePath,
+        scope: "/repos/alpha",
+        path: "src/index.ts",
+      }),
+    ).resolves.toMatchObject({ owner: "task-alpha" });
+    await expect(
+      findClaimCoveringPath({
+        storePath,
+        scope: "/repos/beta",
+        path: "src/index.ts",
+      }),
+    ).resolves.toMatchObject({ owner: "task-beta" });
+  });
+
   it("rejects overlapping exclusive write claims", async () => {
     const storePath = await createStorePath();
     await acquireResourceLease({

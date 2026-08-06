@@ -21,6 +21,9 @@ export function taskParametersSchema() {
         isolation: Type.Optional(Type.Literal("worktree", {
           description: "Run writes in an isolated Git worktree. Changed worktrees are retained and returned; unchanged worktrees are removed.",
         })),
+        cwd: Type.Optional(Type.String({
+          description: "Absolute existing directory used as the child execution root. Defaults to the parent cwd; resumed tasks reuse their persisted cwd. With isolation: worktree, the worktree is created from the Git repository containing this directory.",
+        })),
 
     task_id: Type.Optional(
       Type.String({

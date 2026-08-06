@@ -19,6 +19,7 @@ export interface SdkBackgroundTaskInput {
   startedAt: number;
   piDir: string;
   artifactsDir: string;
+  cwd?: string;
   conversationId?: string;
   worktree?: WorktreeHandle;
   run: () => Promise<SdkBackgroundResult>;
@@ -39,6 +40,7 @@ export function startSdkBackgroundTask(input: SdkBackgroundTaskInput): void {
     startedAt: input.startedAt,
     piDir: input.piDir,
     dir: input.artifactsDir,
+    cwd: input.cwd,
     conversationId: input.conversationId,
     worktree: input.worktree,
     status: "running",
@@ -58,6 +60,7 @@ export function startSdkBackgroundTask(input: SdkBackgroundTaskInput): void {
         startedAt: input.startedAt,
         piDir: input.piDir,
         dir: input.artifactsDir,
+        cwd: input.cwd,
         conversationId: input.conversationId,
         sessionRef: result.sessionPath ?? undefined,
         worktree: input.worktree,
@@ -84,6 +87,7 @@ export function startSdkBackgroundTask(input: SdkBackgroundTaskInput): void {
         startedAt: input.startedAt,
         piDir: input.piDir,
         dir: input.artifactsDir,
+        cwd: input.cwd,
         conversationId: input.conversationId,
         worktree: input.worktree,
         worktreeResult,

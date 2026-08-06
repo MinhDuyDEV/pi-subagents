@@ -115,7 +115,11 @@ export interface DurableTaskRun {
   joinMode?: "async" | "group";
   agentType?: string;
   description?: string;
+  /** Parent/control root that owns durable orchestration state. */
   projectDirectory: string;
+  /** Base repository/directory in which claims and context paths are interpreted. */
+  workspaceDirectory: string;
+  /** Actual child cwd; differs from workspaceDirectory when worktree-isolated. */
   executionDirectory: string;
   worktree?: WorktreeHandle;
   worktreeResult?: WorktreeResult;
@@ -164,6 +168,7 @@ export interface CreateDurableRunInput {
   agentType?: string;
   description?: string;
   projectDirectory: string;
+  workspaceDirectory?: string;
   executionDirectory?: string;
   startedAt?: string;
   claims?: readonly ResourceClaim[];
@@ -190,7 +195,9 @@ export function createDurableRun(input: CreateDurableRunInput): DurableTaskRun {
     ...(input.agentType ? { agentType: input.agentType } : {}),
     ...(input.description ? { description: input.description } : {}),
     projectDirectory: input.projectDirectory,
-    executionDirectory: input.executionDirectory ?? input.projectDirectory,
+    workspaceDirectory: input.workspaceDirectory ?? input.projectDirectory,
+    executionDirectory:
+      input.executionDirectory ?? input.workspaceDirectory ?? input.projectDirectory,
     startedAt: now,
     updatedAt: now,
     heartbeatAt: now,
@@ -495,9 +502,14 @@ function cloneLease(lease: ResourceLease): ResourceLease {
   return { ...lease, claims: lease.claims.map((claim) => ({ ...claim })) };
 }
 
-type PersistedDurableTaskRun = Omit<DurableTaskRun, "reportedOutcome"> & {
+type PersistedDurableTaskRun = Omit<
+  DurableTaskRun,
+  "reportedOutcome" | "workspaceDirectory"
+> & {
   /** Missing in version-1 stores written before the semantic outcome axis. */
   reportedOutcome?: TaskReportedOutcome;
+  /** Missing in version-1 stores written before multi-repo execution. */
+  workspaceDirectory?: string;
 };
 
 interface PersistedRunStoreDocument {
@@ -520,6 +532,8 @@ function isDurableTaskRun(value: unknown): value is PersistedDurableTaskRun {
     value.version === RUN_STORE_VERSION &&
     typeof value.invocationId === "string" &&
     typeof value.projectDirectory === "string" &&
+    (value.workspaceDirectory === undefined ||
+      typeof value.workspaceDirectory === "string") &&
     typeof value.executionDirectory === "string" &&
     typeof value.startedAt === "string" &&
     typeof value.updatedAt === "string" &&
@@ -549,6 +563,7 @@ function normalizePersistedRun(run: PersistedDurableTaskRun): DurableTaskRun {
     structuredClone(run) as DurableTaskRun & { semanticBindingKey?: string };
   return {
     ...withoutLegacySecret,
+    workspaceDirectory: run.workspaceDirectory ?? run.projectDirectory,
     // A legacy `completed` phase does not establish semantic success.  The
     // fail-closed migration keeps it unknown until a fresh child result is
     // parsed and durably recorded.

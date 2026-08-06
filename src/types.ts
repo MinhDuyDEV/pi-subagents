@@ -6,7 +6,10 @@ export type { TerminalHandle, HerdrTerminalHandle } from "./subagent/terminalBac
 export type ExecutionBackend = "sdk" | TerminalBackendKind;
 
 export interface BackgroundTask {
+  /** Artifact root used for session completion polling. */
   dir: string;
+  /** Durable base execution directory; an isolated worktree may override it. */
+  cwd?: string;
   agentType: string;
   sessionName: string;
   /** Legacy tmux field retained while old in-memory callers are migrated. */
@@ -44,7 +47,10 @@ export interface RegistryEntry {
   paneId?: string;
   backend?: TerminalBackendKind;
   piDir: string;
+  /** Artifact root, distinct from the child execution directory. */
   dir: string;
+  /** Durable base execution directory used by the child. */
+  cwd?: string;
   conversationId?: string;
   sessionRef?: string;
   worktree?: WorktreeHandle;
