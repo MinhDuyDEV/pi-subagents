@@ -3,7 +3,7 @@
 ## Compatibility
 
 - Herdr `0.7.5+`
-- Pi `0.81.1+`
+- Pi `0.84.x`
 - Required environment inside a managed pane: `HERDR_ENV=1`, `HERDR_PANE_ID`, `HERDR_SOCKET_PATH`
 
 `herdr integration install pi` improves Herdr's native Pi lifecycle/session detection but is not required for spawning `--kind pi`.

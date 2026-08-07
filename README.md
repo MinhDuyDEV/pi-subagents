@@ -14,7 +14,7 @@ A Herdr-native delegation runtime for [Pi](https://pi.dev): durable foreground/b
 ## Requirements
 
 - Node.js 20+
-- Pi `0.81.1+`
+- Pi `0.84.x`
 - Optional: Herdr `0.7.5+` (preferred observable backend)
 - Optional: tmux
 - Git with at least one commit for `isolation: "worktree"`

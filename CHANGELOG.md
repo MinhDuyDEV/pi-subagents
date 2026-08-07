@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - First-class `cwd` support across SDK, tmux and HerdR, with canonical path validation, durable persistence, resume identity checks and worktree creation from the selected repository.
 - Multi-repo orchestration roots: parent/control state remains in the session repository while Context Packs, relative claims, evidence, proof paths and write guards are scoped to the selected workspace repository.
 - Per-identity launch admission that serializes concurrent `task_id`/`conversation_id` launches and rejects foreground relaunch of an active background task.
+- Public `./replay` task-provenance queries with canonical realpath ownership checks, path-free sanitized results, stable newest-first ordering, and a hard `1..200` limit for bounded harness recall.
 
 ### Fixed
 - HerdR initial prompts now use bounded lifecycle waits and retry only a structured stalled-prompt response with a verified state-sequence transition.
@@ -20,7 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Compatibility
 - Existing task/run/lease records without `cwd`, workspace roots or lease scopes remain readable; old unscoped records preserve their previous single-project semantics.
-- Pi peer dependencies remain on the verified `0.81.1` generation; upstream's development-only `0.82` refresh is intentionally not included.
+- Pi peer dependencies move to the verified `0.84.x` generation with TypeBox `1.3.7`.
 
 ## [0.11.0] - 2026-07-29
 

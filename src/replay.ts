@@ -1,5 +1,8 @@
 import { resolve } from "node:path";
+import { realpath } from "node:fs/promises";
 import { taggedDigest, type TaggedSha256V1 } from "./learning-contract.js";
+import { getOrchestrationPaths } from "./orchestration/paths.js";
+import { listDurableRuns, type DurableTaskRun } from "./orchestration/run-store.js";
 import {
   ORCHESTRATION_EVENT_VERSION,
   readOrchestrationEvents,
@@ -33,6 +36,88 @@ export interface OrchestrationReplayPort {
     events: OrchestrationEvent[];
     next?: OrchestrationReplayCursorV1;
   }>;
+}
+
+export interface TaskProvenanceEntryV1 {
+  version: 1;
+  producer: "pi-subagents";
+  taskId?: string;
+  invocationId: string;
+  agentType?: string;
+  description?: string;
+  executionPhase: DurableTaskRun["executionPhase"];
+  reportedOutcome: DurableTaskRun["reportedOutcome"];
+  verificationPhase: DurableTaskRun["verificationPhase"];
+  reviewPhase: DurableTaskRun["reviewPhase"];
+  startedAt: string;
+  updatedAt: string;
+  resultDigest?: TaggedSha256V1;
+}
+
+export interface TaskProvenanceQuery {
+  projectDirectory: string;
+  limit?: number;
+}
+
+const MAX_TASK_PROVENANCE_ENTRIES = 200;
+const MAX_TASK_DESCRIPTION_LENGTH = 1_000;
+const MAX_TASK_IDENTITY_LENGTH = 256;
+
+function boundedText(value: string | undefined, maxLength: number): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/gu, " ").trim();
+  if (!normalized) return undefined;
+  return normalized.length <= maxLength ? normalized : `${normalized.slice(0, maxLength - 1)}…`;
+}
+
+async function belongsToProject(run: DurableTaskRun, canonicalProjectDirectory: string): Promise<boolean> {
+  try {
+    return await realpath(run.projectDirectory) === canonicalProjectDirectory;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Returns a deliberately small, path-free view of durable task history for
+ * recall consumers. Transcript references, claims, proof payloads, worktree
+ * paths, and verification issue text stay behind the orchestration boundary.
+ */
+export async function listTaskProvenance(
+  query: TaskProvenanceQuery,
+): Promise<TaskProvenanceEntryV1[]> {
+  const limit = query.limit ?? MAX_TASK_PROVENANCE_ENTRIES;
+  if (!Number.isInteger(limit) || limit < 1 || limit > MAX_TASK_PROVENANCE_ENTRIES) {
+    throw new Error(`Task provenance limit must be within bounds 1..${MAX_TASK_PROVENANCE_ENTRIES}`);
+  }
+  const canonicalProjectDirectory = await realpath(query.projectDirectory);
+  const runs = await listDurableRuns(getOrchestrationPaths(canonicalProjectDirectory).runStore);
+  const owned: DurableTaskRun[] = [];
+  for (const run of runs.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))) {
+    if (await belongsToProject(run, canonicalProjectDirectory)) owned.push(run);
+    if (owned.length === limit) break;
+  }
+
+  return owned.map((run) => {
+    const taskId = boundedText(run.taskId, MAX_TASK_IDENTITY_LENGTH);
+    const agentType = boundedText(run.agentType, MAX_TASK_IDENTITY_LENGTH);
+    const description = boundedText(run.description, MAX_TASK_DESCRIPTION_LENGTH);
+    return {
+      version: 1,
+      producer: "pi-subagents",
+      ...(taskId ? { taskId } : {}),
+      invocationId: boundedText(run.invocationId, MAX_TASK_IDENTITY_LENGTH) ?? "unknown",
+      ...(agentType ? { agentType } : {}),
+      ...(description ? { description } : {}),
+      executionPhase: run.executionPhase,
+      reportedOutcome: run.reportedOutcome,
+      verificationPhase: run.verificationPhase,
+      reviewPhase: run.reviewPhase,
+      startedAt: run.startedAt,
+      updatedAt: run.updatedAt,
+      ...(run.resultDigest ? { resultDigest: run.resultDigest } : {}),
+    };
+  });
 }
 
 interface CursorEvent {

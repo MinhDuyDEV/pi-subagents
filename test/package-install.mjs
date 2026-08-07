@@ -45,6 +45,7 @@ try {
   for (const path of [
     "dist/task-runtime.js",
     "dist/api.js",
+    "dist/replay.js",
     "skills/pi-subagents/SKILL.md",
     "herdr-plugin/attention-broker/herdr-plugin.toml",
   ]) {
@@ -58,8 +59,10 @@ try {
       [
         'const runtime = await import("@minhduydev/pi-subagents");',
         'const api = await import("@minhduydev/pi-subagents/api");',
+        'const replay = await import("@minhduydev/pi-subagents/replay");',
         'if (typeof runtime.default !== "function") throw new Error("runtime export missing");',
         'if (api.TASK_RPC_PROTOCOL_VERSION !== 3) throw new Error("API export mismatch");',
+        'if (typeof replay.listTaskProvenance !== "function") throw new Error("task provenance export missing");',
       ].join("\n"),
     ],
     { cwd: temporary, stdio: "inherit" },

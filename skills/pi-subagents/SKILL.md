@@ -2,7 +2,7 @@
 name: pi-subagents
 description: Reliably delegate foreground, background, parallel, scheduled, isolated, and independently reviewed work with @minhduydev/pi-subagents. Use when launching or supervising Pi task subagents, choosing Herdr/tmux/SDK execution, coordinating resource claims, using worktrees, collecting evidence, recovering tasks, or operating task_control and /task commands.
 license: MIT
-compatibility: Pi 0.81.1+, Node.js 20+, optional Herdr 0.7.5+ or tmux, Git required for worktree isolation.
+compatibility: Pi 0.84.x, Node.js 20+, optional Herdr 0.7.5+ or tmux, Git required for worktree isolation.
 metadata:
   package: "@minhduydev/pi-subagents"
   protocol: "1"
