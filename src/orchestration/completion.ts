@@ -8,6 +8,7 @@ import {
 import type { ContextEvidence, ContextPack } from "./context.js";
 import { captureSessionCommandReceipts } from "./evidence.js";
 import { resolveTaskSessionReference } from "./lifecycle.js";
+import { ORCHESTRATION_REASON_CODES } from "./reason-codes.js";
 import { getOrchestrationPaths, type OrchestrationPaths } from "./paths.js";
 import {
   validateEvidenceOnlyProof,
@@ -469,6 +470,7 @@ async function recordExecutionAndReviewState(
         idempotencyKey: `${run.invocationId}:review:awaiting`,
         taskId: run.taskId,
         reason: awaitingReview,
+        reasonCode: ORCHESTRATION_REASON_CODES.independentReviewRequired,
       },
     });
     return true;

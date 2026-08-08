@@ -34,6 +34,7 @@ import {
   verifyEvidenceReceipt,
 } from "./evidence.js";
 import { getOrchestrationPaths, type OrchestrationPaths } from "./paths.js";
+import { ORCHESTRATION_REASON_CODES } from "./reason-codes.js";
 import { validateEvidenceOnlyProof } from "./proof.js";
 import { parseUsageReceipts } from "../learning-contract.js";
 import {
@@ -325,6 +326,8 @@ async function executeHerdrAction(
             type: "task_awaiting_review",
             orchestrationId: run.correlationId ?? run.invocationId,
             taskId,
+            reason: "Pending independent review",
+            reasonCode: ORCHESTRATION_REASON_CODES.independentReviewRequired,
           },
         });
       } else if (proof.valid) {
@@ -1000,6 +1003,7 @@ async function executeHerdrAction(
           orchestrationId: subject.invocationId,
           taskId,
           reason,
+          reasonCode: ORCHESTRATION_REASON_CODES.independentReviewRequired,
         },
       });
       return {

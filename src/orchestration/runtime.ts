@@ -64,6 +64,10 @@ import {
   resolveTaskSessionReference,
 } from "./lifecycle.js";
 import { getOrchestrationPaths, type OrchestrationPaths } from "./paths.js";
+import {
+  normalizeOrchestrationReason,
+  ORCHESTRATION_REASON_CODES,
+} from "./reason-codes.js";
 import { appendOrchestrationEvent } from "./telemetry.js";
 import {
   createDurableRun,
@@ -2739,11 +2743,13 @@ async function abandonLostLease(
   run.leaseLost = true;
   const lostLease = run.lease;
   run.lease = undefined;
+  const normalizedReason = normalizeOrchestrationReason(reason);
 
   if (run.invocationId) {
     await patchDurableRun(paths.runStore, run.invocationId, {
       executionPhase: "blocked",
-      blockedReason: reason,
+      blockedReason: normalizedReason,
+      blockedReasonCode: ORCHESTRATION_REASON_CODES.claimLeaseLost,
     }).catch(() => undefined);
   }
 
@@ -2754,7 +2760,8 @@ async function abandonLostLease(
       orchestrationId: run.orchestrationId,
       taskId: run.taskId,
       ...(lostLease ? { leaseId: lostLease.id, fence: lostLease.fence } : {}),
-      reason,
+      reason: normalizedReason,
+      reasonCode: ORCHESTRATION_REASON_CODES.claimLeaseLost,
     },
   }).catch(() => undefined);
 
@@ -2764,7 +2771,8 @@ async function abandonLostLease(
       taskId: run.taskId,
       orchestrationId: run.orchestrationId,
       ...(lostLease ? { leaseId: lostLease.id, fence: lostLease.fence } : {}),
-      reason,
+      reason: normalizedReason,
+      reasonCode: ORCHESTRATION_REASON_CODES.claimLeaseLost,
     });
   } catch {
     // Event listeners are optional projections; losing one must not leave the
@@ -2776,7 +2784,7 @@ async function abandonLostLease(
       {
         customType: "orchestration-lease-lost",
         content:
-          `Task ${run.taskId} lost its resource lease (${reason}). It is now blocked and ` +
+          `Task ${run.taskId} lost its resource lease (${normalizedReason}). It is now blocked and ` +
           `must not write to its claimed resources. Re-run it to re-acquire the lease.`,
         display: true,
       },
@@ -2786,7 +2794,7 @@ async function abandonLostLease(
     // The durable blocked state and stop request below remain authoritative.
   }
 
-  await stopOwnedTask(run.projectDirectory, run.taskId, `lease lost: ${reason}`).catch(() => undefined);
+  await stopOwnedTask(run.projectDirectory, run.taskId, `lease lost: ${normalizedReason}`).catch(() => undefined);
   state.activeRuns.delete(run.taskId);
 }
 

@@ -4,6 +4,10 @@ import { dirname } from "node:path";
 import { isResourceClaim } from "./claims.js";
 import type { ResourceClaim, ResourceLease } from "./claims.js";
 import type { TaggedSha256V1, UsageReceiptV1 } from "../learning-contract.js";
+import {
+  normalizeOrchestrationReason,
+  type OrchestrationReasonCode,
+} from "./reason-codes.js";
 import type { ContextPack } from "./context.js";
 import type { OrchestrationRequest } from "./contract.js";
 import type { WorktreeHandle, WorktreeResult } from "../worktree.js";
@@ -132,6 +136,7 @@ export interface DurableTaskRun {
   reportedOutcome: TaskReportedOutcome;
   /** Why the run is `blocked` — e.g. it lost its resource lease. */
   blockedReason?: string;
+  blockedReasonCode?: OrchestrationReasonCode;
   verificationPhase: TaskVerificationPhase;
   reviewPhase: TaskReviewPhase;
   verificationIssues: string[];
@@ -321,9 +326,12 @@ export async function patchDurableRun(
         `Invalid task execution transition: ${current.executionPhase} -> ${changes.executionPhase}`,
       );
     }
+    const normalizedChanges = changes.blockedReason === undefined
+      ? changes
+      : { ...changes, blockedReason: normalizeOrchestrationReason(changes.blockedReason) };
     const updated: DurableTaskRun = {
       ...current,
-      ...structuredClone(changes),
+      ...structuredClone(normalizedChanges),
       version: RUN_STORE_VERSION,
       invocationId: current.invocationId,
       updatedAt: new Date().toISOString(),

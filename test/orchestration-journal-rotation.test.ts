@@ -166,7 +166,7 @@ describe("journal appends", () => {
 describe("journal rotation", () => {
   it("rotates past the size cap and keeps reading every segment in order", async () => {
     const eventPath = await createEventPath();
-    // A reason field large enough that a few dozen events cross the 4 MiB cap.
+    // A synthetic idempotency key large enough that a few dozen events cross the 4 MiB cap.
     const padding = "x".repeat(256 * 1024);
 
     for (let index = 0; index < 40; index += 1) {
@@ -175,7 +175,7 @@ describe("journal rotation", () => {
         event: {
           type: "task_started",
           orchestrationId: `run-${index}`,
-          reason: padding,
+          idempotencyKey: `${index}:${padding}`,
         },
       });
     }

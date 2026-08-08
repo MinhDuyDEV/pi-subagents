@@ -12,6 +12,10 @@ import {
 import { basename, dirname, extname, join } from "node:path";
 import type { UsageReceiptV1 } from "../learning-contract.js";
 import { withFileLock } from "./file-lock.js";
+import {
+  normalizeOrchestrationReason,
+  type OrchestrationReasonCode,
+} from "./reason-codes.js";
 
 export const ORCHESTRATION_EVENT_VERSION = 1;
 
@@ -93,6 +97,7 @@ export interface NewOrchestrationEvent {
   usage?: TaskUsageSummary;
   usageBindings?: UsageReceiptV1[];
   reason?: string;
+  reasonCode?: OrchestrationReasonCode;
   verdict?: string;
   reviewerTaskId?: string;
   reviewerInvocationId?: string;
@@ -167,6 +172,9 @@ export async function appendOrchestrationEvent(input: {
 
       const event: OrchestrationEvent = {
         ...eventInput,
+        ...(eventInput.reason !== undefined
+          ? { reason: normalizeOrchestrationReason(eventInput.reason) }
+          : {}),
         version: ORCHESTRATION_EVENT_VERSION,
         id: randomUUID(),
         sequence: index.lastSequence + 1,
@@ -636,6 +644,8 @@ function isEventType(value: unknown): value is OrchestrationEventType {
 function withoutOptionalMetrics(
   event: NewOrchestrationEvent,
 ): NewOrchestrationEvent {
+  // Retry and review-yield counters are optional operational telemetry; disabling
+  // them also disables diagnostics derived exclusively from those counters.
   const correctness = { ...event };
   delete correctness.durationMs;
   delete correctness.retryCount;
@@ -644,7 +654,6 @@ function withoutOptionalMetrics(
   delete correctness.usage;
   return correctness;
 }
-
 function numericValue(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }

@@ -20,6 +20,11 @@ export {
   type TaskVerificationPhase,
 } from "./orchestration/run-store.js";
 export {
+  ORCHESTRATION_REASON_CODES,
+  ORCHESTRATION_REASON_MAX_CHARS,
+  type OrchestrationReasonCode,
+} from "./orchestration/reason-codes.js";
+export {
   listEvidenceReceipts,
   recordEvidenceReceipt,
   verifyEvidenceReceipt,

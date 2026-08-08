@@ -558,7 +558,13 @@ describe("independent ship gate", () => {
     expect(proof).toBeUndefined();
     const events = await readOrchestrationEvents(paths.eventLog);
     expect(events.some((event) => event.type === "task_execution_completed")).toBe(true);
-    expect(events.some((event) => event.type === "task_awaiting_review")).toBe(true);
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "task_awaiting_review",
+        reason: expect.stringContaining("Pending independent review"),
+        reasonCode: "INDEPENDENT_REVIEW_REQUIRED",
+      }),
+    );
     expect(events.some((event) => event.type === "task_failed")).toBe(false);
   });
 

@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
+import { ORCHESTRATION_REASON_MAX_CHARS } from "../src/orchestration/reason-codes.js";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -41,6 +42,30 @@ describe("durable task run store", () => {
       executionPhase: "working",
     });
     expect(await listDurableRuns(path)).toHaveLength(1);
+  });
+
+  it("round-trips a bounded, redacted optional blocked reason code while accepting legacy runs", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "pi-runs-reason-code-"));
+    directories.push(directory);
+    const path = join(directory, "runs.json");
+    const run = createDurableRun({ invocationId: "blocked", projectDirectory: directory });
+    const blockedReason = `secret=super-secret ${"z".repeat(5_000)}`;
+    await putDurableRun(path, run);
+    await patchDurableRun(path, run.invocationId, {
+      executionPhase: "blocked",
+      blockedReason,
+      blockedReasonCode: "CLAIM_LEASE_LOST",
+    });
+
+    const [stored] = await listDurableRuns(path);
+    expect(stored).toEqual(
+      expect.objectContaining({
+        blockedReasonCode: "CLAIM_LEASE_LOST",
+      }),
+    );
+    expect(stored?.blockedReason).toHaveLength(ORCHESTRATION_REASON_MAX_CHARS);
+    expect(stored?.blockedReason).toContain("secret=[REDACTED]");
+    expect(stored?.blockedReason).not.toContain("super-secret");
   });
 
   it("normalizes legacy single-repo runs to their control project", async () => {

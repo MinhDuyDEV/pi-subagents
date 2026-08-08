@@ -258,4 +258,93 @@ describe("task outcome telemetry", () => {
     expect(event?.durationMs).toBeUndefined();
     expect(event?.usage).toBeUndefined();
   });
+
+  it("strips only optional cost/usage fields under the telemetry opt-out, never correctness fields", async () => {
+    const directory = await createTemporaryDirectory();
+    const eventPath = join(directory, "events.jsonl");
+    process.env.PI_SUBAGENTS_NO_TELEMETRY = "1";
+    await appendOrchestrationEvent({
+      eventPath,
+      event: {
+        type: "task_awaiting_decision",
+        taskId: "task-contract",
+        orchestrationId: "invocation-contract",
+        agentType: "general",
+        reportedOutcome: "awaiting-decision",
+        decisionId: "decision-contract-1",
+        reason: "Premise in dispute; parent must choose.",
+        reasonCode: "INDEPENDENT_REVIEW_REQUIRED",
+        verdict: "changes_requested",
+        reviewerTaskId: "task-reviewer",
+        reviewerOutputDigest: "sha256:v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        subjectDigest: "sha256:v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+
+        idempotencyKey: "invocation-contract:outcome:awaiting-decision",
+        durationMs: 100,
+        retryCount: 1,
+        reviewFindings: 3,
+        acceptedFindings: 2,
+        usage: {
+          inputTokens: 1,
+          outputTokens: 1,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          totalTokens: 2,
+          cost: 0.01,
+        },
+      },
+    });
+    const [event] = await readOrchestrationEvents(eventPath);
+    expect(event?.type).toBe("task_awaiting_decision");
+    expect(event?.taskId).toBe("task-contract");
+    expect(event?.orchestrationId).toBe("invocation-contract");
+    expect(event?.reportedOutcome).toBe("awaiting-decision");
+    expect(event?.decisionId).toBe("decision-contract-1");
+    expect(event?.reason).toBe("Premise in dispute; parent must choose.");
+    expect(event?.reasonCode).toBe("INDEPENDENT_REVIEW_REQUIRED");
+    expect(event?.verdict).toBe("changes_requested");
+    expect(event?.reviewerTaskId).toBe("task-reviewer");
+    expect(event?.reviewerOutputDigest).toBe("sha256:v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    expect(event?.subjectDigest).toBe("sha256:v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    expect(event?.idempotencyKey).toBe("invocation-contract:outcome:awaiting-decision");
+    expect(event?.durationMs).toBeUndefined();
+    expect(event?.retryCount).toBeUndefined();
+    expect(event?.reviewFindings).toBeUndefined();
+    expect(event?.acceptedFindings).toBeUndefined();
+    expect(event?.usage).toBeUndefined();
+  });
+
+  it("clamps reason text to 1,024 characters at write time", async () => {
+    const directory = await createTemporaryDirectory();
+    const eventPath = join(directory, "events.jsonl");
+    const shortReason = await appendOrchestrationEvent({
+      eventPath,
+      event: {
+        type: "task_awaiting_review",
+        taskId: "task-clamp",
+        orchestrationId: "invocation-clamp",
+        reason: "x".repeat(512),
+      },
+    });
+    expect(shortReason.reason).toBe("x".repeat(512));
+
+    const clamped = await appendOrchestrationEvent({
+      eventPath,
+      event: {
+        type: "task_awaiting_review",
+        taskId: "task-clamp-long",
+        orchestrationId: "invocation-clamp",
+        reason: `secret=super-secret ${"y".repeat(5_000)}`,
+      },
+    });
+    expect(clamped.reason).toHaveLength(1_024);
+    expect(clamped.reason).toContain("secret=[REDACTED]");
+    expect(clamped.reason).not.toContain("super-secret");
+
+    const [clampedEvent] = (await readOrchestrationEvents(eventPath)).filter(
+      (event) => event.taskId === "task-clamp-long",
+    );
+    expect(clampedEvent?.reason).toHaveLength(1_024);
+    expect(clampedEvent?.reason).not.toContain("super-secret");
+  });
 });
