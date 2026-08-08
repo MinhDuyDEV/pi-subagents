@@ -182,4 +182,48 @@ describe("spawn option sanitization (S-E)", () => {
     });
     expect(dropped).toEqual([]);
   });
+
+  it("defaults RPC write-claim spawns to evidence-only proof", async () => {
+    const bus = new Bus();
+    let received: Record<string, unknown> | undefined;
+    const rpc = registerTaskRpc({
+      events: bus,
+      spawn: async (input) => {
+        received = input.options;
+        return "task-write-claim-default-proof";
+      },
+      stopTask: async () => undefined,
+      isTaskSettled: () => true,
+    });
+
+    const reply = (await bus.request("pi-subagents:rpc:v3:spawn", {
+      requestId: "write-claims",
+      protocolVersion: TASK_RPC_PROTOCOL_VERSION,
+      agentType: "general",
+      prompt: "work",
+      description: "work",
+      options: {
+        // The audit gap: an RPC caller cannot pass `orchestration.context`
+        // (sanitization drops it), so its write claims never carried an
+        // authorization — and without write authorization the runtime used to
+        // launch the task with NO proof gate at all. Write claims themselves
+        // are the write signal and must default to evidence-only proof.
+        orchestration: {
+          claims: [{ kind: "write", resource: "src/**", mode: "exclusive" }],
+        },
+      },
+    })) as { success: boolean; data: { droppedOptions?: string[] } };
+
+    expect(reply.success).toBe(true);
+    // The runtime derives the write signal from the claims and defaults to
+    // evidence-only proof; the RPC surface itself must not need to pass it —
+    // the sanitized options stay claims-only.
+    expect(received).toEqual({
+      orchestration: {
+        claims: [{ kind: "write", resource: "src/**", mode: "exclusive" }],
+      },
+    });
+    expect(reply.data.droppedOptions).toBeUndefined();
+    rpc.dispose();
+  });
 });

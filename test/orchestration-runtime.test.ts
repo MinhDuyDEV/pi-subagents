@@ -692,6 +692,283 @@ describe("orchestrated task runtime", () => {
     ).rejects.toThrow(/Evidence-only review failed/u);
   });
 
+  it("fails the evidence-only proof gate for write claims without context authorization", async () => {
+    const projectDirectory = await createTemporaryProject();
+    const fakePi = createFakePi();
+    const upstream = (pi: ExtensionAPI) => {
+      pi.registerTool({
+        name: "task",
+        label: "Task",
+        description: "Fake upstream task",
+        parameters: Type.Object({
+          agent_type: Type.String(),
+          prompt: Type.String(),
+          description: Type.String(),
+          background: Type.Optional(Type.Boolean()),
+        }),
+        async execute() {
+          return {
+            content: [{ type: "text" as const, text: "Claimed completion." }],
+            details: {
+              taskId: "task-claims-only-proof",
+              phase: "completed",
+              reported_status: "success",
+            },
+          };
+        },
+      });
+    };
+
+    createTaskRuntime(upstream)(fakePi.api);
+    // Write/test claims alone (no `orchestration.context` authorization at all,
+    // exactly as an RPC caller can send after sanitization) must still count as
+    // write authorization: no explicit proof was passed, so the runtime must
+    // default to evidence-only proof and FAIL on this successful task output
+    // because no runtime evidence exists.
+    await expect(
+      fakePi.tools.get("task")?.execute(
+        "claims-only-proof",
+        {
+          agent_type: "general",
+          prompt: "Ship the change.",
+          description: "Claims-only proof",
+          background: false,
+          orchestration: {
+            claims: [{ kind: "write", resource: "src", mode: "exclusive" }],
+          },
+        },
+        new AbortController().signal,
+        undefined,
+        createContext(projectDirectory),
+      ),
+    ).rejects.toThrow(/Evidence-only review failed/u);
+  });
+
+  it("rejects read-only authorization combined with write claims at admission", async () => {
+    const projectDirectory = await createTemporaryProject();
+    const fakePi = createFakePi();
+    createTaskRuntime((pi) => {
+      pi.registerTool({
+        name: "task",
+        label: "Task",
+        description: "Fake upstream task",
+        parameters: Type.Object({
+          agent_type: Type.String(),
+          prompt: Type.String(),
+          description: Type.String(),
+          background: Type.Optional(Type.Boolean()),
+        }),
+        async execute() {
+          throw new Error("upstream must not run for a contradictory admission");
+        },
+      });
+    })(fakePi.api);
+
+    const result = await fakePi.tools.get("task")?.execute(
+      "read-only-write-claims",
+      {
+        agent_type: "general",
+        prompt: "Inspect only.",
+        description: "Read-only with write claims",
+        background: true,
+        orchestration: {
+          claims: [{ kind: "write", resource: "src", mode: "exclusive" }],
+          context: {
+            goal: "Inspect the code.",
+            authorization: "read-only",
+            next_step: "Report findings.",
+          },
+        },
+      },
+      new AbortController().signal,
+      undefined,
+      createContext(projectDirectory),
+    );
+
+    // The contradiction is rejected at admission: no lease is acquired and the
+    // upstream task tool never runs.
+    expect(result?.isError).toBe(true);
+    expect(result?.details).toMatchObject({
+      error: "read-only authorization cannot be combined with write or test claims",
+    });
+  });
+
+  it("rejects read-only authorization combined with test claims at admission", async () => {
+    const projectDirectory = await createTemporaryProject();
+    const fakePi = createFakePi();
+    createTaskRuntime((pi) => {
+      pi.registerTool({
+        name: "task",
+        label: "Task",
+        description: "Fake upstream task",
+        parameters: Type.Object({
+          agent_type: Type.String(),
+          prompt: Type.String(),
+          description: Type.String(),
+          background: Type.Optional(Type.Boolean()),
+        }),
+        async execute() {
+          throw new Error("upstream must not run for a contradictory admission");
+        },
+      });
+    })(fakePi.api);
+
+    const result = await fakePi.tools.get("task")?.execute(
+      "read-only-test-claims",
+      {
+        agent_type: "general",
+        prompt: "Inspect only.",
+        description: "Read-only with test claims",
+        background: true,
+        orchestration: {
+          claims: [{ kind: "test", resource: "src/**", mode: "shared" }],
+          context: {
+            goal: "Inspect the code.",
+            authorization: "read-only",
+            next_step: "Report findings.",
+          },
+        },
+      },
+      new AbortController().signal,
+      undefined,
+      createContext(projectDirectory),
+    );
+
+    // The contradiction is rejected at admission: no lease is acquired and the
+    // upstream task tool never runs.
+    expect(result?.isError).toBe(true);
+    expect(result?.details).toMatchObject({
+      error: "read-only authorization cannot be combined with write or test claims",
+    });
+  });
+
+  it("rejects read-only authorization with write claims before a schedule is persisted", async () => {
+    const projectDirectory = await createTemporaryProject();
+    const fakePi = createFakePi();
+    let upstreamCalls = 0;
+    const upstream = (pi: ExtensionAPI) => {
+      pi.registerTool({
+        name: "task",
+        label: "Task",
+        description: "Fake upstream task",
+        parameters: Type.Object({
+          agent_type: Type.String(),
+          prompt: Type.String(),
+          description: Type.String(),
+          background: Type.Optional(Type.Boolean()),
+        }),
+        async execute() {
+          upstreamCalls += 1;
+          return {
+            content: [{ type: "text" as const, text: "Scheduled." }],
+            details: { taskId: "task-scheduled", phase: "running" },
+          };
+        },
+      });
+    };
+
+    createTaskRuntime(upstream)(fakePi.api);
+    const result = await fakePi.tools.get("task")?.execute(
+      "schedule-read-only-write",
+      {
+        agent_type: "general",
+        prompt: "Inspect only.",
+        description: "Read-only scheduled with write claims",
+        background: true,
+        orchestration: {
+          schedule: { cron: "0 0 * * *" },
+          claims: [{ kind: "write", resource: "src", mode: "exclusive" }],
+          context: {
+            goal: "Inspect the code.",
+            authorization: "read-only",
+            next_step: "Report findings.",
+          },
+        },
+      },
+      new AbortController().signal,
+      undefined,
+      createContext(projectDirectory),
+    );
+
+    // The contradiction must be rejected at admission — before the schedule is
+    // persisted — so no schedule file exists, no Cron job is installed, and the
+    // upstream task tool never runs.
+    expect(result?.isError).toBe(true);
+    expect(result?.details).toMatchObject({
+      error: "read-only authorization cannot be combined with write or test claims",
+    });
+    expect(upstreamCalls).toBe(0);
+    const schedulePath = join(
+      projectDirectory,
+      ".pi",
+      "artifacts",
+      "tasks",
+      "orchestration",
+      "schedules.json",
+    );
+    let schedules: { schedules: unknown[] } | undefined;
+    try {
+      schedules = JSON.parse(await readFile(schedulePath, "utf8"));
+    } catch {
+      // Absent file is the expected no-side-effect state.
+    }
+    expect(schedules?.schedules ?? []).toEqual([]);
+  });
+
+  it("allows read-only authorization with evidence-only claims", async () => {
+    const projectDirectory = await createTemporaryProject();
+    const fakePi = createFakePi();
+    const upstream = (pi: ExtensionAPI) => {
+      pi.registerTool({
+        name: "task",
+        label: "Task",
+        description: "Fake upstream task",
+        parameters: Type.Object({
+          agent_type: Type.String(),
+          prompt: Type.String(),
+          description: Type.String(),
+          background: Type.Optional(Type.Boolean()),
+        }),
+        async execute() {
+          return {
+            content: [{ type: "text" as const, text: "Read-only evidence findings." }],
+            details: {
+              taskId: "task-read-only-evidence",
+              phase: "completed",
+              reported_status: "success",
+            },
+          };
+        },
+      });
+    };
+
+    createTaskRuntime(upstream)(fakePi.api);
+    const result = await fakePi.tools.get("task")?.execute(
+      "read-only-evidence",
+      {
+        agent_type: "general",
+        prompt: "Verify evidence only.",
+        description: "Read-only evidence claims",
+        background: false,
+        orchestration: {
+          claims: [{ kind: "evidence", resource: "build.log", mode: "shared" }],
+          context: {
+            goal: "Verify the build log.",
+            authorization: "read-only",
+            next_step: "Report findings.",
+          },
+        },
+      },
+      new AbortController().signal,
+      undefined,
+      createContext(projectDirectory),
+    );
+
+    // Evidence claims are not write claims: read-only admission stays legal and
+    // no evidence-only proof gate is imposed on the raw read result.
+    expect(result?.content[0]?.text).toBe("Read-only evidence findings.");
+  });
+
   it("does not default non-write tasks to evidence-only proof", async () => {
     const projectDirectory = await createTemporaryProject();
     const fakePi = createFakePi();
