@@ -446,6 +446,47 @@ function createOrchestratedTaskTool(
           isError: true,
         };
       }
+      const resolvedTaskId = stringValue(rawParameters.task_id);
+      const resolvedTaskKey = resolvedTaskId ?? stringValue(rawParameters.id);
+      const resumedRun = resolvedTaskId
+        ? await getDurableRunByTaskId(paths.runStore, resolvedTaskId)
+        : undefined;
+      const effectiveClaims = orchestration?.claims ?? resumedRun?.claims;
+      const effectiveAuthorization =
+        orchestration?.context?.authorization ??
+        resumedRun?.contextPack?.authorization;
+      const claimsDeclareWrite =
+        effectiveClaims?.some(
+          (claim) => claim.kind === "write" || claim.kind === "test",
+        ) ?? false;
+      // Admission runs BEFORE the schedule branch: a contradictory read-only +
+      // write/test request must be refused before a schedule is persisted or a
+      // Cron job installed. `PI_SUBAGENTS_NO_CLAIMS=1` skips this rejection
+      // deliberately — that env is the documented emergency override that
+      // disables claim coordination entirely (lease acquisition and the parent
+      // write guard are skipped under it too); proof gating stays independent
+      // of it, so the write-signal derivation below is intentionally NOT
+      // overridden by NO_CLAIMS.
+      if (
+        effectiveAuthorization === "read-only" &&
+        claimsDeclareWrite &&
+        process.env.PI_SUBAGENTS_NO_CLAIMS !== "1"
+      ) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `read-only authorization cannot be combined with write or test claims`,
+            },
+          ],
+          details: {
+            phase: "failed" as const,
+            error: "read-only authorization cannot be combined with write or test claims",
+            task_id: resolvedTaskId ?? resolvedTaskKey,
+          },
+          isError: true,
+        };
+      }
       if (orchestration?.schedule) {
         const scheduler = await ensureScheduler(state, paths.scheduleStore, ctx);
         const scheduledParameters = structuredClone(parametersValue);
@@ -482,10 +523,7 @@ function createOrchestratedTaskTool(
       const agentType = stringValue(rawParameters.agent_type);
       const description = stringValue(rawParameters.description);
       const isBackground = rawParameters.background !== false;
-      const resumedTaskId = stringValue(rawParameters.task_id);
-      const resumedRun = resumedTaskId
-        ? await getDurableRunByTaskId(paths.runStore, resumedTaskId)
-        : undefined;
+      const resumedTaskId = resolvedTaskId;
       const persistedWorkspace = resumedRun
         ? (resumedRun.workspaceDirectory ??
           resumedRun.worktree?.repositoryRoot ??
@@ -509,7 +547,6 @@ function createOrchestratedTaskTool(
         resumedRun?.correlationId ??
         resumedRun?.invocationId ??
         `run-${invocationId}`;
-      const effectiveClaims = orchestration?.claims ?? resumedRun?.claims;
       const effectiveVerifier = orchestration?.verifier ?? resumedRun?.verifier;
       const effectiveLeaseTtlMs =
         orchestration?.leaseTtlMs ?? resumedRun?.leaseTtlMs;
@@ -528,7 +565,8 @@ function createOrchestratedTaskTool(
         orchestration?.context?.authorization === "write-approved" ||
         orchestration?.context?.authorization === "sensitive-approved" ||
         resumedRun?.contextPack?.authorization === "write-approved" ||
-        resumedRun?.contextPack?.authorization === "sensitive-approved";
+        resumedRun?.contextPack?.authorization === "sensitive-approved" ||
+        claimsDeclareWrite;
       const honorNoProofEnv =
         process.env.PI_SUBAGENTS_NO_PROOF === "1" &&
         !(isWriteAuthorized && !explicitProof);
