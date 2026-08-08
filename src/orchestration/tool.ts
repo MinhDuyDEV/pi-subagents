@@ -35,6 +35,7 @@ import {
 } from "./evidence.js";
 import { getOrchestrationPaths, type OrchestrationPaths } from "./paths.js";
 import { validateEvidenceOnlyProof } from "./proof.js";
+import { parseUsageReceipts } from "../learning-contract.js";
 import {
   isAcceptingReviewerVerdict,
   isReviewerEventBound,
@@ -406,6 +407,10 @@ async function executeHerdrAction(
         throw new Error("accepted_findings must not exceed review_findings");
       }
       const reviewedRun = await getDurableRunByTaskId(paths.runStore, taskId);
+      const usageBindings =
+        reviewedRun?.usageBindings && reviewedRun.usageBindings.length > 0
+          ? parseUsageReceipts(reviewedRun.usageBindings)
+          : undefined;
       await appendOrchestrationEvent({
         eventPath: paths.eventLog,
         event: {
@@ -416,9 +421,16 @@ async function executeHerdrAction(
           reviewFindings: findings,
           acceptedFindings: accepted,
           reviewStatus: accepted > 0 ? "changes_requested" : "approved",
-          ...(reviewedRun?.usageBindings?.length
-            ? { usageBindings: reviewedRun.usageBindings }
-            : {}),
+          ...(usageBindings?.length ? { usageBindings } : {}),
+          // Idempotency key is scoped to (task, yield): an identical retry of
+          // the same findings/accepted collapses onto the first durable event
+          // (it must not inflate the reviewYield denominator), while a
+          // different yield tuple is a distinct review and gets its own
+          // event. Dedup is enforced by the journal's keyed index, which is
+          // rebuilt from the LIVE segment only, so idempotency across a
+          // journal rotation is an inherited store limitation, not a
+          // per-event guarantee.
+          idempotencyKey: `review:${taskId}:${findings}:${accepted}`,
         },
       });
       return {
@@ -560,6 +572,13 @@ async function executeHerdrAction(
           `Reviewer ${reviewerTaskId} already recorded an immutable verdict for this subject digest`,
         );
       }
+      // The learning consumer reads the canonical usage receipts off the
+      // reviewer-owned task_reviewed event. The subject run's stored receipts
+      // are the only authority; malformed persisted receipts fail closed so a
+      // broken binding can never masquerade as a review.
+      const canonicalUsageBindings = subject.usageBindings?.length
+        ? parseUsageReceipts(subject.usageBindings)
+        : undefined;
       await appendOrchestrationEvent({
         eventPath: paths.eventLog,
         event: {
@@ -571,6 +590,9 @@ async function executeHerdrAction(
           subjectDigest,
           verdict,
           reviewerOutputDigest: reviewerVerdict.outputDigest,
+          ...(canonicalUsageBindings?.length
+            ? { usageBindings: canonicalUsageBindings }
+            : {}),
           idempotencyKey: `${reviewer.invocationId}:review:${subject.invocationId}:${subjectDigest}`,
         },
       });
