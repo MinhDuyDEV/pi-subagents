@@ -6,6 +6,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-08-08
+
+### Added
+
+- Added optional machine-readable orchestration reason codes for independent-review and lost-lease states while preserving human-readable reasons and legacy run/event compatibility.
+- Added canonical bounded `usageBindings` to reviewed-task lifecycle events so learning consumers can correlate accepted review outcomes with evidence-backed usage receipts.
+
+### Changed
+
+- Bounded and redacted persisted orchestration reasons, including durable blocked-run reasons, to prevent unbounded or sensitive error text from entering replay and run-state artifacts.
+- Tightened `PI_SUBAGENTS_NO_TELEMETRY=1` so optional usage and operational metrics are omitted while correctness, review, decision, digest, outcome, and idempotency fields remain durable.
+
 ## [0.12.0] - 2026-08-07
 
 ### Added

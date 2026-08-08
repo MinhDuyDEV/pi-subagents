@@ -1,6 +1,6 @@
 {
   "name": "@minhduydev/pi-subagents",
-  "version": "0.12.0",
+  "version": "0.13.0",
   "description": "Herdr-native multi-repo delegation runtime for Pi with durable task state, foreground/background agents, worktree isolation, scoped claims, evidence and independent review gates, grouped completion, schedules, recovery, and SDK/tmux fallback. Runtime-only: agent profiles remain consumer-owned.",
   "type": "module",
   "main": "dist/task-runtime.js",
