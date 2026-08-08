@@ -31,6 +31,7 @@ import type {
   ExtensionContext,
   ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
+import type { UsageReceiptV1 } from "../src/events.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -76,6 +77,7 @@ async function seedCompletedTask(input: {
   agentType: string;
   verifier?: { required: boolean; reviewerAgent?: string; minReviews?: number };
   finalOutput?: string;
+  usageBindings?: UsageReceiptV1[];
 }): Promise<void> {
   const { projectDirectory, taskId } = input;
   const paths = getOrchestrationPaths(projectDirectory);
@@ -115,6 +117,7 @@ async function seedCompletedTask(input: {
     projectDirectory,
     agentType: input.agentType,
     verifier: input.verifier,
+    ...(input.usageBindings ? { usageBindings: input.usageBindings } : {}),
   });
   run.taskId = taskId;
   run.executionPhase = "completed";
@@ -573,5 +576,312 @@ describe("independent ship gate", () => {
     });
     const result = await runOrchestrationDoctor({ projectDirectory });
     expect(result.issues.some((issue) => issue.code === "unverified-ship")).toBe(true);
+  });
+
+  it("makes record_review idempotent for identical review yields", async () => {
+    const projectDirectory = await createTemporaryProject();
+    const tool = createControlTool();
+    await seedCompletedTask({
+      projectDirectory,
+      taskId: "task-yield",
+      invocationId: "yield-invocation",
+      agentType: "general",
+    });
+    const input = {
+      action: "record_review" as const,
+      task_id: "task-yield",
+      review_findings: 4,
+      accepted_findings: 3,
+    };
+
+    const first = await tool.execute(
+      "record-review-1",
+      input,
+      signal,
+      undefined,
+      createContext(projectDirectory),
+    );
+    const second = await tool.execute(
+      "record-review-2",
+      input,
+      signal,
+      undefined,
+      createContext(projectDirectory),
+    );
+
+    expect(first.details?.reviewFindings).toBe(4);
+    expect(second.details?.reviewFindings).toBe(4);
+    const paths = getOrchestrationPaths(projectDirectory);
+    const events = await readOrchestrationEvents(paths.eventLog);
+    expect(
+      events.filter((event) => event.type === "review_completed"),
+    ).toHaveLength(1);
+  });
+
+  it("distinguishes distinct record_review yields while collapsing identical retries", async () => {
+    const projectDirectory = await createTemporaryProject();
+    const tool = createControlTool();
+    await seedCompletedTask({
+      projectDirectory,
+      taskId: "task-yield",
+      invocationId: "yield-invocation",
+      agentType: "general",
+    });
+    const base = {
+      action: "record_review" as const,
+      task_id: "task-yield",
+    };
+
+    await tool.execute(
+      "record-review-4-3",
+      { ...base, review_findings: 4, accepted_findings: 3 },
+      signal,
+      undefined,
+      createContext(projectDirectory),
+    );
+    // Same yield again: must collapse onto the single durable event.
+    await tool.execute(
+      "record-review-4-3-retry",
+      { ...base, review_findings: 4, accepted_findings: 3 },
+      signal,
+      undefined,
+      createContext(projectDirectory),
+    );
+    // Different yield: a distinct review, must not be swallowed by the key.
+    await tool.execute(
+      "record-review-4-2",
+      { ...base, review_findings: 4, accepted_findings: 2 },
+      signal,
+      undefined,
+      createContext(projectDirectory),
+    );
+
+    const paths = getOrchestrationPaths(projectDirectory);
+    const events = await readOrchestrationEvents(paths.eventLog);
+    const reviews = events.filter((event) => event.type === "review_completed");
+    expect(reviews).toHaveLength(2);
+    expect(
+      reviews.map((event) => [event.reviewFindings, event.acceptedFindings]),
+    ).toEqual([
+      [4, 3],
+      [4, 2],
+    ]);
+  });
+
+  it("carries the reviewed run's canonical usage bindings on the review_completed event", async () => {
+    const projectDirectory = await createTemporaryProject();
+    const tool = createControlTool();
+    const usageReceipt: UsageReceiptV1 = {
+      version: 1,
+      usageId: `sha256:v1:${"b".repeat(64)}`,
+      projectId: "project-1",
+      trustEpoch: "trust-1",
+      sessionGeneration: "session-1",
+      consumer: { kind: "subagent", id: "task-yield" },
+      correlationId: "corr-1",
+      requestDigest: `sha256:v1:${"c".repeat(64)}`,
+      queryDigest: `sha256:v1:${"d".repeat(64)}`,
+      learningId: "learning-1",
+      learningRevision: 1,
+      learningDigest: `sha256:v1:${"e".repeat(64)}`,
+      returnedAt: "2026-07-26T00:00:00.000Z",
+    };
+    await seedCompletedTask({
+      projectDirectory,
+      taskId: "task-yield",
+      invocationId: "yield-invocation",
+      agentType: "general",
+      usageBindings: [usageReceipt],
+    });
+
+    await tool.execute(
+      "record-review",
+      {
+        action: "record_review",
+        task_id: "task-yield",
+        review_findings: 4,
+        accepted_findings: 3,
+      },
+      signal,
+      undefined,
+      createContext(projectDirectory),
+    );
+
+    const paths = getOrchestrationPaths(projectDirectory);
+    const events = await readOrchestrationEvents(paths.eventLog);
+    const review = events.find((event) => event.type === "review_completed");
+    expect(review).toBeDefined();
+    expect(review?.usageBindings).toEqual([usageReceipt]);
+  });
+
+  it("fails closed on malformed persisted bindings without producing a review_completed event", async () => {
+    const projectDirectory = await createTemporaryProject();
+    const tool = createControlTool();
+    const malformed = {
+      version: 1,
+      usageId: `sha256:v1:${"b".repeat(64)}`,
+      projectId: "project-1",
+      trustEpoch: "trust-1",
+      sessionGeneration: "session-1",
+      consumer: { kind: "subagent", id: "task-yield" },
+      correlationId: "corr-1",
+      requestDigest: `sha256:v1:${"c".repeat(64)}`,
+      queryDigest: `sha256:v1:${"d".repeat(64)}`,
+      learningId: "learning-1",
+      learningRevision: 1,
+      learningDigest: "not-a-digest",
+      returnedAt: "2026-07-26T00:00:00.000Z",
+    };
+    await seedCompletedTask({
+      projectDirectory,
+      taskId: "task-yield",
+      invocationId: "yield-invocation",
+      agentType: "general",
+      usageBindings: [malformed] as never,
+    });
+
+    await expect(
+      tool.execute(
+        "record-review",
+        {
+          action: "record_review",
+          task_id: "task-yield",
+          review_findings: 4,
+          accepted_findings: 3,
+        },
+        signal,
+        undefined,
+        createContext(projectDirectory),
+      ),
+    ).rejects.toThrow(/usage/i);
+    const events = await readOrchestrationEvents(
+      getOrchestrationPaths(projectDirectory).eventLog,
+    );
+    expect(
+      events.filter((event) => event.type === "review_completed"),
+    ).toHaveLength(0);
+  });
+
+  it("carries the subject run's canonical usage bindings on the immutable task_reviewed event", async () => {
+    const projectDirectory = await createTemporaryProject();
+    const tool = createControlTool();
+    const usageReceipt: UsageReceiptV1 = {
+      version: 1,
+      usageId: `sha256:v1:${"b".repeat(64)}`,
+      projectId: "project-1",
+      trustEpoch: "trust-1",
+      sessionGeneration: "session-1",
+      consumer: { kind: "subagent", id: "task-subject" },
+      correlationId: "corr-1",
+      requestDigest: `sha256:v1:${"c".repeat(64)}`,
+      queryDigest: `sha256:v1:${"d".repeat(64)}`,
+      learningId: "learning-1",
+      learningRevision: 1,
+      learningDigest: `sha256:v1:${"e".repeat(64)}`,
+      returnedAt: "2026-07-26T00:00:00.000Z",
+    };
+    await seedCompletedTask({
+      projectDirectory,
+      taskId: "task-subject",
+      invocationId: "subject-invocation",
+      agentType: "general",
+      verifier: { required: true, reviewerAgent: "reviewer" },
+      usageBindings: [usageReceipt],
+    });
+    const status = await tool.execute(
+      "status",
+      { action: "status", task_id: "task-subject" },
+      signal,
+      undefined,
+      createContext(projectDirectory),
+    );
+    const subjectDigest = String(status.details?.subjectDigest);
+    await seedCompletedTask({
+      projectDirectory,
+      taskId: "task-reviewer",
+      invocationId: "reviewer-invocation",
+      agentType: "reviewer",
+      finalOutput: [
+        "<review_verdict>approved</review_verdict>",
+        `<reviewed_digest>${subjectDigest}</reviewed_digest>`,
+      ].join("\n"),
+    });
+
+    await tool.execute(
+      "review",
+      {
+        action: "review",
+        task_id: "task-subject",
+        reviewer_task_id: "task-reviewer",
+      },
+      signal,
+      undefined,
+      createContext(projectDirectory),
+    );
+
+    const events = await readOrchestrationEvents(getOrchestrationPaths(projectDirectory).eventLog);
+    const reviewed = events.find((event) => event.type === "task_reviewed");
+    expect(reviewed).toBeDefined();
+    expect(reviewed?.usageBindings).toEqual([usageReceipt]);
+  });
+
+  it("fails closed when a run carries malformed usage bindings and cannot produce a task_reviewed event", async () => {
+    const projectDirectory = await createTemporaryProject();
+    const tool = createControlTool();
+    const malformed = {
+      version: 1,
+      usageId: `sha256:v1:${"b".repeat(64)}`,
+      projectId: "project-1",
+      trustEpoch: "trust-1",
+      sessionGeneration: "session-1",
+      consumer: { kind: "subagent", id: "task-subject" },
+      correlationId: "corr-1",
+      requestDigest: `sha256:v1:${"c".repeat(64)}`,
+      queryDigest: `sha256:v1:${"d".repeat(64)}`,
+      learningId: "learning-1",
+      learningRevision: 1,
+      learningDigest: "not-a-digest",
+      returnedAt: "2026-07-26T00:00:00.000Z",
+    };
+    await seedCompletedTask({
+      projectDirectory,
+      taskId: "task-subject",
+      invocationId: "subject-invocation",
+      agentType: "general",
+      verifier: { required: true, reviewerAgent: "reviewer" },
+      usageBindings: [malformed] as never,
+    });
+    const status = await tool.execute(
+      "status",
+      { action: "status", task_id: "task-subject" },
+      signal,
+      undefined,
+      createContext(projectDirectory),
+    );
+    const subjectDigest = String(status.details?.subjectDigest);
+    await seedCompletedTask({
+      projectDirectory,
+      taskId: "task-reviewer",
+      invocationId: "reviewer-invocation",
+      agentType: "reviewer",
+      finalOutput: [
+        "<review_verdict>approved</review_verdict>",
+        `<reviewed_digest>${subjectDigest}</reviewed_digest>`,
+      ].join("\n"),
+    });
+
+    await expect(
+      tool.execute(
+        "review",
+        {
+          action: "review",
+          task_id: "task-subject",
+          reviewer_task_id: "task-reviewer",
+        },
+        signal,
+        undefined,
+        createContext(projectDirectory),
+      ),
+    ).rejects.toThrow(/usage/i);
   });
 });
